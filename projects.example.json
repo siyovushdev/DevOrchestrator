@@ -1,0 +1,29 @@
+{
+  "firefly_voice": {
+    "machine": "firefly",
+    "workspace": "/home/firefly/FireflyVoiceAssistantLinux",
+    "default_agent": "codex",
+    "description": "Firefly Voice Assistant on RK3588S"
+  },
+
+  "adbus": {
+    "machine": "work",
+    "workspace": "/home/siovush/StudioProjects/1MT.adbus.android",
+    "default_agent": "cursor",
+    "description": "1MT Android adbus"
+  },
+
+  "adbusservice": {
+    "machine": "work",
+    "workspace": "/home/siovush/StudioProjects/1MT.adbus.service",
+    "default_agent": "cursor",
+    "description": "1MT Android service"
+  },
+
+  "work_test": {
+    "machine": "work",
+    "workspace": "/home/siovush/DevOrchestratorTest",
+    "default_agent": "cursor",
+    "description": "Safe orchestration test project"
+  }
+}

@@ -1,0 +1,39 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local environment / secrets
+.env
+.env.*
+*.env
+*.pem
+*.key
+
+# DevOrchestrator local backups
+*.before-*
+
+# Logs / temp
+*.log
+*.tmp
+*.swp
+.DS_Store
+
+# Build output
+build/
+dist/
+
+# Machine-local project registry
+projects.json
+
+# Temporary/bootstrap helpers
+mcp_b4_continue.py
+mcp_b4_resume.py
+mcp_report.py
+responses_tunnel_smoke.py
