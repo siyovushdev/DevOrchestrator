@@ -12,6 +12,8 @@ from unittest.mock import AsyncMock, Mock, patch
 import devctl
 import scheduler
 import task_bridge as b
+from github_transport import GitHubTransport
+from transports import TransportError
 from durable import read_json
 from tests_helpers import coding_result, review_result
 
@@ -62,12 +64,29 @@ class Harness:
             return {**copy.deepcopy(self.issues[number]), 'comments': copy.deepcopy(self.comments[number])}
         raise AssertionError(args)
 
+    def gh(self, *args):
+        """Fake provider I/O; real GitHubTransport and V1 wrappers stay active."""
+        if args[0] == 'api':
+            endpoint = args[1]
+            if '/comments?' in endpoint:
+                number = int(endpoint.split('/issues/', 1)[1].split('/')[0])
+                return json.dumps(self.comments[number])
+            return json.dumps([i for i in self.issues.values() if i.get('state', 'OPEN').upper() == 'OPEN'])
+        if args[:2] == ('issue', 'comment'):
+            self.post_comment(args[2], Path(args[args.index('--body-file') + 1]).read_text())
+            return ''
+        if args[:2] == ('issue', 'edit'):
+            labels = b.label_names(self.issues[int(args[2])])
+            for index, value in enumerate(args):
+                if value == '--remove-label': labels.discard(args[index + 1])
+                if value == '--add-label': labels.add(args[index + 1])
+            self.issues[int(args[2])]['labels'] = sorted(labels)
+            return ''
+        raise AssertionError(args)
+
     def post_comment(self, number, body):
         self.comments[int(number)].append({'id': 'effect-' + str(len(self.comments[int(number)])),
             'author': {'login': 'bridge'}, 'body': body})
-
-    def transition(self, issue, target):
-        self.issues[int(issue['number'])]['labels'] = [target]
 
     async def transport(self, name, args):
         if name == 'list_tasks':
@@ -118,9 +137,7 @@ class BridgeIntegrationTests(unittest.IsolatedAsyncioTestCase):
                    patch.object(devctl, 'DATA_DIR', self.root / 'state/tasks'),
                    patch.object(b, 'STATE_FILE', self.root / 'state/task_bridge_state.json'),
                    patch.object(b, 'transport_call', self.h.transport), patch.object(b, 'gh_json', self.h.gh_json),
-                   patch.object(b, 'open_issues', lambda: [copy.deepcopy(i) for i in self.h.issues.values()]),
-                   patch.object(b, 'issue_comments', lambda n: copy.deepcopy(self.h.comments[int(n)])),
-                   patch.object(b, 'raw_add_comment', self.h.post_comment), patch.object(b, 'raw_transition_issue', self.h.transition),
+                   patch.object(b, 'gh', self.h.gh),
                    patch.object(b, 'send_telegram', self.h.telegram)]
         for p in patches: p.start(); self.addCleanup(p.stop)
         self.addCleanup(lambda: setattr(b, 'WORK_CONTEXT', None))
@@ -143,6 +160,145 @@ class BridgeIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.h.finish(item['task_id'], coding_result())
         await self.tick()
         return item
+
+    async def test_github_discovery_crosses_normalized_boundary_once_per_tick(self):
+        observed = []
+        poll = GitHubTransport.poll_commands
+        def capture(adapter):
+            result = poll(adapter)
+            observed.extend(result)
+            return result
+        with patch.object(GitHubTransport, 'poll_commands', autospec=True, side_effect=capture) as polling, \
+             patch.object(b, 'gh', wraps=self.h.gh) as io:
+            await self.tick(); self.h.restart(); await self.tick()
+        self.assertEqual(polling.call_count, 2)
+        self.assertEqual(sum(c.args[:1] == ('api',) and '/comments?' not in c.args[1] for c in io.call_args_list), 2)
+        self.assertEqual(len(self.h.starts), 1)
+        first, replay = observed
+        self.assertEqual(first.source_id, GitHubTransport(b.REPO).issue_ref(1).source_id())
+        self.assertEqual(first.command_id, replay.command_id)
+        self.assertEqual(first.payload['body'], self.h.issues[1]['body'])
+        self.assertEqual(self.h.last_coding_prompt, b.coding_prompt(b.build_autopilot_prompt('Implement task')))
+        self.assertEqual(self.h.state['issues']['1']['queue_status'], 'STARTED')
+
+    async def test_github_poll_failure_is_closed_before_lifecycle_mutation(self):
+        await self.tick()
+        before = copy.deepcopy(self.h.state)
+        with patch.object(b, 'gh', side_effect=OSError('credential-secret')), \
+             patch.object(b, 'transport_call', new_callable=AsyncMock) as rpc:
+            with self.assertRaises(TransportError) as error: await self.tick()
+        self.assertNotIn('credential-secret', str(error.exception))
+        rpc.assert_not_awaited()
+        self.assertEqual(self.h.state, before)
+        self.h.restart(); await self.tick()
+        self.assertEqual(len(self.h.starts), 1)
+
+    async def test_github_comment_failure_does_not_consume_followup_or_approval(self):
+        item = await self.ready()
+        task_id = item['task_id']
+        self.h.comment(b.FOLLOWUP_MARKER + '\nFix edge case')
+        actual = self.h.gh
+        def unavailable(*args):
+            if args[0] == 'api' and '/comments?' in args[1]: raise OSError('credential-secret')
+            return actual(*args)
+        with patch.object(b, 'gh', side_effect=unavailable): await self.tick()
+        self.assertEqual(item['owner_state'], 'READY_FOR_OWNER')
+        self.assertFalse(item.get('processed_followups'))
+        self.assertEqual(self.h.continues, [])
+        self.h.restart()
+        retry = self.h.state['issues']['1']['reconciliation_retry']['next_attempt'] + 1
+        with patch.object(b.time, 'time', return_value=retry): await self.tick()
+        self.assertEqual([value[0] for value in self.h.continues], [task_id])
+        self.h.restart(); await self.tick()
+        self.assertEqual(len(self.h.continues), 1)
+        self.assertIsNone(self.h.state['issues']['1']['owner_state'])
+
+    async def test_transport_comments_preserve_all_owner_command_parsing_and_gates(self):
+        item = await self.ready()
+        actions = ('COMMIT', 'PUSH', 'CREATE_PR', 'MERGE')
+        for action in actions:
+            data = {'action': ' ' + action.lower() + ' '}
+            if action == 'MERGE': data['method'] = 'merge'
+            self.h.comment('<!-- DEVORCHESTRATOR_OWNER_V1 ' + json.dumps(data) + ' -->',
+                           created='2020-01-01T00:00:00Z')
+        comments = b.issue_comments(1)[-4:]
+        for action, comment in zip(actions, comments):
+            parsed = b.parse_owner_command(comment['body'])
+            self.assertEqual(parsed['action'], action)
+            self.assertTrue(b.authorized_comment(comment))
+            expected = 'ALLOWED' if action == 'COMMIT' else 'REJECTED'
+            self.assertEqual(b.owner_action_plan(item['owner_state'], action)['status'], expected)
+        self.assertEqual(b.parse_owner_command(comments[-1]['body'])['method'], 'merge')
+        with patch.object(b, 'publish') as publish:
+            await self.tick(); self.h.restart(); await self.tick()
+        publish.assert_not_called()
+        self.assertEqual(self.h.state['issues']['1']['owner_state'], 'READY_FOR_OWNER')
+        self.assertTrue(all(c['id'] in self.h.state['issues']['1']['processed_owner_actions'] for c in comments))
+
+    async def test_transport_accepted_comment_error_recovers_outbox_without_resend(self):
+        key = b.bridge_effects.enqueue(self.h.state, 1, 'comment', 'Result\nExact V1 text')
+        b.bridge_effects.enqueue(self.h.state, 1, 'transition', {'issue': self.h.issues[1], 'target': 'dev:running'})
+        actual = self.h.gh
+        def accepted_then_error(*args):
+            result = actual(*args)
+            if args[:2] == ('issue', 'comment'): raise OSError('lost response after acceptance')
+            return result
+        with patch.object(b, 'gh', side_effect=accepted_then_error) as io:
+            b.flush_effects(self.h.state)
+        self.assertEqual(self.h.state['outbox'][key]['status'], 'PENDING')
+        self.assertEqual(sum(c.args[:2] == ('issue', 'comment') for c in io.call_args_list), 1)
+        self.assertEqual(sum(c.args[:2] == ('issue', 'edit') for c in io.call_args_list), 1)
+        self.assertEqual(self.h.comments[1][0]['body'], 'Result\nExact V1 text\n\n<!-- DEVORCHESTRATOR_EFFECT_V1 ' + key + ' -->')
+        self.h.restart()
+        with patch.object(b.time, 'time', return_value=self.h.state['outbox'][key]['next_attempt'] + 1), \
+             patch.object(b, 'gh', wraps=self.h.gh) as io:
+            b.flush_effects(self.h.state); b.flush_effects(self.h.state)
+        self.assertFalse(any(c.args[:2] == ('issue', 'comment') for c in io.call_args_list))
+        self.assertEqual(len(self.h.comments[1]), 1)
+        self.assertEqual(self.h.issues[1]['labels'], ['dev:running'])
+        self.assertTrue(all(e['status'] == 'DONE' for e in self.h.state['outbox'].values()))
+
+    async def test_transport_accepted_label_error_reconciles_without_duplicate_effects(self):
+        b.bridge_effects.enqueue(self.h.state, 1, 'comment', 'Result')
+        key = b.bridge_effects.enqueue(self.h.state, 1, 'transition',
+            {'issue': self.h.issues[1], 'target': 'dev:running'})
+        actual = self.h.gh
+        def accepted_then_error(*args):
+            result = actual(*args)
+            if args[:2] == ('issue', 'edit'): raise OSError('lost response after acceptance')
+            return result
+        with patch.object(b, 'gh', side_effect=accepted_then_error): b.flush_effects(self.h.state)
+        self.assertEqual(self.h.state['outbox'][key]['status'], 'PENDING')
+        self.assertEqual(self.h.issues[1]['labels'], ['dev:running'])
+        self.h.restart()
+        with patch.object(b.time, 'time', return_value=self.h.state['outbox'][key]['next_attempt'] + 1), \
+             patch.object(b, 'gh', wraps=self.h.gh) as io:
+            b.flush_effects(self.h.state); b.flush_effects(self.h.state)
+        self.assertFalse(any(c.args[:2] in (('issue', 'edit'), ('issue', 'comment')) for c in io.call_args_list))
+        self.assertEqual(len(self.h.comments[1]), 1)
+        self.assertTrue(all(e['status'] == 'DONE' for e in self.h.state['outbox'].values()))
+
+    async def test_transport_readonly_noop_completes_review_without_commit_invitation(self):
+        await self.tick()
+        item = self.h.state['issues']['1']
+        # A read-only coding task leaves exactly its initial repository snapshot.
+        (self.h.repo / 'file').write_text('baseline')
+        self.h.finish(item['task_id'], coding_result()); await self.tick()
+        self.assertEqual(self.h.tasks[item['review_task_id']]['role'], 'review')
+        self.h.finish(item['review_task_id'], review_result()); await self.tick()
+        self.h.restart(); await self.tick(); await self.tick()
+        item = self.h.state['issues']['1']
+        self.assertEqual(item['owner_state'], 'READY_FOR_OWNER')
+        self.assertFalse(b.notifications.publication_delta_present(item, self.h.tasks[item['task_id']]))
+        final = [c.args[0] for c in self.h.telegram.call_args_list if 'REVIEW_PASSED' in c.args[0]]
+        self.assertEqual(len(final), 1)
+        self.assertIn('Publication: NOT_REQUIRED', final[0])
+        self.assertNotIn('Next owner action: COMMIT', final[0])
+        markers = [c['body'].split('DEVORCHESTRATOR_EFFECT_V1 ')[1].split(' -->')[0]
+                   for c in self.h.comments[1] if 'DEVORCHESTRATOR_EFFECT_V1 ' in c['body']]
+        self.assertEqual(len(markers), len(set(markers)))
+        self.assertEqual(self.h.issues[1]['labels'], ['dev:ready-for-review'])
+        self.assertEqual(len(self.h.starts), 2)
 
     async def test_stale_ready_on_running_followup_waits_for_new_terminal_turn(self):
         item = await self.ready()
