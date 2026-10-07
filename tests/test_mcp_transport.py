@@ -12,6 +12,7 @@ import unittest
 from unittest.mock import patch
 
 import task_bridge as bridge
+from health import health_result
 from scheduler import Scheduler
 
 
@@ -170,7 +171,7 @@ class TransportTests(unittest.TestCase):
         result.structured_content = {'result': []}
         self.assertEqual(self.call('list_tasks', result), [])
 
-    def smoke(self, tasks_result):
+    def smoke(self, tasks_result, health_response=None):
         class Client:
             def __init__(self, url): pass
             async def __aenter__(self): return self
@@ -182,6 +183,12 @@ class TransportTests(unittest.TestCase):
                     return response({'test': {'machine': 'work'}})
                 if name == 'list_tasks':
                     return tasks_result
+                if name == 'orchestrator_health':
+                    return health_response or response(health_result({'work': {
+                        'type': 'local', 'required': True, 'status': 'OK',
+                        'diagnostic': None, 'details': 'fixture'}, 'firefly': {
+                        'type': 'ssh', 'required': False, 'status': 'AVAILABLE',
+                        'diagnostic': None, 'details': 'fixture'}}))
                 raise AssertionError(name)
 
         spec = importlib.util.spec_from_file_location(
@@ -204,3 +211,23 @@ class TransportTests(unittest.TestCase):
                 self.smoke(response(content=[response(task(0)).content[0],
                     SimpleNamespace(type='text', text='{malformed')]))
         self.assertNotIn('TASK_LIST_TRANSPORT: PASS', output.getvalue())
+
+    def test_smoke_accepts_degraded_remote_and_keeps_diagnostic(self):
+        report = health_result({'work': {'type': 'local', 'required': True, 'status': 'OK',
+            'diagnostic': None, 'details': ''}, 'firefly': {'type': 'ssh', 'required': False,
+            'status': 'UNAVAILABLE', 'diagnostic': 'SSH probe timed out after 5s', 'details': ''}})
+        with redirect_stdout(io.StringIO()) as output:
+            self.smoke(response(task(0)), response(report))
+        self.assertIn('WORK_HEALTH: PASS (DEGRADED)', output.getvalue())
+        self.assertIn('firefly: UNAVAILABLE — SSH probe timed out after 5s', output.getvalue())
+        self.assertIn('TASK_LIST_TRANSPORT: PASS', output.getvalue())
+
+    def test_smoke_rejects_work_failure_and_mcp_errors(self):
+        report = health_result({'work': {'type': 'local', 'required': True, 'status': 'FAILED',
+            'diagnostic': 'Local probe failed', 'details': ''}})
+        for wire in (response(report), response(report, is_error=True), response({'ok': True})):
+            with self.subTest(wire=wire), redirect_stdout(io.StringIO()) as output:
+                with self.assertRaises((RuntimeError, ValueError)):
+                    self.smoke(response(task(0)), wire)
+            self.assertNotIn('WORK_HEALTH: PASS', output.getvalue())
+            self.assertNotIn('TASK_LIST_TRANSPORT: PASS', output.getvalue())

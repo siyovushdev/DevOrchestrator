@@ -9,7 +9,10 @@ import sys
 import uuid
 import re
 import hashlib
+import time
+import signal
 from durable import write_json, exclusive
+from health import DOCTOR_TIMEOUT, PROBE_TIMEOUT, SSH_CONNECT_TIMEOUT, health_result
 import worker_runtime
 import remote_worker
 from redaction import redact, redact_data
@@ -75,7 +78,7 @@ def now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def machine_command(machine, command):
+def machine_command(machine, command, *, connect_timeout=10, ssh_options=()):
     cfg = MACHINES[machine]
 
     path_prefix = cfg.get("path_prefix")
@@ -90,7 +93,8 @@ def machine_command(machine, command):
     return [
         "ssh",
         "-o", "BatchMode=yes",
-        "-o", "ConnectTimeout=10",
+        "-o", f"ConnectTimeout={connect_timeout}",
+        *[arg for option in ssh_options for arg in ("-o", option)],
         target,
         f"bash -lc {shlex.quote(command)}",
     ]
@@ -234,28 +238,84 @@ def capture_git_baseline(machine, workspace):
     }
 
 
-def doctor():
+def doctor_probe(machine, command, timeout):
+    # A timed-out local version command may have children holding stdout open.
+    # Kill the entire probe group so cleanup cannot wait on those children.
+    process = subprocess.Popen(
+        machine_command(machine, command, connect_timeout=SSH_CONNECT_TIMEOUT,
+                        ssh_options=('ConnectionAttempts=1', 'ServerAliveInterval=1',
+                                     'ServerAliveCountMax=2')),
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, errors='replace', start_new_session=True,
+    )
+    try:
+        output, _ = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.communicate()
+        raise
+    return subprocess.CompletedProcess(process.args, process.returncode, output)
+
+
+def doctor_health():
     command = """
-echo "HOST=$(hostname)"
-echo "USER=$(whoami)"
+set -e
+host=$(hostname)
+user=$(whoami)
+echo "HOST=$host"
+echo "USER=$user"
 echo "CODEX=$(command -v codex || true)"
 codex --version 2>/dev/null || true
 echo "CURSOR=$(command -v agent || true)"
 agent --version 2>/dev/null || true
 """
 
-    failed = False
+    deadline = time.monotonic() + DOCTOR_TIMEOUT
+    machines = {}
+    # Verify required local machines before spending time on optional workers.
+    ordered = sorted(MACHINES, key=lambda name: MACHINES[name]['type'] != 'local')
+    for machine in ordered:
+        kind = MACHINES[machine]['type']
+        details = ''
+        diagnostic = None
+        timeout = min(PROBE_TIMEOUT, max(0, deadline - time.monotonic()))
+        try:
+            if timeout <= 0:
+                diagnostic = 'Doctor probe budget exhausted; machine not probed'
+            else:
+                result = doctor_probe(machine, command, timeout)
+                details = redact(result.stdout.strip())[-2000:]
+                if result.returncode != 0:
+                    diagnostic = f'Probe exited {result.returncode}: {details[-500:] or "no output"}'
+        except subprocess.TimeoutExpired:
+            diagnostic = f'{"SSH" if kind == "ssh" else "Local"} probe timed out after {timeout:g}s'
+        except OSError as exc:
+            diagnostic = f'Probe could not start: {redact(exc)}'
+        machines[machine] = {
+            'type': kind, 'required': kind == 'local',
+            'status': ('FAILED' if kind == 'local' else 'UNAVAILABLE') if diagnostic else
+                      ('OK' if kind == 'local' else 'AVAILABLE'),
+            'diagnostic': diagnostic, 'details': details,
+        }
+    return health_result(machines)
 
-    for machine in MACHINES:
-        print(f"\n===== {machine} =====")
 
-        result = capture(machine, command)
-        print(result.stdout.rstrip())
-
-        if result.returncode != 0:
-            failed = True
-
-    return 1 if failed else 0
+def doctor(as_json=False):
+    report = doctor_health()
+    if as_json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        print(f"STATE={report['state']} LOCAL_CONTROL_PLANE={report['local_control_plane']}")
+        for machine, item in report['machines'].items():
+            print(f"\n===== {machine}: {item['status']} =====")
+            if item['details']:
+                print(item['details'])
+            if item['diagnostic']:
+                print(item['diagnostic'])
+    return 0 if report['ok'] else 1
 
 
 
@@ -1295,7 +1355,8 @@ def main():
     parser = argparse.ArgumentParser(prog="devctl")
     sub = parser.add_subparsers(dest="action", required=True)
 
-    sub.add_parser("doctor")
+    p_doctor = sub.add_parser("doctor")
+    p_doctor.add_argument("--json", action="store_true")
 
     p_projects = sub.add_parser("projects")
     p_projects.add_argument("--json", action="store_true")
@@ -1367,7 +1428,7 @@ def main():
     args = parser.parse_args()
 
     if args.action == "doctor":
-        raise SystemExit(doctor())
+        raise SystemExit(doctor(args.json))
 
     if args.action == "projects":
         raise SystemExit(show_projects(args.json))
