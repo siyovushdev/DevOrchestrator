@@ -4,6 +4,8 @@ import json
 import subprocess
 from pathlib import Path
 from typing import Literal
+from health import MCP_HEALTH_TIMEOUT, failed_health, validate_health
+from redaction import redact
 
 from mcp.server import MCPServer
 
@@ -19,8 +21,8 @@ def load_projects() -> dict:
     return json.loads(PROJECTS_FILE.read_text())
 
 
-def devctl(*args: str, timeout: int = 30) -> str:
-    result = subprocess.run(
+def devctl_result(*args: str, timeout: int = 30):
+    return subprocess.run(
         [str(DEVCTL), *args],
         cwd=ROOT,
         stdin=subprocess.DEVNULL,
@@ -30,6 +32,9 @@ def devctl(*args: str, timeout: int = 30) -> str:
         timeout=timeout,
     )
 
+
+def devctl(*args: str, timeout: int = 30) -> str:
+    result = devctl_result(*args, timeout=timeout)
     output = result.stdout.strip()
 
     if result.returncode != 0:
@@ -171,11 +176,24 @@ def adopt_task(
 
 @mcp.tool()
 def orchestrator_health() -> dict:
-    """Check connectivity and available agents."""
-    return {
-        "ok": True,
-        "details": devctl("doctor"),
-    }
+    """Report required WORK health and optional worker availability independently.
+
+    READY and DEGRADED have ok=true; FAILED has ok=false and blocks rollout.
+    MCP/project identity and task-list transport still require separate checks.
+    """
+    try:
+        result = devctl_result('doctor', '--json', timeout=MCP_HEALTH_TIMEOUT)
+        report = validate_health(json.loads(result.stdout))
+        expected_exit = 0 if report['ok'] else 1
+        if result.returncode != expected_exit:
+            return failed_health(f'Doctor exit {result.returncode} disagrees with health state')
+        return report
+    except subprocess.TimeoutExpired:
+        return failed_health(f'Local doctor timed out after {MCP_HEALTH_TIMEOUT}s')
+    except OSError as exc:
+        return failed_health(f'Local doctor could not start: {redact(exc)}')
+    except (ValueError, TypeError) as exc:
+        return failed_health(f'Invalid local doctor result: {exc}')
 
 
 if __name__ == "__main__":

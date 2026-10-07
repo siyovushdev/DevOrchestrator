@@ -1,9 +1,9 @@
 # DevOrchestrator roadmap 4–10
 
 All seven phases are implemented in the development worktree. The 2026-10-06
-pre-rollout audit passed, but controlled rollout #18 exposed an installed MCP
-transport defect and safely rolled back. The development transport repair and next
-rollout acceptance gate are documented below. This repair changes no live checkout,
+pre-rollout audit passed, but controlled rollouts #18 and #25 exposed MCP transport
+and optional-worker health defects and safely rolled back. The development repairs
+and next rollout acceptance gate are documented below. This repair changes no live checkout,
 service, task bus, Telegram chat, or publication.
 
 | Phase | Status | Implementation / verification |
@@ -414,12 +414,66 @@ complete delta from `2fc29dee`, including the new regression file and rollout or
 
 **Next rollout gate:** start MCP first while TaskBridge remains stopped. Run
 `python mcp_smoke.py` with the installed dependency interpreter and deployed code;
-require exit status 0 and `TASK_LIST_TRANSPORT: PASS`, checking decoded task count
-and identities against the read-only inventory. Health/project-list PASS alone is
+require exit status 0, `WORK_HEALTH: PASS (READY)` or `WORK_HEALTH: PASS (DEGRADED)`,
+and `TASK_LIST_TRANSPORT: PASS`, checking decoded task count
+and identities against the read-only inventory. DEGRADED is acceptable only with
+WORK/local control-plane OK and optional remote worker unavailability explicitly
+reported with a diagnostic. Health/project-list PASS alone is
 insufficient. A missing/failed task-list transport smoke keeps TaskBridge stopped
 and admissions frozen. Only after task-list smoke PASS may the authorized operator
 start TaskBridge and verify recovery. This development task performs no deployment,
 service restart, commit, push or merge.
+
+### Controlled rollout #25: optional remote worker health repair
+
+Rollout #25 deployed merge `9c2f2d4707ac160da410f1ec548c16e2f33d0e74` and passed
+181 tests, compilation, diff checks, MCP startup and
+`TASK_LIST_TRANSPORT: PASS (35 tasks, 35 content blocks)`. TaskBridge started on
+`work:queued` without duplicate launches/publication. Acceptance then failed because
+FIREFLY's SSH doctor probe timed out and the MCP health wrapper had an even shorter
+timeout. Safe rollback restored live baseline `55d3766`, with both DevOrchestrator
+services stopped and disabled. Durable post-rollout state was retained; backup:
+`/home/siovush/rollout-backups/devorchestrator-20261007T060636Z`.
+
+The development repair adds `devctl doctor --json` and a shared health contract:
+
+| Field | Healthy WORK and FIREFLY | Healthy WORK, unavailable FIREFLY | Failed WORK/local probe |
+|---|---|---|---|
+| `local_control_plane` | `OK` | `OK` | `FAILED` |
+| `machines.work.status` | `OK` | `OK` | `FAILED` |
+| `machines.firefly.status` | `AVAILABLE` | `UNAVAILABLE` | Independently reported |
+| `state` | `READY` | `DEGRADED` | `FAILED` |
+| `ok` / doctor exit | `true` / 0 | `true` / 0 | `false` / 1 |
+
+Local machines are required; SSH workers are optional. Probe exit failures, missing
+executables and timeouts are isolated per machine, with concise diagnostics and
+agent path/version output. Host/user lookup failures are fatal locally; agent
+discovery/version output remains informational. Local probes run first. Each probe
+has at most five seconds, SSH uses a three-second connection limit, one connection
+attempt and bounded keepalives, and the whole doctor has a 20-second probe budget
+inside the MCP wrapper's 30-second timeout. Timeout cleanup kills the probe process
+group, including local children holding output pipes open. Exhausted-budget machines
+are explicitly reported as unprobed/unavailable or failed, according to their role.
+
+`orchestrator_health` returns the same structured object even for local failure.
+Doctor execution/timeout errors, invalid JSON, malformed/inconsistent health records
+and disagreement between the doctor exit code and health state return structured
+`FAILED` / `ok=false`, never a success fallback. A successful health RPC alone does
+not establish MCP/project identity or task-list transport health; those remain
+independent required rollout checks. `mcp_smoke.py` now enforces WORK health,
+permits READY or DEGRADED, prints remote outage diagnostics and still requires full
+task-list transport PASS. An MCP error, WORK failure or failed/malformed task-list
+response fails the smoke and keeps the bridge stopped and admissions frozen.
+
+Regression tests cover CLI and MCP results for READY/DEGRADED/FAILED, independent
+local/remote probe failures, tight timeout options and aggregate budget, probe-group
+cleanup, malformed subprocess results, and smoke acceptance/rejection. Verification:
+**193 tests passed** with `python -m unittest discover -s tests -v`;
+`python -m py_compile *.py tests/*.py` and `git diff --check` passed. Self-review
+checked fail-closed local/subprocess errors, independent remote diagnostics, probe
+timeout/child cleanup and the required MCP/task-list rollout gates. This repair
+is development-only: no live checkout changes, service starts/enables, commit,
+push, PR, merge or deployment.
 
 ### Controlled rollout retry #16: dedicated WORK queue startup fix
 
@@ -625,7 +679,11 @@ worker identity or an unaccounted in-flight publication.
 4. In the installed runtime, run the full unittest suite, compilation and diff check.
    Start the identified MCP service first, verify health/registered project identity,
    and run `python mcp_smoke.py` with the installed interpreter while TaskBridge is
-   stopped. Require exit status 0 and `TASK_LIST_TRANSPORT: PASS`, reconciling the
+   stopped. Require `local_control_plane=OK`, `ok=true`, and state READY or DEGRADED.
+   DEGRADED with only FIREFLY unavailable is acceptable; record its diagnostic and
+   keep FIREFLY-dependent work subject to the existing worker availability/hold rules.
+   WORK failure, MCP failure or invalid health output is fatal. Require exit status 0,
+   `WORK_HEALTH: PASS` and `TASK_LIST_TRANSPORT: PASS`, reconciling the
    decoded task count/identities with the inventory, before starting the WORK bridge.
    Failure keeps the bridge stopped and admissions frozen. Check migration/quarantine
    outcomes, PID holds, request receipts, labels and outbox; confirm no duplicate
@@ -656,7 +714,8 @@ Rollback after any code has run:
    actions ran since the backup, restoring that matching code/state snapshot together
    is safe. Otherwise reconcile forward from the post-rollout snapshot, preserving
    completed Git/GitHub actions; code rollback does not undo commits/pushes/PRs/merges.
-5. After state/runtime compatibility is verified, start MCP and require the installed
+5. After state/runtime compatibility is verified, start MCP and require WORK/local
+   health OK (READY or DEGRADED with explicit remote diagnostic) and the installed
    task-list transport smoke PASS before starting the single WORK bridge. Re-run
    health/reconciliation and disposable checks before reopening
    submissions. Keep all backups and audit evidence. No automatic cleanup, receipt
