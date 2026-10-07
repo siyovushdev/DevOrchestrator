@@ -7,6 +7,12 @@ import shlex
 import subprocess
 import sys
 import uuid
+import re
+import hashlib
+from durable import write_json, exclusive
+import worker_runtime
+import remote_worker
+from redaction import redact, redact_data
 
 from collections import deque
 from datetime import datetime, timezone
@@ -47,6 +53,22 @@ MACHINES = {
 
 DATA_DIR = Path.home() / ".local/share/devorchestrator/tasks"
 PROJECTS_FILE = Path(__file__).resolve().parent / "projects.json"
+_CHILDREN = []
+
+
+def reap_processes():
+    _CHILDREN[:] = [process for process in _CHILDREN if process.poll() is None]
+
+
+def spawn_detached(wrapper, log_file):
+    try:
+        process = subprocess.Popen(["bash", "-lc", wrapper], stdin=subprocess.DEVNULL,
+                                   stdout=log_file, stderr=subprocess.STDOUT, start_new_session=True)
+        _CHILDREN.append(process)
+        return process
+    finally:
+        log_file.close()
+
 
 
 def now():
@@ -74,12 +96,13 @@ def machine_command(machine, command):
     ]
 
 
-def capture(machine, command):
+def capture(machine, command, separate_stderr=False):
     return subprocess.run(
         machine_command(machine, command),
         text=True,
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        stderr=subprocess.PIPE if separate_stderr else subprocess.STDOUT,
+        timeout=60,
     )
 
 
@@ -189,6 +212,9 @@ def capture_git_baseline(machine, workspace):
         else None
     )
 
+    root_result = capture_git(machine, workspace, "rev-parse", "--show-toplevel")
+    push_result = capture_git(machine, workspace, "remote", "get-url", "--push", "--all", "origin")
+
     return {
         "captured_at": captured_at,
         "is_repo": True,
@@ -198,6 +224,8 @@ def capture_git_baseline(machine, workspace):
         "status_porcelain": status_porcelain,
         "clean": status_porcelain == "",
         "origin": origin,
+        "root": root_result.stdout.strip() if root_result.returncode == 0 else None,
+        "push_urls": push_result.stdout.splitlines() if push_result.returncode == 0 else [],
         "error": (
             None
             if status_result.returncode == 0
@@ -267,6 +295,8 @@ def run_project(
     agent_override=None,
     model=None,
     effort=None,
+    request_id=None,
+    role="coding",
 ):
     projects = load_projects()
 
@@ -300,23 +330,41 @@ def run_project(
         prompt,
         model=model,
         effort=effort,
+        request_id=request_id,
+        role=role,
     )
 
 
 
-def task_state(meta, directory):
+def task_state(meta, directory, refresh_remote=True):
+    reap_processes()
+    if meta.get("resume_prepared") or meta.get("launch_prepared"):
+        return "UNKNOWN", None
+    if meta.get("remote_key"):
+        if not refresh_remote:
+            exit_path = directory / "exit_code"
+            if exit_path.exists():
+                try:
+                    code = int(exit_path.read_text().strip())
+                    return ("DONE" if code == 0 else "FAILED"), code
+                except ValueError:
+                    return "UNKNOWN", None
+            return meta.get("remote_status", "UNKNOWN"), None
+        return remote_worker.refresh(meta, directory)
     exit_path = directory / "exit_code"
-
     if exit_path.exists():
         try:
             code = int(exit_path.read_text().strip())
         except ValueError:
             code = -1
+        if meta.get("machine") == "firefly" and code == 255:
+            return "UNKNOWN", None
         return ("DONE" if code == 0 else "FAILED"), code
-
-    if process_alive(meta.get("pid", 0)):
+    if worker_runtime.alive(meta):
         return "RUNNING", None
-
+    # A local wrapper demonstrably died. For SSH, the remote child may still exist.
+    if meta.get("pid", 0) > 0 and meta.get("machine") == "work":
+        return "FAILED", None
     return "UNKNOWN", None
 
 
@@ -336,12 +384,15 @@ def project_for_task(meta):
     return "-"
 
 
-def list_tasks(as_json=False, show_all=False):
+def list_tasks(as_json=False, show_all=False, cached=False):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     rows = []
 
-    for directory in DATA_DIR.iterdir():
+    directories = [p for p in DATA_DIR.iterdir() if p.name != "archives"]
+    if (DATA_DIR / "archives").exists():
+        directories.extend((DATA_DIR / "archives").iterdir())
+    for directory in directories:
         if not directory.is_dir():
             continue
 
@@ -351,13 +402,24 @@ def list_tasks(as_json=False, show_all=False):
 
         try:
             meta = json.loads(meta_path.read_text())
+            if (not isinstance(meta, dict) or meta.get('id', directory.name) != directory.name or
+                    not isinstance(meta.get('machine'), str) or not isinstance(meta.get('workspace'), str) or
+                    meta.get('role', 'coding') not in ('coding', 'review')):
+                raise ValueError('Invalid task metadata')
         except Exception:
+            # Never silently erase uncertain work from bridge admission/publication checks.
+            rows.append({'id': directory.name, 'project': '-', 'machine': '-', 'agent': '-',
+                         'workspace': None, 'status': 'UNKNOWN', 'role': 'coding', 'turns': 0,
+                         'created_at': '', 'updated_at': '', 'session_id': None,
+                         'exit_code': None, 'archived': directory.parent.name == 'archives'})
             continue
 
-        if meta.get("archived", False) and not show_all:
+        try:
+            state, exit_code = task_state(meta, directory, refresh_remote=not cached)
+        except Exception:
+            state, exit_code = 'UNKNOWN', None
+        if meta.get("archived", False) and not show_all and state in ("DONE", "FAILED"):
             continue
-
-        state, exit_code = task_state(meta, directory)
 
         rows.append({
             "id": meta.get("id", directory.name),
@@ -368,8 +430,9 @@ def list_tasks(as_json=False, show_all=False):
             "turns": meta.get("turns", 1),
             "session_id": meta.get("session_id"),
             "workspace": meta.get("workspace"),
-            "created_at": meta.get("created_at", ""),
-            "updated_at": meta.get("updated_at", ""),
+            "role": meta.get("role", "coding"),
+            "created_at": str(meta.get("created_at") or ""),
+            "updated_at": str(meta.get("updated_at") or ""),
             "exit_code": exit_code,
             "archived": bool(meta.get("archived", False)),
         })
@@ -559,7 +622,7 @@ REMOTE_PY
 
 
 def set_task_archived(task_id, archived=True):
-    directory = DATA_DIR / task_id
+    directory = task_dir(task_id)
     meta_path = directory / "meta.json"
 
     if not meta_path.exists():
@@ -576,12 +639,16 @@ def set_task_archived(task_id, archived=True):
 
 
 def task_dir(task_id):
-    return DATA_DIR / task_id
+    if not isinstance(task_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", task_id) or ".." in task_id:
+        raise ValueError("Invalid task ID")
+    current = DATA_DIR / task_id
+    archived = DATA_DIR / "archives" / task_id
+    return archived if not current.exists() and archived.exists() else current
 
 
 def save_meta(directory, meta):
     path = directory / "meta.json"
-    path.write_text(json.dumps(meta, indent=2, ensure_ascii=False))
+    write_json(path, meta)
     os.chmod(path, 0o600)
 
 
@@ -601,6 +668,7 @@ def build_agent_command(
     prompt,
     model=None,
     effort=None,
+    role="coding",
 ):
     if agent == "codex":
         args = [
@@ -608,7 +676,7 @@ def build_agent_command(
             "exec",
             "--json",
             "--color", "never",
-            "--sandbox", MACHINES[machine].get(
+            "--sandbox", "read-only" if role == "review" else MACHINES[machine].get(
                 "codex_sandbox", "workspace-write"
             ),
         ]
@@ -667,19 +735,54 @@ def build_agent_command(
     raise ValueError(f"Unsupported agent: {agent}")
 
 
-def run_agent(
+def run_agent(machine, agent, workspace, prompt, model=None, effort=None,
+              request_id=None, role="coding"):
+    worker_runtime.valid_request(request_id)
+    task_id = request_id[:24] if request_id else uuid.uuid4().hex[:12]
+    with exclusive(DATA_DIR.parent / "worker.lock", blocking=True):
+        import scheduler
+        project = next((name for name, cfg in load_projects().items()
+                        if cfg["machine"] == machine and cfg["workspace"] == workspace), None)
+        if not project:
+            raise ValueError("Mutable tasks require a registered workspace")
+        _, canonical = scheduler.project_identity(project)
+        signature = hashlib.sha256(json.dumps([machine, agent, workspace, prompt, model, effort, role]).encode()).hexdigest()
+        def prepare():
+            worker_runtime.check_capacity(DATA_DIR, task_id, machine, role, task_state)
+            worker_runtime.admit(DATA_DIR, machine, canonical, task_id, task_state)
+            directory = task_dir(task_id)
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            save_meta(directory, {"id": task_id, "machine": machine, "agent": agent,
+                      "workspace": workspace, "pid": 0, "status": "STARTING", "role": role,
+                      "created_at": now(), "git_baseline": None, "launch_prepared": True, "prepared_request": request_id})
+        def start():
+            return _run_agent(machine, agent, workspace, prompt, model, effort, task_id, role)
+        result = worker_runtime.launch(DATA_DIR, request_id, task_id, start, prepare, signature)
+        meta = load_meta(task_id)
+        if meta.get("launch_prepared") and meta.get("prepared_request") == request_id:
+            _run_agent(machine, agent, workspace, prompt, model, effort, task_id, role)
+            meta = load_meta(task_id)
+        if meta.get("remote_key"):
+            remote_worker.start(machine, meta["remote_key"], meta["remote_command"])
+        return result
+
+
+
+def _run_agent(
     machine,
     agent,
     workspace,
     prompt,
     model=None,
     effort=None,
+    task_id=None,
+    role="coding",
 ):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    task_id = uuid.uuid4().hex[:12]
+    task_id = task_id or uuid.uuid4().hex[:12]
     directory = task_dir(task_id)
-    directory.mkdir(mode=0o700)
+    directory.mkdir(mode=0o700, exist_ok=True)
 
     log_path = directory / "events.jsonl"
     exit_path = directory / "exit_code"
@@ -702,6 +805,7 @@ def run_agent(
         prompt,
         model=model,
         effort=effort,
+        role=role,
     )
     actual_command = machine_command(machine, agent_command)
 
@@ -711,7 +815,9 @@ def run_agent(
         "agent": agent,
         "workspace": workspace,
         "created_at": now(),
-        "status": "RUNNING",
+        "status": "STARTING",
+        "pid": 0,
+        "role": role,
         "git_baseline": git_baseline,
     }
 
@@ -720,6 +826,15 @@ def run_agent(
 
     if effort:
         meta["reasoning_effort"] = effort
+
+    save_meta(directory, meta)
+
+    if MACHINES[machine]["type"] == "ssh":
+        meta.update(remote_key=f"{task_id}-turn-1", remote_command=agent_command)
+        save_meta(directory, meta)
+        remote_worker.start(machine, meta["remote_key"], agent_command)
+        print(task_id)
+        return 0
 
     log_file = open(log_path, "ab", buffering=0)
     os.chmod(log_path, 0o600)
@@ -732,15 +847,11 @@ def run_agent(
         f"exit \"$rc\""
     )
 
-    process = subprocess.Popen(
-        ["bash", "-lc", wrapper],
-        stdin=subprocess.DEVNULL,
-        stdout=log_file,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-    )
+    process = spawn_detached(wrapper, log_file)
 
     meta["pid"] = process.pid
+    meta["process_identity"] = worker_runtime.process_identity(process.pid)
+    meta["status"] = "RUNNING"
     save_meta(directory, meta)
 
     print(task_id)
@@ -748,6 +859,8 @@ def run_agent(
 
 
 def process_alive(pid):
+    if not isinstance(pid, int) or pid <= 0:
+        return False
     try:
         os.kill(pid, 0)
         return True
@@ -763,19 +876,7 @@ def status(task_id):
 
     exit_path = directory / "exit_code"
 
-    if exit_path.exists():
-        try:
-            exit_code = int(exit_path.read_text().strip())
-        except ValueError:
-            exit_code = -1
-
-        state = "DONE" if exit_code == 0 else "FAILED"
-    elif process_alive(meta["pid"]):
-        exit_code = None
-        state = "RUNNING"
-    else:
-        exit_code = None
-        state = "UNKNOWN"
+    state, exit_code = task_state(meta, directory)
 
     print(f"id:        {task_id}")
     print(f"status:    {state}")
@@ -852,13 +953,52 @@ def find_cursor_session_id(task_id):
     return session_id
 
 
-def continue_task(task_id, prompt):
+def continue_task(task_id, prompt, request_id=None):
+    with exclusive(DATA_DIR.parent / "worker.lock", blocking=True):
+        meta = load_meta(task_id)
+        project = project_for_task(meta)
+        if project == "-":
+            raise ValueError("Task workspace is no longer registered")
+        import scheduler
+        _, canonical = scheduler.project_identity(project)
+        signature = hashlib.sha256(json.dumps([task_id, prompt]).encode()).hexdigest()
+        def prepare():
+            if task_state(meta, task_dir(task_id))[0] not in ("DONE", "FAILED"):
+                raise RuntimeError("Task is active or uncertain; resume is blocked")
+            finder = find_codex_session_id if meta["agent"] == "codex" else find_cursor_session_id
+            session_id = meta.get("session_id") or finder(task_id)
+            if not session_id:
+                raise ValueError("Task session ID is unavailable")
+            worker_runtime.check_capacity(DATA_DIR, task_id, meta["machine"], meta.get("role", "coding"), task_state)
+            worker_runtime.admit(DATA_DIR, meta["machine"], canonical, task_id, task_state)
+            directory = task_dir(task_id)
+            if directory.parent.name == "archives":
+                directory.rename(DATA_DIR / task_id)
+            meta["archived"] = False
+            log_path = task_dir(task_id) / "events.jsonl"
+            meta["turn_log_offset"] = log_path.stat().st_size if log_path.exists() else 0
+            meta.update(status="STARTING", pid=0, process_identity=None, session_id=session_id, resume_prepared=True, prepared_request=request_id)
+            save_meta(task_dir(task_id), meta)
+            (task_dir(task_id) / "exit_code").unlink(missing_ok=True)
+        result = worker_runtime.launch(DATA_DIR, request_id, task_id,
+                                       lambda: _continue_task(task_id, prompt), prepare, signature)
+        meta = load_meta(task_id)
+        if meta.get("resume_prepared") and meta.get("prepared_request") == request_id:
+            _continue_task(task_id, prompt)
+            meta = load_meta(task_id)
+        if meta.get("remote_key"):
+            remote_worker.start(meta["machine"], meta["remote_key"], meta["remote_command"])
+        return result
+
+
+
+def _continue_task(task_id, prompt):
     directory = task_dir(task_id)
     meta = load_meta(task_id)
 
     exit_path = directory / "exit_code"
 
-    if not exit_path.exists() and process_alive(meta["pid"]):
+    if not meta.get("remote_key") and not exit_path.exists() and worker_runtime.alive(meta):
         raise SystemExit(f"Task {task_id} is still running")
 
     agent = meta["agent"]
@@ -880,7 +1020,7 @@ def continue_task(task_id, prompt):
             "codex",
             "exec",
             "--sandbox",
-            MACHINES[machine].get(
+            "read-only" if meta.get("role") == "review" else MACHINES[machine].get(
                 "codex_sandbox",
                 "workspace-write",
             ),
@@ -946,8 +1086,24 @@ def continue_task(task_id, prompt):
 
     actual_command = machine_command(machine, command)
 
+    meta.update(status="STARTING", pid=0, process_identity=None)
+    save_meta(directory, meta)
     exit_path.unlink(missing_ok=True)
 
+    if MACHINES[machine]["type"] == "ssh":
+        meta.update(remote_key=f"{task_id}-turn-{meta.get('turns', 1) + 1}", remote_command=command, resume_prepared=False, remote_status='UNKNOWN',
+                    remote_offset=0, session_id=session_id, updated_at=now(), turns=meta.get("turns", 1) + 1)
+        meta.pop("remote_local_size", None)
+        save_meta(directory, meta)
+        # Keep prior log history; refresh appends this turn using a separate remote offset.
+        with (directory / "events.jsonl").open("ab") as log:
+            log.write((json.dumps({"type": "devorchestrator.continue", "timestamp": now()}) + "\n").encode())
+        remote_worker.start(machine, meta["remote_key"], command)
+        print(task_id)
+        return 0
+
+    meta["resume_prepared"] = False
+    save_meta(directory, meta)
     log_path = directory / "events.jsonl"
     log_file = open(log_path, "ab", buffering=0)
 
@@ -971,15 +1127,11 @@ def continue_task(task_id, prompt):
         f"exit \"$rc\""
     )
 
-    process = subprocess.Popen(
-        ["bash", "-lc", wrapper],
-        stdin=subprocess.DEVNULL,
-        stdout=log_file,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-    )
+    process = spawn_detached(wrapper, log_file)
 
     meta["pid"] = process.pid
+    meta["process_identity"] = worker_runtime.process_identity(process.pid)
+    meta["status"] = "RUNNING"
     meta["session_id"] = session_id
     meta["updated_at"] = now()
     meta["turns"] = meta.get("turns", 1) + 1
@@ -998,18 +1150,7 @@ def task_report(task_id, as_json=False):
     exit_path = directory / "exit_code"
     log_path = directory / "events.jsonl"
 
-    if exit_path.exists():
-        try:
-            exit_code = int(exit_path.read_text().strip())
-        except ValueError:
-            exit_code = -1
-        state = "DONE" if exit_code == 0 else "FAILED"
-    elif process_alive(meta["pid"]):
-        exit_code = None
-        state = "RUNNING"
-    else:
-        exit_code = None
-        state = "UNKNOWN"
+    state, exit_code = task_state(meta, directory)
 
     session_id = meta.get("session_id")
     model = meta.get("model")
@@ -1020,6 +1161,7 @@ def task_report(task_id, as_json=False):
 
     if log_path.exists():
         with log_path.open(errors="replace") as f:
+            f.seek(meta.get("turn_log_offset", 0))
             for raw in f:
                 line = raw.strip()
                 if not line:
@@ -1033,7 +1175,10 @@ def task_report(task_id, as_json=False):
 
                 event_type = event.get("type")
 
-                if event_type == "thread.started":
+                if event_type == "devorchestrator.continue":
+                    # Legacy logs lack a per-turn offset but include this boundary marker.
+                    result = last_error = last_non_json = None
+                elif event_type == "thread.started":
                     session_id = event.get("thread_id") or session_id
 
                 elif event_type == "system" and event.get("subtype") == "init":
@@ -1085,6 +1230,10 @@ def task_report(task_id, as_json=False):
 
     report = {
         "id": task_id,
+        "git_baseline": redact_data(meta.get("git_baseline")),
+        "adopted": bool(meta.get("adopted")),
+        "created_at": meta.get("created_at"),
+        "updated_at": meta.get("updated_at"),
         "status": state,
         "machine": meta["machine"],
         "agent": meta["agent"],
@@ -1094,8 +1243,8 @@ def task_report(task_id, as_json=False):
         "reasoning_effort": reasoning_effort,
         "turns": meta.get("turns", 1),
         "exit_code": exit_code,
-        "result": result,
-        "error": last_error,
+        "result": redact(result) if result else result,
+        "error": redact(last_error) if last_error else last_error,
     }
 
     if as_json:
@@ -1154,6 +1303,7 @@ def main():
     p_tasks = sub.add_parser("tasks")
     p_tasks.add_argument("--json", action="store_true")
     p_tasks.add_argument("--all", dest="show_all", action="store_true")
+    p_tasks.add_argument("--cached", action="store_true", help="Use durable remote status without SSH probes")
 
     p_archive = sub.add_parser("archive")
     p_archive.add_argument("task_id")
@@ -1183,6 +1333,8 @@ def main():
     )
     p_run_project.add_argument("--model", default=None)
     p_run_project.add_argument("--effort", default=None)
+    p_run_project.add_argument("--request-id", default=None)
+    p_run_project.add_argument("--role", choices=["coding", "review"], default="coding")
 
     p_exec = sub.add_parser("exec")
     p_exec.add_argument("machine", choices=MACHINES.keys())
@@ -1210,6 +1362,7 @@ def main():
     p_continue = sub.add_parser("continue")
     p_continue.add_argument("task_id")
     p_continue.add_argument("prompt")
+    p_continue.add_argument("--request-id", default=None)
 
     args = parser.parse_args()
 
@@ -1221,7 +1374,7 @@ def main():
 
     if args.action == "tasks":
         raise SystemExit(
-            list_tasks(args.json, args.show_all)
+            list_tasks(args.json, args.show_all, args.cached)
         )
 
     if args.action == "archive":
@@ -1254,6 +1407,8 @@ def main():
                 args.agent,
                 args.model,
                 args.effort,
+                args.request_id,
+                args.role,
             )
         )
 
@@ -1285,7 +1440,7 @@ def main():
 
     if args.action == "continue":
         raise SystemExit(
-            continue_task(args.task_id, args.prompt)
+            continue_task(args.task_id, args.prompt, args.request_id)
         )
 
 

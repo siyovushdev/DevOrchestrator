@@ -53,6 +53,8 @@ def start_task(
     agent: Literal["codex", "cursor"] | None = None,
     model: str | None = None,
     effort: str | None = None,
+    request_id: str | None = None,
+    role: Literal["coding", "review"] = "coding",
 ) -> dict:
     """Start a task in a registered project.
 
@@ -89,18 +91,18 @@ def start_task(
     if effort:
         args += ["--effort", effort]
 
+    if request_id:
+        args += ["--request-id", request_id]
+    args += ["--role", role]
     output = devctl(*args)
     task_id = output.splitlines()[-1].strip()
 
-    return {
-        "task_id": task_id,
-        "project": project,
-        "machine": cfg["machine"],
-        "agent": selected_agent,
-        "model": model,
-        "effort": effort,
-        "status": "RUNNING",
-    }
+    report = json.loads(devctl("report", task_id, "--json"))
+    return {**report, "task_id": task_id, "project": project,
+            "machine": cfg["machine"], "agent": selected_agent, "role": role,
+            "model": report.get("model") or model,
+            "effort": report.get("reasoning_effort") or effort}
+
 
 
 @mcp.tool()
@@ -112,9 +114,13 @@ def get_task_report(task_id: str) -> dict:
 
 
 @mcp.tool()
-def continue_task(task_id: str, prompt: str) -> dict:
+def continue_task(task_id: str, prompt: str, request_id: str | None = None,
+                  role: Literal["coding", "review"] = "coding") -> dict:
     """Continue the same Codex or Cursor session."""
-    devctl("continue", task_id, prompt)
+    args = ["continue", task_id, prompt]
+    if request_id:
+        args += ["--request-id", request_id]
+    devctl(*args)
 
     return json.loads(
         devctl("report", task_id, "--json")
@@ -123,9 +129,9 @@ def continue_task(task_id: str, prompt: str) -> dict:
 
 @mcp.tool()
 def list_tasks() -> list:
-    """List known DevOrchestrator tasks and their current status."""
+    """List durable status without network probes; get_task_report refreshes individual SSH work."""
     return json.loads(
-        devctl("tasks", "--json")
+        devctl("tasks", "--json", "--cached")
     )
 
 

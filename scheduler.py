@@ -1,0 +1,165 @@
+"""Durable FIFO admission, explicit capacities and repository ownership."""
+from dataclasses import dataclass, field
+import hashlib
+import json
+import os
+
+import devctl
+
+
+class QueueWait(Exception):
+    """Normal admission deferral, not a task failure."""
+
+
+def registered_project(task, preferred=None):
+    """Resolve local task metadata only; never execute or normalize a reported path."""
+    registry = devctl.load_projects()
+    matches = sorted(name for name, cfg in registry.items()
+                     if cfg.get('machine') in devctl.MACHINES and
+                     cfg.get('machine') == task.get('machine') and
+                     cfg.get('workspace') == task.get('workspace'))
+    if preferred:
+        if preferred in matches:
+            return preferred
+        raise ValueError('Task identity does not match its registered project')
+    if task.get('project') in matches:
+        return task['project']
+    if len(matches) == 1:
+        return matches[0]
+    raise ValueError('Task identity has no unique registered project')
+
+
+@dataclass
+class Limits:
+    coding: int = 1
+    review: int = 1
+    total: int = 2
+    machines: dict = field(default_factory=lambda: {'work': 1, 'firefly': 1})
+
+    @classmethod
+    def from_env(cls):
+        limits = cls(coding=int(os.environ.get('DEVORCHESTRATOR_MAX_CODING', '1')),
+                     review=int(os.environ.get('DEVORCHESTRATOR_MAX_REVIEW', '1')),
+                     total=int(os.environ.get('DEVORCHESTRATOR_MAX_AGENTS', '2')),
+                     machines=json.loads(os.environ.get('DEVORCHESTRATOR_MACHINE_LIMITS', '{"work":1,"firefly":1}')))
+        if min(limits.coding, limits.review, limits.total) < 1 or any(
+                not isinstance(v, int) or v < 1 for v in limits.machines.values()):
+            raise ValueError('Concurrency limits must be positive integers')
+        return limits
+
+
+def project_identity(project):
+    cfg = devctl.load_projects().get(project)
+    if not cfg or cfg.get('machine') not in devctl.MACHINES:
+        raise ValueError('Task requires a registered project on a known machine')
+    workspace = cfg['workspace']
+    # Resolve aliases on the actual worker, never a cloud supplied path.
+    import shlex
+    result = devctl.capture(cfg['machine'], shlex.join([
+        'python3', '-c', 'import os,subprocess,sys; p=os.path.realpath(sys.argv[1]); r=subprocess.run(["git","-C",p,"rev-parse","--show-toplevel"],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True); print(os.path.realpath(r.stdout.strip()) if r.returncode == 0 else p)', workspace]), separate_stderr=True)
+    if result.returncode:
+        raise RuntimeError('Cannot resolve registered workspace identity')
+    canonical = result.stdout.strip()
+    return cfg['machine'], hashlib.sha256((cfg['machine'] + '\0' + canonical).encode()).hexdigest()
+
+
+class Scheduler:
+    def __init__(self, state, limits=None):
+        self.state = state
+        self.limits = limits or Limits.from_env()
+        self.jobs = state.setdefault('work_queue', {})
+        self.locks = state.setdefault('repo_locks', {})
+
+    def enqueue(self, key, owner, kind, machine, repo):
+        if key not in self.jobs:
+            sequence = self.state.get('queue_sequence', 0) + 1
+            self.state['queue_sequence'] = sequence
+            self.jobs[key] = dict(owner=owner, kind=kind, machine=machine, repo=repo,
+                                  sequence=sequence, status='QUEUED', task_id=None)
+        return self.jobs[key]
+
+    def repository_busy(self, owner, machine, repo):
+        # An unresolved workspace may alias any repository on its registered machine.
+        # If even that machine is unknown, hold all new admissions until reconciliation.
+        return (self.locks.get(repo, {}).get('owner', owner) != owner or
+                any(j['status'] in ('RESERVED', 'RUNNING', 'UNKNOWN') and
+                    ((j.get('identity_pending') and j.get('machine') in (None, machine)) or
+                     (j['repo'] == repo and j['owner'] != owner)) for j in self.jobs.values()))
+
+    def available(self, job):
+        active = [j for j in self.jobs.values() if j['status'] in ('RESERVED', 'RUNNING', 'UNKNOWN')]
+        limit = self.limits.coding if job['kind'] == 'coding' else self.limits.review
+        return (not self.repository_busy(job['owner'], job['machine'], job['repo']) and
+                len(active) < self.limits.total and
+                sum(j['kind'] == job['kind'] for j in active) < limit and
+                sum(j['machine'] == job['machine'] for j in active) < self.limits.machines.get(job['machine'], 1))
+
+    def reserve(self, key):
+        job = self.jobs[key]
+        if job['status'] != 'QUEUED':
+            return job
+        # Oldest eligible request wins; blocked repositories do not stall unrelated machines.
+        eligible = sorted((j for j in self.jobs.values() if j['status'] == 'QUEUED' and self.available(j)),
+                          key=lambda j: j['sequence'])
+        if not eligible or eligible[0] is not job:
+            raise QueueWait()
+        job['status'] = 'RESERVED'
+        self.locks[job['repo']] = {'owner': job['owner'], 'key': key}
+        return job
+
+    def started(self, key, task_id, status="RUNNING"):
+        self.jobs[key].update(status=status if status in ("RUNNING", "DONE", "FAILED") else "UNKNOWN", task_id=task_id, launch_pending=False)
+
+    def observe(self, task_id, status):
+        matching = [j for j in self.jobs.values() if j.get('task_id') == task_id and j['status'] != 'QUEUED']
+        if matching:
+            job = max(matching, key=lambda j: j['sequence'])
+            if job.get('launch_pending') and status in ('DONE', 'FAILED'):
+                return
+            job['status'] = status if status in ('DONE', 'FAILED', 'RUNNING') else 'UNKNOWN'
+            if job.get('identity_pending') and job['status'] == 'RUNNING':
+                job['status'] = 'UNKNOWN'
+
+    def release(self, owner):
+        if any(j['owner'] == owner and j['status'] in ('RESERVED', 'RUNNING', 'UNKNOWN') for j in self.jobs.values()):
+            return False
+        for repo, lock in list(self.locks.items()):
+            if lock['owner'] == owner:
+                del self.locks[repo]
+        return True
+
+    def recover(self, tasks):
+        """Import active legacy/direct tasks; never steal an uncertain lock."""
+        for task in tasks:
+            project = task.get('project')
+            matching = [j for j in self.jobs.values() if j.get('task_id') == task['id']]
+            pending = next((j for j in matching if j.get('identity_pending')), None)
+            if matching and not pending:
+                self.observe(task['id'], task['status'])
+            elif task['status'] in ('RUNNING', 'UNKNOWN', 'STARTING'):
+                key = 'external:' + task['id']
+                try:
+                    if not project or project == '-':
+                        project = registered_project(task)
+                    machine, repo = project_identity(project)
+                except Exception:
+                    # Failure is isolated to this task, never discarded or treated as a free slot.
+                    try:
+                        machine = task.get('machine') or devctl.load_projects().get(project, {}).get('machine')
+                        if machine not in devctl.MACHINES:
+                            machine = None
+                    except Exception:
+                        machine = None
+                    job = self.enqueue(key, key, task.get('role', 'coding'), machine, None)
+                    job.update(machine=machine, status='UNKNOWN', task_id=task['id'], identity_pending=True, project=project)
+                else:
+                    job = self.enqueue(key, key, task.get('role', 'coding'), machine, repo)
+                    job.update(machine=machine, repo=repo, identity_pending=False,
+                               status='UNKNOWN' if task['status'] != 'RUNNING' else 'RUNNING', task_id=task['id'])
+                    self.locks.setdefault(repo, {'owner': key, 'key': key})
+        external = {t['id']: t for t in tasks}
+        for key, job in self.jobs.items():
+            if key.startswith('external:') and job.get('task_id') in external:
+                self.observe(job['task_id'], external[job['task_id']]['status'])
+                if job['status'] in ('DONE', 'FAILED'):
+                    self.release(job['owner'])
