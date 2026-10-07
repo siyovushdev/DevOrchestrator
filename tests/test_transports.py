@@ -1,11 +1,12 @@
-"""Offline contract/mapping tests; no provider API, credentials or new workflow."""
+"""Offline transport contract, mapping and GitHub runtime I/O tests."""
 from dataclasses import FrozenInstanceError, fields
 import inspect
+import json
 from pathlib import Path
 import tempfile
 from typing import get_type_hints
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from control_plane import ControlCommand, ControlEvent, ControlJournal
 from durable import write_json
@@ -201,8 +202,7 @@ class TransportContractTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), before)
             self.assertIsNone(state['issues']['12']['owner_state'])
             self.assertIsNone(state['issues']['12']['review_status'])
-            self.assertNotIn('transports', vars(bridge))
-            self.assertNotIn('github_transport', vars(bridge))
+            self.assertIsInstance(bridge.github_task_transport(), GitHubTransport)
 
 
 class GitHubMappingTests(unittest.TestCase):
@@ -280,3 +280,99 @@ class GitHubMappingTests(unittest.TestCase):
             alias = journal.record_command(other)
             self.assertEqual((alias.identity, alias.sequence, alias.duplicate), (first.identity, 1, True))
             self.assertEqual(len(journal.snapshot()['receipts']), 2)
+
+
+class GitHubRuntimeTests(unittest.TestCase):
+    def setUp(self):
+        self.issue = {'number': 12, 'title': 'Task', 'body': 'Unparsed task text',
+                      'html_url': 'https://github.com/owner/tasks/issues/12',
+                      'url': 'api-display-url', 'labels': [{'name': 'work:queued'}],
+                      'created_at': NOW, 'state': 'open', 'node_id': 'opaque'}
+        self.run = Mock(return_value=json.dumps([self.issue]) + '\n[]')
+        self.read = Mock(return_value=self.issue)
+        self.adapter = GitHubTransport('OWNER/Tasks', run=self.run, read_json=self.read,
+                                       state_labels=('work:queued', 'dev:running'))
+        self.target = self.adapter.issue_ref(12)
+
+    def test_discovery_is_normalized_with_m2a_identity_and_exact_v1_view(self):
+        commands = self.adapter.poll_commands()
+        self.run.assert_called_once_with('api',
+            'repos/OWNER/Tasks/issues?state=open&sort=created&direction=asc&per_page=100', '--paginate')
+        observed, = commands
+        self.assertEqual(observed.source_transport, 'github')
+        self.assertEqual(observed.source_id, GitHubTransport('owner/tasks').issue_ref(12).source_id())
+        self.assertEqual(observed.kind, 'task.discovered')
+        self.assertEqual(dict(observed.payload), dict(external_id='issue:12', title='Task',
+                                                     body='Unparsed task text', url=self.issue['html_url']))
+        self.assertEqual(dict(observed.actor), {})
+        self.assertIsNone(observed.task_ref)
+        self.assertEqual(self.adapter.issue_view(observed), {**self.issue, 'url': self.issue['html_url']})
+        with tempfile.TemporaryDirectory() as root:
+            journal = ControlJournal(Path(root) / 'control.json')
+            first = journal.record_command(observed)
+            replay = journal.record_command(self.adapter.poll_commands()[0])
+            self.assertEqual((replay.identity, replay.duplicate), (first.identity, True))
+
+    def test_failed_or_partial_poll_never_exposes_stale_views(self):
+        old, = self.adapter.poll_commands()
+        for response in ('[]\n{"invalid":"page"}', json.dumps([self.issue, {'number': False}]),
+                         json.dumps([self.issue, None]), 'not-json', '', '   '):
+            with self.subTest(response=response):
+                self.run.return_value = response
+                with self.assertRaises(TransportError): self.adapter.poll_commands()
+                with self.assertRaises(TransportError): self.adapter.issue_view(old)
+        self.run.side_effect = OSError('credential-secret')
+        with self.assertRaises(TransportError) as error: self.adapter.poll_commands()
+        self.assertNotIn('credential-secret', str(error.exception))
+        self.assertFalse(error.exception.uncertain)
+
+    def test_pr_filtering_null_text_and_empty_queue_preserve_v1(self):
+        null_issue = {**self.issue, 'body': None, 'title': None}
+        self.run.return_value = json.dumps([null_issue, {**self.issue, 'pull_request': {}}])
+        observed, = self.adapter.poll_commands()
+        self.assertEqual(observed.payload['body'], '')
+        self.assertIsNone(self.adapter.issue_view(observed)['body'])
+        self.assertIsNone(self.adapter.issue_view(observed)['title'])
+        self.run.return_value = '[]'
+        self.assertEqual(self.adapter.poll_commands(), ())
+
+    def test_fetch_validates_normalized_task_and_scope_without_extra_reads(self):
+        self.assertEqual(self.adapter.fetch_task(self.target), self.adapter.map_task(self.issue))
+        self.read.assert_called_once_with('issue', 'view', '12', '-R', 'OWNER/Tasks',
+                                         '--json', 'number,title,body,labels,url,state')
+        self.read.reset_mock()
+        for target in (GitHubTransport('owner/other').issue_ref(12),
+                       self.adapter.comment_ref(12, {'id': 91})):
+            with self.assertRaises(TransportError): self.adapter.fetch_task(target)
+            with self.assertRaises(TransportError): self.adapter.post_comment(target, 'text')
+        self.read.assert_not_called()
+        self.read.return_value = {**self.issue, 'number': 13}
+        with self.assertRaises(TransportError): self.adapter.fetch_task(self.target)
+
+    def test_comment_bytes_and_label_arguments_remain_v1_compatible(self):
+        body = 'Owner action COMMIT: ALLOWED; state COMMITTED\n\n<!-- DEVORCHESTRATOR_EFFECT_V1 abc -->'
+        def read_body(*args):
+            self.assertEqual(args[:5], ('issue', 'comment', '12', '-R', 'OWNER/Tasks'))
+            self.assertEqual(args[5], '--body-file')
+            self.assertEqual(Path(args[6]).read_bytes(), body.encode('utf-8'))
+            return ''
+        self.run.side_effect = read_body
+        self.adapter.post_comment(self.target, body)
+        self.run.assert_called_once()
+        self.run.reset_mock(side_effect=True)
+        self.adapter.transition_issue(self.issue, 'dev:running')
+        self.run.assert_called_once_with('issue', 'edit', '12', '-R', 'OWNER/Tasks',
+                                        '--remove-label', 'work:queued', '--add-label', 'dev:running')
+        self.run.reset_mock()
+        self.adapter.transition_issue({**self.issue, 'labels': ['dev:running', 'project:test']}, 'dev:running')
+        self.run.assert_not_called()
+
+    def test_read_and_ambiguous_write_errors_are_explicit_and_secret_free(self):
+        self.read.side_effect = self.run.side_effect = OSError('credential-secret')
+        for operation, uncertain in ((lambda: self.adapter.fetch_task(self.target), False),
+                                     (lambda: self.adapter.post_comment(self.target, 'text'), True),
+                                     (lambda: self.adapter.transition_issue(self.issue, 'dev:running'), True)):
+            with self.subTest(uncertain=uncertain), self.assertRaises(TransportError) as error:
+                operation()
+            self.assertEqual(error.exception.uncertain, uncertain)
+            self.assertNotIn('credential-secret', str(error.exception))

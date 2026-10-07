@@ -1,23 +1,38 @@
-# V2-M2B transport boundary
+# V2-M2C GitHub runtime bridge
 
-`transports.py` is an additive, I/O-only contract above the M2A envelopes.
-`github_transport.py` is a pure GitHub mapping skeleton. Neither is imported by
-production TaskBridge, MCP, notifications or publication code. No network calls,
-credentials, new configuration, polling implementation or lifecycle engine are
-introduced. Runtime integration belongs to M2C.
+`transports.py` defines the I/O-only contract above the M2A envelopes.
+`github_transport.py` now owns the GitHub task-bus I/O used by TaskBridge.
+GitHub is the only active transport. The existing bridge polling loop, CLI runner
+and timeouts, workflow, durable state and outbox remain authoritative. No new
+configuration, credentials, dispatcher or lifecycle engine is introduced.
+
+`task_bridge.open_issues()` calls `GitHubTransport.poll_commands()` once, then
+obtains V1 issue views of that validated batch through `issue_view()`. Discovery
+therefore passes through `ExternalTask` and `ControlCommand` before V1 consumes
+task text or metadata. Commands contain only unparsed title/body/display URL and
+the external issue address; provider labels and other metadata stay in the
+adapter's ephemeral compatibility views. The views preserve V1 fields, nulls,
+URL precedence and issue numbers. They are neither new reads nor lifecycle state.
+A failed poll clears the batch and exposes no partial or stale views.
+
+Discovery commands use kind `task.discovered`, an empty descriptive actor and the
+GitHub creation timestamp (an epoch sentinel for missing legacy fixture metadata).
+They do not claim a local task/project reference or owner authority. No M2A journal
+writes or dispatch are added: edited task text can still follow V1 recovery rules
+without journal conflicts, and V1 issue-number keys and RPC identities are intact.
 
 ## Existing GitHub responsibilities
 
-| Responsibility | Current V1 owner | M2B treatment |
+| Responsibility | V1 workflow seam | M2C boundary |
 | --- | --- | --- |
-| Open issue discovery, pagination, PR filtering | `task_bridge.open_issues`, `gh_pages` | Contract can poll normalized commands; skeleton only maps issue references/text. |
-| Issue title/body/labels and tracked closed-issue fetch | `reconcile_tick`, `gh_json`, `label_names` | `ExternalTask` exposes reference/title/body/display URL; provider metadata and labels stay adapter-owned. |
-| Task marker parsing and execution options | `parse_task`, `start_queued` | Remain local; skeleton preserves unparsed body. |
-| Comments and author/time normalization | `issue_comments` | Future adapter supplies normalized `ControlCommand`; no GitHub comment object in the protocol. |
+| Open issue discovery, pagination, PR filtering | `task_bridge.open_issues`, `gh_pages` | `poll_commands`, `issue_view`, `pages`; one complete validated poll, no duplicate discovery. |
+| Issue title/body/labels and tracked closed-issue fetch | `reconcile_tick`, `fetch_issue`, `label_names` | Adapter `fetch_issue` validates through `ExternalTask`, binds the requested issue reference and returns a V1 compatibility view. `fetch_task` exposes the normalized task directly. |
+| Task marker parsing and execution options | `parse_task`, `start_queued` | Remain local; adapter preserves unparsed body. |
+| Comments and author/time normalization | `issue_comments` | Adapter compatibility method retains V1 author/time/URL precedence and all dedupe aliases. Comment commands are not newly dispatched. |
 | Owner/follow-up markers, trusted authors, question freshness | `parse_owner_command`, `authorized_comment`, `process_followup`, `process_owner_actions` | All authorization, freshness and workflow decisions remain local. |
-| Report/review comments, desired labels | `format_report`, `add_comment`, `transition_issue` | `publish_event` can render a local event as a comment or visible state/labels; never changes local owner/lifecycle state. |
+| Report/review comments, desired labels | `format_report`, `add_comment`, `transition_issue` | Existing durable outbox uses adapter `post_comment`, `fetch_labels` and `transition_issue` via compatibility wrappers; bodies, markers and label arguments are unchanged. |
 | Durable inbound dedupe and launch identity | `processed_followups`, `processed_owner_actions`, `comment_already_processed`, pending RPC, scheduler/worker receipts | Unchanged. M2A source identity is additive, not a migration of V1 operation keys. |
-| Durable external delivery/recovery | `bridge_effects` outbox and `flush_effects` | Unchanged, including comment effect markers, latest desired labels and bounded batches. |
+| Durable external delivery/recovery | `bridge_effects` outbox and `flush_effects` | Unchanged, including comment effect markers, latest desired labels and bounded batches. Ambiguous adapter writes raise `TransportError(uncertain=True)`; V1 re-reads markers/current labels before retrying. |
 | Telegram terminal notifications | `notifications`, V1 outbox | Unchanged and outside this milestone. |
 
 GitHub publication repository calls in `publication.py` are not task-bus transport
@@ -51,11 +66,13 @@ provider exception text and credentials must not leak. Targets outside an
 adapter's scope must be rejected. A Protocol defines this contract; it does not
 sandbox arbitrary adapter code or itself implement delivery/retry validation.
 
-The GitHub skeleton explicitly raises `not_implemented` for all I/O, including
-outbound events. Its pure mapping helpers are usable offline; it is deliberately
-not a production delivery implementation. M2C must define supported event
-rendering and retain durable dedupe/recovery before integrating it. Event IDs can
-key delivery markers, but are not proof of successful delivery.
+GitHub I/O uses injected CLI functions that receive no mutable lifecycle state.
+Mapping-only instances without CLI functions still fail explicitly with
+`not_implemented`. `publish_event` remains explicitly unsupported in M2C: the
+authoritative outbound path is the V1 outbox through the adapter compatibility
+methods, with its existing delivery keys and comment markers. Generic V2 event
+rendering would require a later migration of delivery semantics. There is no
+parallel polling or effect-delivery loop.
 
 ## Source identity and GitHub mapping
 
@@ -84,13 +101,18 @@ rejects PR objects. It does not parse task, follow-up or owner markers.
 `tests/test_transports.py` checks the normalized contract, distinct implementations
 (including a test-only second-provider double), multiple same-provider instances,
 stable and revised sources, explicit/uncertain failures, GitHub reference aliases,
-M2A replay/conflicts and unchanged local owner/lifecycle state. No ClickUp API,
-polling/webhooks, credentials or configuration are added.
+M2A replay/conflicts, runtime discovery/fetch/label/comment compatibility and
+explicit failures. The whole-bridge harness now fakes provider I/O while keeping
+GitHubTransport active, so existing integration/recovery/owner-flow cases exercise
+the migrated path. Additional cases check poll/comment failures, same-session
+follow-ups, all publication command gates, ambiguous-write marker reconciliation,
+duplicate polls and read-only/no-op completion. No ClickUp API, polling/webhooks,
+credentials or configuration are added.
 
 ```bash
 python3 -m unittest discover -s tests -p 'test_transports.py' -v
 PYTHONPATH=tests:. python3 -m unittest test_control_plane test_bridge_integration test_boundaries test_recovery test_owner_flow -v
 python3 -m unittest discover -s tests -v
-python3 -m py_compile transports.py github_transport.py tests/test_transports.py
+python3 -m py_compile transports.py github_transport.py task_bridge.py tests/test_transports.py tests/test_bridge_integration.py
 git diff --check
 ```

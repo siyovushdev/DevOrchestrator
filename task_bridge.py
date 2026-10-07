@@ -6,12 +6,12 @@ import math
 import os
 import re
 import subprocess
-import tempfile
 import time
 from pathlib import Path
 
 import notifications
 import bridge_effects
+from github_transport import GitHubTransport
 from lifecycle import WORK_QUEUE_LABEL, worker_guard
 from datetime import datetime, timezone
 from durable import read_json, write_json, exclusive
@@ -865,48 +865,22 @@ def save_state(state):
 
 
 def label_names(issue):
-    result = set()
+    return GitHubTransport.label_names(issue)
 
-    for label in issue.get("labels") or []:
-        if isinstance(label, dict):
-            name = label.get("name")
-        else:
-            name = str(label)
 
-        if name:
-            result.add(name)
-
-    return result
+def github_task_transport():
+    # One GitHub runtime, using the existing CLI/timeouts and V1 label mapping.
+    # These callbacks perform I/O only; the adapter receives no lifecycle state.
+    return GitHubTransport(REPO, run=gh, read_json=gh_json, state_labels=STATE_LABELS)
 
 
 def raw_transition_issue(issue, target):
-    current = label_names(issue)
-
-    args = [
-        "issue", "edit", str(issue["number"]),
-        "-R", REPO,
-    ]
-
-    changed = False
-
-    for label in STATE_LABELS:
-        if label in current and label != target:
-            args += ["--remove-label", label]
-            changed = True
-
-    if target not in current:
-        args += ["--add-label", target]
-        changed = True
-
-    if changed:
-        gh(*args)
+    return github_task_transport().transition_issue(issue, target)
 
 
 def raw_add_comment(number, body):
-    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as stream:
-        stream.write(body)
-        stream.flush()
-        gh("issue", "comment", str(number), "-R", REPO, "--body-file", stream.name)
+    adapter = github_task_transport()
+    return adapter.post_comment(adapter.issue_ref(number), body)
 
 
 
@@ -952,8 +926,8 @@ def flush_effects(state, reconciled=True):
         save_state(state)
     def transition(issue, target):
         # Read current labels, since outbox payload may predate a restart or another transition.
-        current = gh_json("issue", "view", str(issue["number"]), "-R", REPO,
-                          "--json", "number,labels")
+        adapter = github_task_transport()
+        current = adapter.fetch_labels(adapter.issue_ref(issue["number"]))
         raw_transition_issue(current, target)
     bridge_effects.flush(state, lambda: save_state(state), issue_comments,
                         raw_add_comment, transition, send_telegram,
@@ -1153,29 +1127,22 @@ async def mcp_call(name, arguments):
 
 
 def gh_pages(endpoint):
-    # Older installed gh versions emit adjacent JSON arrays for --paginate (no --slurp).
-    raw = gh("api", endpoint, "--paginate")
-    decoder = json.JSONDecoder()
-    rows = []
-    while raw.strip():
-        page, position = decoder.raw_decode(raw.lstrip())
-        if not isinstance(page, list):
-            raise RuntimeError("Expected a paginated GitHub collection")
-        rows.extend(page)
-        raw = raw.lstrip()[position:]
-    return rows
+    return github_task_transport().pages(endpoint)
 
 
 def open_issues():
-    rows = gh_pages(f"repos/{REPO}/issues?state=open&sort=created&direction=asc&per_page=100")
-    return [{**row, "url": row.get("html_url") or row.get("url")} for row in rows if "pull_request" not in row]
+    adapter = github_task_transport()
+    return [adapter.issue_view(command) for command in adapter.poll_commands()]
+
+
+def fetch_issue(number):
+    adapter = github_task_transport()
+    return adapter.fetch_issue(adapter.issue_ref(number))
 
 
 def issue_comments(number):
-    rows = gh_pages(f"repos/{REPO}/issues/{number}/comments?per_page=100")
-    return [{**row, "author": row.get("user") or row.get("author"),
-             "url": row.get("html_url") or row.get("url"),
-             "createdAt": row.get("created_at") or row.get("createdAt")} for row in rows]
+    adapter = github_task_transport()
+    return adapter.issue_comments(adapter.issue_ref(number))
 
 
 def comment_id(comment):
@@ -2510,8 +2477,7 @@ async def reconcile_tick(state):
             issue = by_number.get(number)
             if not issue:
                 # Closed/missing from list is not proof a process stopped. Fetch tracked issues explicitly.
-                issue = gh_json("issue", "view", number, "-R", REPO,
-                                "--json", "number,title,body,labels,url,state")
+                issue = fetch_issue(number)
         except Exception:
             defer_issue(item, state, number)
             continue

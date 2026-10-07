@@ -1,4 +1,4 @@
-"""Additive V2 transport boundary; deliberately not wired into TaskBridge.
+"""V2 transport boundary, incrementally used by the GitHub V1 task bus.
 
 Adapters exchange observations and externally visible effects, never local task
 state. A command's actor is descriptive; authorization and all workflow decisions
