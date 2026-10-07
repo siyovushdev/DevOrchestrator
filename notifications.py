@@ -23,6 +23,38 @@ def review_approval_complete(item):
             item.get('review_hold') is None)
 
 
+def publication_delta_present(item, report):
+    """True/False when repository delta can be proven; None when unknown."""
+    reviewed = item.get("reviewed_tree")
+    baseline = (report or {}).get("git_baseline")
+
+    if not isinstance(reviewed, dict) or not isinstance(baseline, dict):
+        return None
+
+    reviewed_fp = reviewed.get("fingerprint")
+    baseline_fp = baseline.get("snapshot_fingerprint")
+
+    if (
+        isinstance(reviewed_fp, str)
+        and reviewed_fp
+        and isinstance(baseline_fp, str)
+        and baseline_fp
+    ):
+        return reviewed_fp != baseline_fp
+
+    # Safe compatibility fallback for tasks created before fingerprint support:
+    # a clean baseline + identical HEAD + still-clean reviewed worktree proves no-op.
+    if (
+        baseline.get("clean") is True
+        and reviewed.get("head") == baseline.get("head")
+        and str(reviewed.get("status") or "").rstrip("\n") == ""
+    ):
+        return False
+
+    # Dirty legacy baselines cannot be proven unchanged from porcelain alone.
+    return None
+
+
 def send(text, opener=None, sleep=time.sleep):
     """True=accepted, False=known undelivered, None=acceptance uncertain.
 
@@ -76,6 +108,13 @@ def terminal_text(status, issue, item, report=None, blocker=None):
             blocker = 'Historical review PASS lacks owner approval or reviewed-tree evidence. Send a trusted follow-up for a fresh independent review before publication.'
         elif item['owner_state'] != 'READY_FOR_OWNER':
             status = item['owner_state']
+    no_publication_required = (
+        status == 'REVIEW_PASSED / READY_FOR_OWNER'
+        and publication_delta_present(item, report) is False
+    )
+    if no_publication_required:
+        status = 'REVIEW_PASSED / COMPLETE'
+
     lines = [status, str(issue.get('title') or f"Task #{issue['number']}")[:200],
              f"Project: {item.get('project', '?')}",
              f"Coding agent: {item.get('coding_agent') or report.get('agent', '?')}"]
@@ -86,6 +125,8 @@ def terminal_text(status, issue, item, report=None, blocker=None):
         next_action = 'INSPECT_WORKER'
     if next_action:
         lines.append("Next owner action: " + next_action)
+    if no_publication_required:
+        lines.append("Publication: NOT_REQUIRED (no repository delta)")
     values = [('Model', report.get('model') or item.get('model')),
               ('Effort', report.get('reasoning_effort') or item.get('effort')),
               ('Reviewer', item.get('reviewer_agent')), ('Review round', item.get('review_round')),
