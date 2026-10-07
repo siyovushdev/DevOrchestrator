@@ -7,12 +7,13 @@ from pathlib import Path
 import tempfile
 
 
-def read_json(path, default=None):
+def read_json(path, default=None, *, object_pairs_hook=None):
     path = Path(path)
     if not path.exists():
         return default
     # Corrupt state is a fail-closed error, never a fresh empty state.
-    return json.loads(path.read_text())
+    # Optional strict object decoding for new contracts; V1 keeps JSON defaults.
+    return json.loads(path.read_text(), object_pairs_hook=object_pairs_hook)
 
 
 def write_json(path, data):
