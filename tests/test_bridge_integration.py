@@ -137,6 +137,515 @@ class BridgeIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item['owner_state'], 'READY_FOR_OWNER')
         return item
 
+    async def running_review(self):
+        await self.tick()
+        item = self.h.state['issues']['1']
+        self.h.finish(item['task_id'], coding_result())
+        await self.tick()
+        return item
+
+    async def test_stale_ready_on_running_followup_waits_for_new_terminal_turn(self):
+        item = await self.ready()
+        old_reviewer = item['review_task_id']; coding_id = item['task_id']
+        self.h.comment(b.FOLLOWUP_MARKER + '\nFix the coding/review race')
+        async def transport(name, args):
+            result = await self.h.transport(name, args)
+            if name == 'continue_task' and args['task_id'] == coding_id:
+                self.h.tasks[coding_id]['result'] = coding_result()
+                result['result'] = coding_result()
+            return result
+        with patch.object(b, 'transport_call', transport):
+            await self.tick()
+        self.assertEqual(self.h.tasks[coding_id]['status'], 'RUNNING')
+        self.assertIsNone(item['review_task_id'])
+        self.assertIsNone(item['owner_state'])
+        self.assertIsNone(item['reviewed_tree'])
+        self.assertNotIn('review_coding_turn', item)
+        self.assertEqual(len(self.h.starts), 2)
+        self.h.restart(); await self.tick(); await self.tick()
+        self.assertIsNone(self.h.state['issues']['1']['review_task_id'])
+        self.assertEqual(len(self.h.starts), 2)
+        self.h.finish(coding_id, coding_result()); await self.tick()
+        item = self.h.state['issues']['1']; fresh = item['review_task_id']
+        self.assertNotEqual(fresh, old_reviewer)
+        self.assertEqual(item['review_coding_turn'], 2)
+        self.h.restart(); await self.tick()
+        self.assertEqual(len(self.h.starts), 3)
+        self.h.finish(fresh, review_result()); await self.tick()
+        self.assertEqual(self.h.state['issues']['1']['owner_state'], 'READY_FOR_OWNER')
+
+    async def test_old_reviewer_pass_is_ignored_while_coding_has_resumed(self):
+        item = await self.running_review(); old = item['review_task_id']; coder = item['task_id']
+        self.h.tasks[coder].update(status='RUNNING', turns=2, result=coding_result())
+        self.h.finish(old, review_result())
+        self.h.restart(); await self.tick(); self.h.restart(); await self.tick()
+        item = self.h.state['issues']['1']
+        self.assertIsNone(item['review_task_id'])
+        self.assertIsNone(item['owner_state'])
+        self.assertIn(old, item['stale_review_task_ids'])
+        self.assertEqual(len(self.h.starts), 2)
+        self.assertFalse(any('REVIEW_PASSED' in c.args[0] for c in self.h.telegram.call_args_list))
+        self.h.finish(coder, coding_result()); await self.tick()
+        self.assertNotEqual(item['review_task_id'], old)
+        self.assertEqual(item['review_coding_turn'], 2)
+        self.assertEqual(len(self.h.starts), 3)
+
+    async def test_invalidated_reviewer_retains_lock_until_terminal(self):
+        item = await self.running_review(); old = item['review_task_id']; coder = item['task_id']
+        self.h.tasks[coder].update(status='RUNNING', turns=2, result=coding_result())
+        await self.tick()
+        self.h.finish(coder, coding_result()); await self.tick()
+        self.h.restart(); await self.tick()
+        self.assertEqual(len(self.h.starts), 2)
+        self.assertFalse(scheduler.Scheduler(self.h.state).release('1'))
+        self.assertIn(old, self.h.state['issues']['1']['stale_review_task_ids'])
+        self.h.finish(old, review_result()); await self.tick()
+        self.assertEqual(len(self.h.starts), 3)
+        self.assertNotEqual(self.h.state['issues']['1']['review_task_id'], old)
+
+    async def test_coding_resume_during_reviewer_report_prevents_pass(self):
+        item = await self.running_review(); old = item['review_task_id']; coder = item['task_id']
+        self.h.finish(old, review_result())
+        async def transport(name, args):
+            result = await self.h.transport(name, args)
+            if name == 'get_task_report' and args['task_id'] == old:
+                self.h.tasks[coder].update(status='RUNNING', turns=2, result=coding_result())
+            return result
+        with patch.object(b, 'transport_call', transport):
+            await self.tick()
+        self.assertIsNone(item['review_task_id'])
+        self.assertIsNone(item['owner_state'])
+        self.assertIsNone(item['reviewed_tree'])
+        self.assertFalse(any('REVIEW_PASSED' in c.args[0] for c in self.h.telegram.call_args_list))
+
+    async def test_coding_resume_before_format_rpc_prevents_reviewer_continue(self):
+        item = await self.running_review(); coder = item['task_id']
+        self.h.finish(item['review_task_id'], 'Malformed review')
+        coding_reads = 0
+        async def transport(name, args):
+            nonlocal coding_reads
+            if name == 'get_task_report' and args['task_id'] == coder:
+                coding_reads += 1
+                if coding_reads == 4:
+                    self.h.tasks[coder].update(status='RUNNING', turns=2, result=coding_result())
+            return await self.h.transport(name, args)
+        with patch.object(b, 'transport_call', transport):
+            await self.tick()
+        self.assertEqual(self.h.continues, [])
+        self.assertIsNone(item['review_task_id'])
+        self.assertIsNone(item['owner_state'])
+
+    async def test_pending_review_launch_cancelled_on_new_turn_uses_fresh_request(self):
+        await self.tick(); item = self.h.state['issues']['1']; coder = item['task_id']
+        self.h.finish(coder, coding_result()); self.h.fail_after_start = True
+        await self.tick()
+        old = self.h.starts[-1][1]
+        self.assertEqual(item['pending_rpc']['operation'], 'review:1')
+        next_attempt = item['reconciliation_retry']['next_attempt']
+        self.h.tasks[coder].update(status='RUNNING', turns=2, result=coding_result())
+        self.h.restart(); await self.tick()
+        item = self.h.state['issues']['1']
+        self.assertFalse(item.get('pending_rpc'))
+        self.assertIn(old, item['stale_review_task_ids'])
+        self.h.finish(old, review_result()); self.h.finish(coder, coding_result())
+        with patch.object(b.time, 'time', return_value=next_attempt + 1):
+            await self.tick()
+        self.assertEqual(len(self.h.starts), 3)
+        self.assertNotEqual(item['review_task_id'], old)
+        self.assertEqual(item['review_round'], 2)
+        self.assertEqual(item['review_coding_turn'], 2)
+        self.assertIsNone(item['owner_state'])
+
+    async def test_cancelled_format_rpc_drains_finished_turn_after_restart(self):
+        item = await self.running_review(); old = item['review_task_id']; coder = item['task_id']
+        self.h.finish(old, 'Malformed review')
+        async def transport(name, args):
+            if name == 'continue_task' and args.get('role') == 'review':
+                # Crash after durable reservation, before dispatching the format RPC.
+                raise asyncio.CancelledError()
+            return await self.h.transport(name, args)
+        with patch.object(b, 'transport_call', transport), self.assertRaises(asyncio.CancelledError):
+            await self.tick()
+        self.assertTrue(item['pending_rpc']['operation'].startswith('review-format:'))
+        reserved = next(j for j in self.h.state['work_queue'].values() if j['status'] == 'RESERVED')
+        self.assertTrue(reserved['launch_pending'])
+        self.assertEqual(self.h.tasks[old]['turns'], 1)
+        self.assertEqual(self.h.continues, [])
+        self.h.tasks[coder].update(status='RUNNING', turns=2, result=coding_result())
+        self.h.restart(); await self.tick()
+        item = self.h.state['issues']['1']
+        self.assertFalse(item.get('pending_rpc'))
+        self.assertIsNone(item['review_task_id'])
+        self.assertIn(old, item['stale_review_task_ids'])
+        self.h.restart()
+        self.h.finish(coder, coding_result()); await self.tick()
+        item = self.h.state['issues']['1']; fresh = item['review_task_id']
+        cancelled = [j for j in self.h.state['work_queue'].values() if j.get('cancelled')]
+        self.assertEqual(len(cancelled), 1)
+        self.assertEqual(cancelled[0]['status'], 'DONE')
+        self.assertFalse(cancelled[0]['launch_pending'])
+        self.assertFalse(item.get('stale_review_task_ids'))
+        self.assertNotEqual(fresh, old)
+        self.assertEqual(item['review_coding_turn'], 2)
+        self.assertEqual(len(self.h.starts), 3)
+        self.assertEqual(self.h.continues, [])
+        self.h.restart(); await self.tick()
+        self.assertEqual(len(self.h.starts), 3)
+        self.h.finish(fresh, review_result()); await self.tick()
+        self.assertEqual(self.h.state['issues']['1']['owner_state'], 'READY_FOR_OWNER')
+        self.assertTrue(scheduler.Scheduler(self.h.state).release('1'))
+
+    async def test_cancelled_accepted_format_rpc_keeps_active_reviewer_locked(self):
+        item = await self.running_review(); old = item['review_task_id']; coder = item['task_id']
+        self.h.finish(old, 'Malformed review'); self.h.fail_after_start = True
+        await self.tick()
+        self.assertTrue(item['pending_rpc']['operation'].startswith('review-format:'))
+        next_attempt = item['reconciliation_retry']['next_attempt']
+        self.h.tasks[coder].update(status='RUNNING', turns=2, result=coding_result())
+        self.h.restart(); await self.tick()
+        self.h.finish(coder, coding_result())
+        with patch.object(b.time, 'time', return_value=next_attempt + 1):
+            await self.tick()
+        item = self.h.state['issues']['1']
+        cancelled = next(j for j in self.h.state['work_queue'].values() if j.get('cancelled'))
+        self.assertEqual(cancelled['status'], 'RUNNING')
+        self.assertFalse(cancelled['launch_pending'])
+        self.assertIn(old, item['stale_review_task_ids'])
+        self.assertIsNone(item['review_task_id'])
+        self.assertFalse(scheduler.Scheduler(self.h.state).release('1'))
+        self.h.tasks[old]['status'] = 'UNKNOWN'
+        self.h.restart(); await self.tick()
+        self.assertIsNone(self.h.state['issues']['1']['review_task_id'])
+        self.assertFalse(scheduler.Scheduler(self.h.state).release('1'))
+        self.h.finish(old, review_result()); await self.tick()
+        self.assertNotEqual(self.h.state['issues']['1']['review_task_id'], old)
+        self.assertEqual(len(self.h.starts), 3)
+        self.assertEqual(len(self.h.continues), 1)
+
+    async def test_preupgrade_cancelled_format_job_drains_without_expected_turn(self):
+        item = await self.running_review(); old = item['review_task_id']; coder = item['task_id']
+        self.h.finish(old, 'Malformed review'); self.h.fail_after_start = True
+        await self.tick()
+        next_attempt = item['reconciliation_retry']['next_attempt']
+        self.h.tasks[coder].update(status='RUNNING', turns=2, result=coding_result())
+        await self.tick()
+        # Reproduce persisted cancellation from the earlier bridge implementation.
+        cancelled = next(j for j in self.h.state['work_queue'].values() if j.get('cancelled'))
+        cancelled.pop('cancelled'); cancelled['cancelled_review_turn'] = 2
+        self.h.tasks[old].update(status='DONE', turns=1, result=review_result())
+        item['stale_review_diagnostic'] = 'Invalidated reviewer launch is uncertain'
+        b.save_state(self.h.state); self.h.restart()
+        self.h.finish(coder, coding_result())
+        with patch.object(b.time, 'time', return_value=next_attempt + 1):
+            await self.tick()
+        item = self.h.state['issues']['1']
+        self.assertNotEqual(item['review_task_id'], old)
+        self.assertFalse(item.get('stale_review_task_ids'))
+        self.assertFalse(item.get('stale_review_diagnostic'))
+        self.assertFalse(any(j.get('cancelled_review_turn') for j in self.h.state['work_queue'].values()))
+        self.assertEqual(len(self.h.starts), 3)
+
+    async def test_task_list_outage_flushes_durable_github_and_telegram_effects(self):
+        for error in (OSError('transport unavailable'), RuntimeError('Invalid MCP task collection')):
+            with self.subTest(error=type(error).__name__):
+                number = 1
+                comment = 'Recovery diagnostic: ' + type(error).__name__
+                keys = [b.bridge_effects.enqueue(self.h.state, number, 'comment', comment),
+                        b.bridge_effects.enqueue(self.h.state, number, 'transition',
+                            {'issue': self.h.issues[number], 'target': 'dev:running'}, comment),
+                        b.bridge_effects.enqueue(self.h.state, number, 'telegram', comment)]
+                uncertain = b.bridge_effects.enqueue(self.h.state, number, 'telegram', 'Already sending: ' + comment)
+                self.h.state['outbox'][uncertain]['status'] = 'SENDING'
+                b.save_state(self.h.state); self.h.restart()
+                async def unavailable(name, args):
+                    self.assertEqual(name, 'list_tasks')
+                    raise error
+                with patch.object(b, 'transport_call', unavailable):
+                    with self.assertRaises(type(error)):
+                        await self.tick()
+                    self.h.restart()
+                    with self.assertRaises(type(error)):
+                        await self.tick()
+                self.assertTrue(all(self.h.state['outbox'][k]['status'] == 'DONE' for k in keys))
+                self.assertEqual(self.h.state['outbox'][uncertain]['status'], 'UNCERTAIN')
+                self.assertFalse(any(c.args[0].startswith('Already sending:') for c in self.h.telegram.call_args_list))
+                self.assertEqual(sum(comment in c['body'] for c in self.h.comments[number]), 1)
+                self.assertEqual(sum(c.args[0] == comment for c in self.h.telegram.call_args_list), 1)
+                self.assertEqual(self.h.issues[number]['labels'], ['dev:running'])
+                self.assertEqual(self.h.starts, [])
+                self.assertIsNone(b.WORK_CONTEXT)
+
+    async def test_outage_defers_approval_notice_until_successful_reconciliation(self):
+        await self.ready()
+        approvals = [e for e in self.h.state['outbox'].values() if
+                     (e['kind'] == 'telegram' and e['payload'].startswith('REVIEW_PASSED')) or
+                     (e['kind'] == 'transition' and e['payload']['target'] == 'dev:ready-for-review')]
+        for entry in approvals:
+            entry['status'] = 'PENDING'
+        self.h.telegram.reset_mock()
+        other = b.bridge_effects.enqueue(self.h.state, 1, 'telegram', 'Independent recovery notice')
+        with patch.object(b, 'transport_call', AsyncMock(side_effect=ValueError('Bad task list'))):
+            with self.assertRaises(ValueError):
+                await self.tick()
+        self.assertTrue(all(e['status'] == 'PENDING' for e in approvals))
+        self.assertTrue(all(e['attempts'] == 0 for e in approvals))
+        self.assertEqual(self.h.state['outbox'][other]['status'], 'DONE')
+        self.assertEqual(self.h.telegram.call_args_list[0].args[0], 'Independent recovery notice')
+        self.h.restart(); await self.tick(); self.h.restart(); await self.tick()
+        self.assertEqual(sum('REVIEW_PASSED' in c.args[0] for c in self.h.telegram.call_args_list), 1)
+
+    async def test_outage_does_not_send_stale_approval_before_resumed_coding_is_observed(self):
+        item = await self.ready()
+        for entry in self.h.state['outbox'].values():
+            if entry['kind'] == 'telegram' and entry['payload'].startswith('REVIEW_PASSED'):
+                entry['status'] = 'PENDING'
+        self.h.tasks[item['task_id']].update(status='RUNNING', turns=2, result=coding_result())
+        self.h.telegram.reset_mock()
+        with patch.object(b, 'transport_call', AsyncMock(side_effect=OSError('Task service outage'))):
+            with self.assertRaises(OSError):
+                await self.tick()
+        self.h.telegram.assert_not_called()
+        self.h.restart(); await self.tick()
+        self.assertFalse(any('REVIEW_PASSED' in c.args[0] for c in self.h.telegram.call_args_list))
+        self.assertIsNone(self.h.state['issues']['1']['owner_state'])
+
+    async def test_new_terminal_turn_invalidates_review_without_running_poll(self):
+        item = await self.running_review(); old = item['review_task_id']
+        self.h.tasks[item['task_id']].update(status='DONE', turns=2, result=coding_result())
+        self.h.finish(old, review_result())
+        self.h.restart(); await self.tick()
+        item = self.h.state['issues']['1']
+        self.assertNotEqual(item['review_task_id'], old)
+        self.assertEqual(item['review_coding_turn'], 2)
+        self.assertIsNone(item['owner_state'])
+        self.assertFalse(any('REVIEW_PASSED' in c.args[0] for c in self.h.telegram.call_args_list))
+
+    async def test_unbound_legacy_reviewer_72624bcb32db_cannot_approve(self):
+        item = await self.running_review(); old = item['review_task_id']; legacy = '72624bcb32db'
+        self.h.tasks[legacy] = self.h.tasks.pop(old); self.h.tasks[legacy]['id'] = legacy
+        for job in self.h.state['work_queue'].values():
+            if job.get('task_id') == old:
+                job['task_id'] = legacy
+        item['review_task_id'] = legacy; item.pop('review_coding_turn')
+        self.h.finish(legacy, review_result())
+        b.save_state(self.h.state); self.h.restart(); await self.tick()
+        item = self.h.state['issues']['1']
+        self.assertNotEqual(item['review_task_id'], legacy)
+        self.assertIsNone(item['owner_state'])
+        self.assertEqual(len(self.h.starts), 3)
+        self.assertFalse(any('REVIEW_PASSED' in c.args[0] for c in self.h.telegram.call_args_list))
+
+    async def test_pending_pass_notice_suppressed_when_coding_is_uncertain(self):
+        item = await self.ready()
+        for entry in self.h.state['outbox'].values():
+            if entry['kind'] == 'telegram' and entry['payload'].startswith('REVIEW_PASSED'):
+                entry['status'] = 'PENDING'
+        self.h.tasks[item['task_id']]['status'] = 'UNKNOWN'
+        self.h.telegram.reset_mock()
+        await self.tick()
+        messages = [c.args[0] for c in self.h.telegram.call_args_list]
+        self.assertFalse(any('REVIEW_PASSED' in m or 'Next owner action: COMMIT' in m for m in messages))
+
+    async def test_malformed_review_turn_and_stale_ids_do_not_poison_tick(self):
+        for number, fields in enumerate(({'coding_turn': 0}, {'review_coding_turn': 'invalid'},
+                                        {'stale_review_task_ids': {'bad': 'shape'}},
+                                        {'stale_review_task_ids': ['../unregistered']},
+                                        {'review_task_id': ['bad']},
+                                        {'pending_rpc': {'name': 'start_task', 'operation': 'review:1', 'arguments': {}}},
+                                        {'pending_rpc': {'name': 'continue_task', 'operation': 'review-format:old:1', 'arguments': {}}}), start=5):
+            item = self.legacy(number)
+            item.update(fields)
+        await self.tick(); self.h.restart(); await self.tick()
+        for number in range(5, 12):
+            self.assertEqual(self.h.state['issues'][str(number)]['compatibility_status'], 'QUARANTINED')
+        self.assertEqual(self.h.state['issues']['1']['queue_status'], 'STARTED')
+        self.assertEqual(len(self.h.starts), 1)
+
+    async def test_historical_pass_without_coding_binding_holds_publication(self):
+        item = await self.ready()
+        item.pop('review_coding_turn'); item.pop('review_start_tree')
+        self.h.comment('<!-- DEVORCHESTRATOR_OWNER_V1 {"action":"COMMIT"} -->')
+        self.h.telegram.reset_mock()
+        await self.tick(); self.h.restart(); await self.tick()
+        item = self.h.state['issues']['1']
+        self.assertEqual(item['review_status'], 'FRESH_REVIEW_REQUIRED')
+        self.assertIn('no verified coding-turn binding', item['review_hold']['diagnostic'])
+        self.assertFalse(item.get('processed_owner_actions'))
+        self.assertEqual(len(self.h.starts), 2)
+        self.assertFalse(any('REVIEW_PASSED' in c.args[0] for c in self.h.telegram.call_args_list))
+
+    async def pending_format_fallback(self):
+        item = await self.running_review()
+        reviewer = item['review_task_id']
+        self.h.finish(reviewer, review_result() + ' extra trailing data')
+        await self.tick()
+        self.assertEqual(item['review_format_corrections'], 1)
+        self.h.finish(reviewer, 'The review is complete, but the trailer is missing.')
+        await self.tick()
+        return item, reviewer
+
+    async def test_same_session_format_correction_can_pass_without_fallback(self):
+        item = await self.running_review()
+        reviewer = item['review_task_id']
+        self.h.finish(reviewer, 'DEVORCHESTRATOR_REVIEW: {invalid JSON')
+        await self.tick()
+        self.assertEqual(self.h.continues[0][0], reviewer)
+        self.assertIsNone(item.get('owner_state'))
+        self.assertNotIn('REVIEW_PASSED', '\n'.join(c.args[0] for c in self.h.telegram.call_args_list))
+        self.h.finish(reviewer, review_result()); await self.tick()
+        self.assertEqual(item['owner_state'], 'READY_FOR_OWNER')
+        self.assertEqual(item['review_format_restarts'], 0)
+        self.assertEqual(len(self.h.starts), 2)
+
+    async def test_missing_trailer_after_retry_persists_fresh_reviewer_intent(self):
+        item, old_reviewer = await self.pending_format_fallback()
+        persisted = read_json(b.STATE_FILE)['issues']['1']
+        self.assertEqual(persisted['review_format_restarts'], 1)
+        self.assertEqual(persisted['review_status'], 'RUNNING')
+        self.assertIsNone(persisted['review_task_id'])
+        self.assertIsNone(persisted.get('owner_state'))
+        self.assertIsNone(persisted.get('reviewed_tree'))
+        self.assertTrue(persisted['review_start_tree'])
+        self.assertFalse(persisted.get('pending_rpc'))
+        self.assertEqual(len(self.h.starts), 2)
+        self.assertEqual([task for task, _ in self.h.continues], [old_reviewer])
+        self.assertEqual(self.h.issues[1]['labels'], ['dev:running'])
+        self.assertFalse(scheduler.Scheduler(self.h.state).available(dict(
+            owner='2', kind='coding', machine='work', repo=next(iter(self.h.state['repo_locks'])))))
+
+    async def test_fresh_reviewer_fallback_passes_without_resuming_coding(self):
+        item, old_reviewer = await self.pending_format_fallback()
+        snapshot = copy.deepcopy(item['review_start_tree'])
+        coding_id = item['task_id']
+        with patch.object(b, 'transport_call', wraps=self.h.transport) as transport:
+            await self.tick()
+        starts = [c.args[1] for c in transport.call_args_list if c.args[0] == 'start_task']
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(starts[0]['role'], 'review')
+        self.assertEqual(starts[0]['agent'], 'cursor')
+        self.assertIn(b.review_contract(), starts[0]['prompt'])
+        self.assertIn('- Do NOT edit source files.', starts[0]['prompt'])
+        self.assertIn('- Do NOT implement fixes.', starts[0]['prompt'])
+        new_reviewer = item['review_task_id']
+        self.assertNotEqual(new_reviewer, old_reviewer)
+        self.assertEqual(item['review_round'], 2)
+        self.assertEqual(item['review_format_corrections'], 0)
+        self.assertEqual(item['review_start_tree'], snapshot)
+        self.h.finish(new_reviewer, review_result()); await self.tick()
+        self.h.restart(); await self.tick()
+        item = self.h.state['issues']['1']
+        self.assertTrue(b.notifications.review_approval_complete(item))
+        self.assertEqual(item['task_id'], coding_id)
+        self.assertEqual(item['review_format_restarts'], 1)
+        self.assertEqual([task for task, _ in self.h.continues], [old_reviewer])
+        self.assertEqual(len(self.h.starts), 3)
+        self.assertEqual(sum('REVIEW_PASSED' in c.args[0] for c in self.h.telegram.call_args_list), 1)
+        self.assertFalse(self.h.state['repo_locks'])
+
+    async def test_bridge_restart_preserves_pending_and_running_format_fallback(self):
+        item, old_reviewer = await self.pending_format_fallback()
+        self.h.issues[2] = self.h.issue(2); self.h.comments[2] = []
+        self.h.comment(b.FOLLOWUP_MARKER + '\nWait for the fresh review')
+        self.h.comment('<!-- DEVORCHESTRATOR_OWNER_V1 {"action":"COMMIT"} -->')
+        self.h.restart(); await self.tick()
+        item = self.h.state['issues']['1']; new_reviewer = item['review_task_id']
+        self.h.restart(); await self.tick(); await self.tick()
+        item = self.h.state['issues']['1']
+        self.assertEqual(item['review_task_id'], new_reviewer)
+        self.assertNotEqual(new_reviewer, old_reviewer)
+        self.assertEqual(item['review_format_restarts'], 1)
+        self.assertEqual(len(self.h.starts), 3)
+        self.assertEqual([task for task, _ in self.h.continues], [old_reviewer])
+        self.assertFalse(item.get('processed_owner_actions'))
+        self.assertEqual(self.h.state['issues']['2']['queue_status'], 'QUEUED')
+        self.assertFalse(scheduler.Scheduler(self.h.state).release('1'))
+
+    async def test_fresh_reviewer_start_recovers_after_accepted_rpc_interruption(self):
+        item, old_reviewer = await self.pending_format_fallback()
+        self.h.fail_after_start = True
+        await self.tick()
+        self.assertEqual(item['pending_rpc']['operation'], 'review:2')
+        next_attempt = item['reconciliation_retry']['next_attempt']
+        self.h.restart()
+        with patch.object(b.time, 'time', return_value=next_attempt + 1):
+            await self.tick()
+        item = self.h.state['issues']['1']
+        self.assertFalse(item.get('pending_rpc'))
+        self.assertEqual(item['review_format_restarts'], 1)
+        self.assertNotEqual(item['review_task_id'], old_reviewer)
+        self.h.restart(); await self.tick()
+        self.assertEqual(len(self.h.starts), 3)
+
+    async def test_fresh_reviewer_receipt_survives_crash_before_completion_state_save(self):
+        await self.pending_format_fallback()
+        with patch.object(b, 'complete_rpc', side_effect=asyncio.CancelledError):
+            with self.assertRaises(asyncio.CancelledError):
+                await self.tick()
+        persisted = read_json(b.STATE_FILE)['issues']['1']
+        self.assertIsNone(persisted['review_task_id'])
+        self.assertEqual(persisted['pending_rpc']['operation'], 'review:2')
+        self.h.restart(); await self.tick()
+        new_reviewer = self.h.state['issues']['1']['review_task_id']
+        self.h.restart(); await self.tick()
+        self.assertEqual(len(self.h.starts), 3)
+        self.assertEqual(self.h.state['issues']['1']['review_task_id'], new_reviewer)
+
+    async def test_every_malformed_review_attempt_reaches_bounded_terminal_failure(self):
+        item, old_reviewer = await self.pending_format_fallback()
+        await self.tick(); new_reviewer = item['review_task_id']
+        self.h.finish(new_reviewer, 'DEVORCHESTRATOR_REVIEW: {invalid JSON'); await self.tick()
+        self.assertEqual(item['review_format_corrections'], 1)
+        self.h.finish(new_reviewer, 'Still missing the required trailer'); await self.tick()
+        self.assertEqual(item['review_status'], 'FAILED')
+        self.assertIsNone(item.get('owner_state'))
+        self.assertIsNone(item.get('reviewed_tree'))
+        self.assertIn('2 independent sessions', item['owner_blocker'])
+        self.assertEqual(item['review_format_restarts'], 1)
+        for _ in range(3):
+            self.h.restart(); await self.tick()
+        self.assertEqual(len(self.h.starts), 3)
+        self.assertEqual([task for task, _ in self.h.continues], [old_reviewer, new_reviewer])
+        self.assertEqual(self.h.issues[1]['labels'], ['dev:failed'])
+        messages = [c.args[0] for c in self.h.telegram.call_args_list]
+        self.assertEqual(sum(m.startswith('FAILED') for m in messages), 1)
+        self.assertFalse(any('REVIEW_PASSED' in m for m in messages))
+        self.assertFalse(self.h.state['repo_locks'])
+
+    async def test_format_fallback_cannot_recapture_a_changed_review_tree(self):
+        item, _ = await self.pending_format_fallback()
+        snapshot = copy.deepcopy(item['review_start_tree'])
+        (self.h.repo / 'file').write_text('silent change during malformed review')
+        await self.tick()
+        self.assertEqual(item['review_start_tree'], snapshot)
+        self.h.finish(item['review_task_id'], review_result()); await self.tick()
+        self.assertEqual(item['review_status'], 'FAILED')
+        self.assertIsNone(item.get('owner_state'))
+        self.assertIn('Repository changed', item['owner_blocker'])
+
+    async def test_coding_correction_resets_format_fallback_budget_after_rpc_recovery(self):
+        item, _ = await self.pending_format_fallback()
+        await self.tick()
+        self.h.finish(item['review_task_id'], review_result('CHANGES_REQUIRED', findings=['Fix defect']))
+        self.h.fail_after_start = True
+        await self.tick()
+        next_attempt = item['reconciliation_retry']['next_attempt']
+        self.h.restart()
+        with patch.object(b.time, 'time', return_value=next_attempt + 1):
+            await self.tick()
+        item = self.h.state['issues']['1']
+        self.assertEqual(item['review_format_restarts'], 0)
+        self.assertEqual(item['review_corrections'], 1)
+        self.h.finish(item['task_id'], coding_result()); await self.tick()
+        reviewer = item['review_task_id']
+        for _ in range(2):
+            self.h.finish(reviewer, 'No trailer'); await self.tick()
+        self.assertEqual(item['review_format_restarts'], 1)
+        self.assertIsNone(item['review_task_id'])
+        self.assertEqual(item['review_status'], 'RUNNING')
+        await self.tick()
+        self.assertEqual(item['review_round'], 4)
+        self.assertNotEqual(item['review_task_id'], reviewer)
+
     async def test_production_startup_admits_only_dedicated_work_queue(self):
         self.assertEqual(b.QUEUE_LABEL, 'work:queued')
         self.assertIn('work:queued', b.STATE_LABELS)

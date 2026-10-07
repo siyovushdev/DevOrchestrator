@@ -24,9 +24,11 @@ class NotificationTests(unittest.TestCase):
                 self.assertIn('FOLLOWUP_FOR_FRESH_REVIEW', text)
         for fields in ({'reviewed_tree': {}}, {'owner_state': 'invalid'},
                        {'review_hold': {'diagnostic': 'Review held'}}, {'review_hold': {}},
-                       {'review_status': 'RUNNING'}):
+                       {'review_status': 'RUNNING'}, {'coding_status': 'UNKNOWN'},
+                       {'coding_turn': 2}, {'coding_turn': 2, 'review_coding_turn': 1}):
             with self.subTest(invalid=fields):
                 self.assertFalse(n.review_approval_complete({**approved, **fields}))
+        self.assertTrue(n.review_approval_complete({**approved, 'coding_turn': 2, 'review_coding_turn': 2}))
 
     def test_review_pass_formatter_uses_completed_publication_stage(self):
         item = dict(review_status='PASS', owner_state='COMMITTED',

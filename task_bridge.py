@@ -100,6 +100,7 @@ OWNER_ACTION_RULES = {
 
 MAX_REVIEW_CORRECTIONS = 2
 MAX_REVIEW_FORMAT_CORRECTIONS = 1
+MAX_REVIEW_FORMAT_RESTARTS = 1
 
 REVIEWER_CODEX_MODEL = "gpt-6.1-sol"
 REVIEWER_CODEX_EFFORT = "high"
@@ -594,13 +595,16 @@ def invalidate_quality_gates(item):
     Keep review_round as historical telemetry, but force a fresh
     independent review before publication is allowed again.
     """
-    if item.get("owner_state") or item.get("reviewed_tree") or item.get("publication_journal") or item.get("review_hold"):
+    if item.get("review_task_id"):
+        item['stale_review_task_ids'] = sorted(set(item.get('stale_review_task_ids') or []) | {item['review_task_id']})
+    if item.get("owner_state") or item.get("reviewed_tree") or item.get("publication_journal") or item.get("review_hold") or item.get('review_task_id'):
         item.setdefault("publication_history", []).append({
             "owner_state": item.get("owner_state"), "review_round": item.get("review_round"),
             "approved_at": item.get("owner_approved_at"), "reviewed_tree": item.get("reviewed_tree"),
             "journal": item.get("publication_journal"), "commit_sha": item.get("commit_sha"),
             "pr_url": item.get("pr_url"),
             "review_hold": item.get("review_hold"), "review_task_id": item.get("review_task_id"),
+            "coding_turn": item.get("review_coding_turn"),
         })
     item["autopilot_corrections"] = 0
 
@@ -608,6 +612,7 @@ def invalidate_quality_gates(item):
     item["reviewer_agent"] = None
     item["review_status"] = None
     item["review_format_corrections"] = 0
+    item["review_format_restarts"] = 0
     item["review_corrections"] = 0
 
     item["owner_state"] = None
@@ -616,8 +621,80 @@ def invalidate_quality_gates(item):
     item["owner_question_at"] = None
     item["reviewed_tree"] = None
     item["review_start_tree"] = None
+    item.pop('review_coding_turn', None)
+    item['last_report_signature'] = None
     item.pop("review_hold", None)
     item["publication_journal"] = {}
+
+
+def coding_report_successful(report, item):
+    turn = report.get('turns')
+    return (report.get('id') == item.get('task_id') and report.get('status') == 'DONE' and
+            type(report.get('exit_code')) is int and report['exit_code'] == 0 and
+            type(turn) is int and turn > 0 and turn == item.get('coding_turn', turn))
+
+
+def observe_coding_turn(item, state, report):
+    """Invalidate reviews on mutable/new coding turns, never adopt old review evidence."""
+    if report.get('id') != item.get('task_id'):
+        return
+    turn = report.get('turns')
+    bound = item.get('review_coding_turn')
+    has_review = any(item.get(field) for field in ('review_task_id', 'review_start_tree', 'review_status',
+                                                  'reviewed_tree', 'owner_state'))
+    changed_turn = type(turn) is int and turn > 0 and (
+        (bound is not None and bound != max(turn, item.get('coding_turn', turn))) or turn > item.get('coding_turn', turn))
+    unbound_review = bool(item.get('review_task_id') and bound is None and item.get('review_start_tree'))
+    if has_review and (report.get('status') in ('RUNNING', 'STARTING') or changed_turn or unbound_review):
+        pending = item.get('pending_rpc')
+        if pending and pending['arguments'].get('role') == 'review':
+            round_match = re.fullmatch(r'review:([0-9]+)', pending['operation'])
+            if round_match:
+                item['review_round'] = max(int(item.get('review_round') or 0), int(round_match[1]))
+            number = next((str(number) for number, tracked in state.get('issues', {}).items() if tracked is item), '')
+            key = hashlib.sha256(f"{REPO}:{number}:{pending['name']}:{pending['operation']}".encode()).hexdigest()
+            job = state.get('work_queue', {}).get(key)
+            if job:
+                job['cancelled'] = True
+                if job['status'] == 'QUEUED':
+                    job.update(status='FAILED', launch_pending=False)
+                elif job.get('task_id'):
+                    item['stale_review_task_ids'] = sorted(set(item.get('stale_review_task_ids') or []) | {job['task_id']})
+            item.pop('pending_rpc', None)
+        invalidate_quality_gates(item)
+    if type(turn) is int and turn > 0:
+        item['coding_turn'] = max(item.get('coding_turn', 0), turn)
+    item['coding_status'] = report.get('status') if report.get('status') in ('RUNNING', 'STARTING', 'UNKNOWN', 'DONE', 'FAILED') else 'UNKNOWN'
+    save_state(state)
+
+
+async def drain_stale_reviews(item, state):
+    for task_id in list(item.get('stale_review_task_ids') or []):
+        report = await mcp_call('get_task_report', {'task_id': task_id})
+        cancelled_observed = False
+        for job in state.get('work_queue', {}).values():
+            if job.get('task_id') == task_id and (job.get('cancelled') or job.get('cancelled_review_turn')):
+                # This RPC will never be replayed. Its requested turn may not exist;
+                # drain the actual reviewer, including persisted pre-upgrade cancellations.
+                status = report.get('status')
+                job.update(cancelled=True, launch_pending=False,
+                           status=status if status in ('DONE', 'FAILED', 'RUNNING') else 'UNKNOWN')
+                job.pop('cancelled_review_turn', None)
+                cancelled_observed = True
+        if cancelled_observed:
+            save_state(state)
+        uncertain_launch = any(job.get('task_id') == task_id and job.get('launch_pending')
+                               for job in state.get('work_queue', {}).values())
+        if report.get('status') in ('DONE', 'FAILED') and uncertain_launch:
+            item['stale_review_diagnostic'] = 'Invalidated reviewer launch is uncertain; the old terminal report does not prove the requested turn ended. Inspect worker receipts before recovery.'
+            save_state(state)
+            raise RuntimeError('Invalidated reviewer launch is uncertain')
+        if report.get('status') in ('DONE', 'FAILED') and not uncertain_launch:
+            item['stale_review_task_ids'].remove(task_id)
+            save_state(state)
+    if not item.get('stale_review_task_ids') and item.pop('stale_review_diagnostic', None) is not None:
+        save_state(state)
+    return not item.get('stale_review_task_ids')
 
 
 def reviewer_for(coding_agent):
@@ -713,7 +790,7 @@ def parse_review_result(text):
 
     verdict = data["verdict"]
 
-    if verdict not in {
+    if not isinstance(verdict, str) or verdict not in {
         "PASS",
         "CHANGES_REQUIRED",
         "NEEDS_OWNER",
@@ -860,7 +937,7 @@ def add_comment(number, body):
     save_state(state)
 
 
-def flush_effects(state):
+def flush_effects(state, reconciled=True):
     suppressed = False
     for entry in state.get('outbox', {}).values():
         item = state.get('issues', {}).get(str(entry['number']), {})
@@ -879,7 +956,10 @@ def flush_effects(state):
                           "--json", "number,labels")
         raw_transition_issue(current, target)
     bridge_effects.flush(state, lambda: save_state(state), issue_comments,
-                        raw_add_comment, transition, send_telegram)
+                        raw_add_comment, transition, send_telegram,
+                        eligible=lambda entry: reconciled or not (
+                            (entry['kind'] == 'telegram' and entry['payload'].startswith('REVIEW_PASSED / READY_FOR_OWNER')) or
+                            (entry['kind'] == 'transition' and entry['payload']['target'] == 'dev:ready-for-review')))
 
 
 def parse_task(issue):
@@ -928,19 +1008,74 @@ async def _transport_call(name, arguments):
     async with Client(MCP_URL) as client:
         result = await client.call_tool(name, arguments)
 
-    for part in result.content:
+    return decode_mcp_result(name, result)
+
+
+# Return contracts from mcp_server.py. A project registry is an object even though
+# it contains multiple projects; only list_tasks has collection-valued output.
+MCP_COLLECTION_TOOLS = frozenset({"list_tasks"})
+MCP_OBJECT_TOOLS = frozenset({"list_projects", "get_task_report", "start_task",
+                              "continue_task", "adopt_task", "orchestrator_health"})
+
+
+def decode_mcp_result(name, result):
+    """Decode every SDK content block before exposing a result to bridge callers.
+
+    MCP 2.3.0 unrolls a Python list into one JSON text block per element, including
+    zero blocks for an empty list. Older transports can instead emit one JSON list.
+    Single-result tools must never silently select one of several blocks.
+    """
+    def fail(reason):
+        # Report shape/location only: tool payloads can contain prompts or secrets.
+        raise RuntimeError(f"MCP tool {name}: {reason}")
+
+    if getattr(result, "is_error", False) or getattr(result, "isError", False):
+        fail("returned an error result")
+    content = getattr(result, "content", None)
+    if not isinstance(content, (list, tuple)):
+        fail("expected a content block sequence")
+
+    values = []
+    for index, part in enumerate(content, 1):
         text = getattr(part, "text", None)
-        if not text:
-            continue
-
+        if getattr(part, "type", None) != "text" or not isinstance(text, str) or not text.strip():
+            fail(f"content block {index} must contain JSON text")
         try:
-            return json.loads(text)
+            values.append(json.loads(text))
         except json.JSONDecodeError:
-            pass
+            fail(f"content block {index} contains malformed JSON")
 
-    raise RuntimeError(
-        f"MCP tool {name} returned no JSON result"
-    )
+    if name in MCP_COLLECTION_TOOLS:
+        if len(values) == 1 and isinstance(values[0], list):
+            tasks = values[0]
+        elif all(isinstance(value, dict) for value in values):
+            tasks = values
+        else:
+            fail("expected one JSON collection or JSON task objects in every block")
+        # Validate the whole list before recovery can change capacity/lock state.
+        # Legacy tasks may lack project/workspace; recovery already holds these.
+        ids = set()
+        for index, task in enumerate(tasks, 1):
+            if not isinstance(task, dict) or any(
+                    not isinstance(task.get(key), str) or not task[key].strip()
+                    for key in ("id", "status")):
+                fail(f"task element {index} requires non-empty string id/status")
+            if task["id"] in ids:
+                fail(f"task element {index} has a duplicate id")
+            ids.add(task["id"])
+        structured = getattr(result, "structured_content", None)
+        if structured is not None:
+            if (not isinstance(structured, dict) or set(structured) != {"result"}
+                    or structured["result"] != tasks):
+                fail("structured collection disagrees with content blocks")
+        return tasks
+
+    if len(values) != 1:
+        fail("expected exactly one JSON result block")
+    value = values[0]
+    if name in MCP_OBJECT_TOOLS and not isinstance(value, dict):
+        fail("expected a JSON object result")
+    return value
 
 
 # Context is set by the serial bridge loop; admission is durably recorded before RPC.
@@ -958,7 +1093,9 @@ def complete_rpc(item, operation, result):
     elif operation.startswith("review-correction:"):
         item.update(review_corrections=int(operation.rsplit(":", 1)[1]), review_task_id=None,
                     reviewer_agent=None, review_status=None, review_start_tree=None,
-                    review_format_corrections=0, autopilot_corrections=0, last_report_signature=None)
+                    review_format_corrections=0, review_format_restarts=0,
+                    autopilot_corrections=0, last_report_signature=None)
+        item.pop('review_coding_turn', None)
     elif operation.startswith("review-format:"):
         item["review_format_corrections"] = int(operation.rsplit(":", 1)[1])
         item["review_status"] = "RUNNING"
@@ -966,6 +1103,7 @@ def complete_rpc(item, operation, result):
         item.update(review_task_id=result.get("task_id") or result["id"],
                     reviewer_agent=result.get("agent"), review_round=int(operation.split(":")[1]),
                     review_status="RUNNING", review_format_corrections=0)
+        item['review_task_turn'] = result.get('turns', 1)
 
 
 async def mcp_call(name, arguments):
@@ -980,6 +1118,13 @@ async def mcp_call(name, arguments):
     arguments = dict(arguments)
     operation = arguments.pop("_operation", "initial")
     kind = arguments.get("role", "coding")
+    if operation.startswith(('review:', 'review-format:')) and kind != 'review':
+        raise ValueError('Review RPC requires the read-only review role')
+    if kind == 'review':
+        current = await mcp_call('get_task_report', {'task_id': item['task_id']})
+        observe_coding_turn(item, state, current)
+        if not coding_report_successful(current, item) or item.get('review_coding_turn') != current.get('turns'):
+            raise QueueWait()
     machine, repo = project_identity(arguments.get("project") or item["project"])
     key = hashlib.sha256(f"{REPO}:{number}:{name}:{operation}".encode()).hexdigest()
     scheduler = Scheduler(state)
@@ -987,10 +1132,10 @@ async def mcp_call(name, arguments):
     if not item.get("pending_rpc"):
         item["pending_rpc"] = {"name": name, "arguments": arguments, "operation": operation}
         if kind == "coding" and name == "continue_task":
-            if operation.startswith("followup:"):
-                invalidate_quality_gates(item)
-            else:
-                item.update(owner_state=None, owner_approved_at=None, reviewed_tree=None)
+            invalidate_quality_gates(item)
+            item['coding_status'] = 'STARTING'
+            if item.get('coding_turn'):
+                item['coding_turn'] += 1
         save_state(state)
     scheduler.reserve(key)
     job["task_id"] = arguments.get("task_id") or key[:24]
@@ -1000,6 +1145,8 @@ async def mcp_call(name, arguments):
     result = await transport_call(name, arguments)
     scheduler.started(key, result.get("task_id") or arguments.get("task_id") or result["id"], result.get("status"))
     complete_rpc(item, operation, result)
+    if kind == 'coding' and type(result.get('turns')) is int:
+        item['coding_turn'] = max(item.get('coding_turn', 0), result['turns'])
     item.pop("pending_rpc", None)
     save_state(state)
     return result
@@ -1159,6 +1306,7 @@ async def start_queued(issue, state):
             "review_round": 0,
             "review_corrections": 0,
             "review_format_corrections": 0,
+            "review_format_restarts": 0,
             "review_status": None,
             "reviewer_agent": None,
             "owner_state": None,
@@ -1222,6 +1370,13 @@ async def process_owner_actions(issue, item, state, report):
     if report.get("status") not in ("DONE", "FAILED") or item.get("review_status") == "RUNNING":
         return
     if item.get('review_hold'):
+        return
+    if item.get('review_status') == 'PASS' and not coding_report_successful(report, item):
+        return
+    if (item.get('review_status') == 'PASS' and item.get('review_coding_turn') != report.get('turns') and
+            item.get('owner_state') and item.get('owner_approved_at') and item.get('reviewed_tree')):
+        hold_review_for_refresh(issue, item, state,
+            'Independent review has no verified coding-turn binding. Send a trusted follow-up for a fresh independent review before publication.', report)
         return
     if item.get('review_status') == 'PASS' and not notifications.review_approval_complete(item):
         hold_review_for_refresh(issue, item, state,
@@ -1390,7 +1545,7 @@ async def maybe_continue_autopilot(
     if item.get("mode") != AUTOPILOT_MODE:
         return report, False
 
-    if report.get("status") == "RUNNING":
+    if report.get("status") not in ('DONE', 'FAILED'):
         return report, False
 
     decision, reason, _ = autopilot_decision(
@@ -1591,6 +1746,8 @@ async def start_independent_review(
     state,
     coding_report,
 ):
+    if not coding_report_successful(coding_report, item):
+        return
     project = item.get("project")
 
     if not project:
@@ -1623,6 +1780,7 @@ async def start_independent_review(
 
     if not item.get("review_start_tree"):
         item["review_start_tree"] = Repository(project, coding_report).snapshot()
+    item['review_coding_turn'] = coding_report['turns']
     save_state(state)
     result = await mcp_call(
         "start_task",
@@ -1671,6 +1829,7 @@ async def fail_review_loop(
     item,
     state,
     message,
+    coding_report,
 ):
     item["review_status"] = "FAILED"
     item["owner_blocker"] = message
@@ -1688,7 +1847,7 @@ async def fail_review_loop(
         ]),
     )
 
-    notify("FAILED", issue, item, blocker=message)
+    notify("FAILED", issue, item, coding_report, message)
 
 
 def hold_review_for_refresh(issue, item, state, diagnostic, coding_report=None, active=False):
@@ -1715,6 +1874,16 @@ async def process_review_loop(
     if item.get("mode") != AUTOPILOT_MODE:
         return False
 
+    observe_coding_turn(item, state, coding_report)
+    if not coding_report_successful(coding_report, item):
+        return coding_report.get('status') not in ('DONE', 'FAILED')
+    coding_report = await mcp_call('get_task_report', {'task_id': item['task_id']})
+    observe_coding_turn(item, state, coding_report)
+    if not coding_report_successful(coding_report, item):
+        return True
+    if not await drain_stale_reviews(item, state):
+        return True
+
     decision, _, _ = autopilot_decision(
         coding_report,
         item,
@@ -1723,6 +1892,11 @@ async def process_review_loop(
     if decision != "READY_FOR_REVIEW":
         return False
 
+    if (item.get('review_status') == 'PASS' and item.get('review_coding_turn') != coding_report.get('turns') and
+            item.get('owner_state') and item.get('owner_approved_at') and item.get('reviewed_tree')):
+        hold_review_for_refresh(issue, item, state,
+            'Independent review has no verified coding-turn binding. Send a trusted follow-up for a fresh independent review before publication.', coding_report)
+        return True
     if item.get('review_status') == 'PASS' and not notifications.review_approval_complete(item):
         hold_review_for_refresh(issue, item, state,
             'Historical review PASS lacks owner approval or reviewed-tree evidence. Send a trusted follow-up for a fresh independent review before publication.', coding_report)
@@ -1768,7 +1942,16 @@ async def process_review_loop(
         {"task_id": review_task_id},
     )
 
+    current = await mcp_call('get_task_report', {'task_id': item['task_id']})
+    observe_coding_turn(item, state, current)
+    if (not coding_report_successful(current, item) or item.get('review_task_id') != review_task_id or
+            item.get('review_coding_turn') != current.get('turns')):
+        return True
+    coding_report = current
+
     review_process_status = review_report.get("status")
+    if type(review_report.get('turns')) is int:
+        item['review_task_turn'] = review_report['turns']
 
     if review_process_status in {"RUNNING", "UNKNOWN"}:
         if review_process_status == "UNKNOWN":
@@ -1790,6 +1973,7 @@ async def process_review_loop(
                 "Independent reviewer process failed: "
                 + str(review_report.get("error") or "unknown error")
             ),
+            coding_report,
         )
         return True
 
@@ -1852,14 +2036,37 @@ Return the review again using the required machine-readable contract.
             ),
         )
 
+        restarts = int(item.get("review_format_restarts") or 0)
+        if restarts < MAX_REVIEW_FORMAT_RESTARTS:
+            # Persist the fallback intent before any launch. The next tick derives
+            # review:<round+1>, and pending_rpc/worker receipts retain that identity
+            # across an interrupted start. Keep the original start-tree snapshot;
+            # a fresh reviewer must not silently approve changes by the old one.
+            item.update(review_format_restarts=restarts + 1, review_task_id=None,
+                        reviewer_agent=None, review_format_corrections=0,
+                        review_status="RUNNING", last_report_signature=None)
+            save_state(state)
+            transition_issue(issue, "dev:running")
+            add_comment(issue["number"], "\n".join([
+                "<!-- DEVORCHESTRATOR_REVIEW_FORMAT_RESTART_V1 -->",
+                f"Reviewer `{review_task_id}` still returned malformed output after format correction.",
+                f"Fresh independent reviewer session queued ({restarts + 1}/{MAX_REVIEW_FORMAT_RESTARTS}).",
+                "The coding session is unchanged; publication remains blocked.",
+                "",
+                f"Reason: {review_error}",
+            ]))
+            return True
+
         await fail_review_loop(
             issue,
             item,
             state,
             (
-                "Reviewer did not return a valid structured result: "
+                f"Reviewer formatting failed after {restarts + 1} independent sessions "
+                f"and {MAX_REVIEW_FORMAT_CORRECTIONS} format correction(s) per session: "
                 + review_error
             ),
+            coding_report,
         )
         return True
 
@@ -1874,17 +2081,25 @@ Return the review again using the required machine-readable contract.
     verdict = review_data["verdict"]
 
     if verdict == "PASS":
-        reviewed = Repository(item["project"], coding_report).snapshot()
-        if reviewed != item.get("review_start_tree"):
-            await fail_review_loop(issue, item, state, "Repository changed during independent review; fresh review required")
-            return True
-        item["reviewed_tree"] = reviewed
-        item["review_status"] = "PASS"
-        item["owner_state"] = OWNER_STATE_READY
-        item["owner_approved_at"] = datetime.now(timezone.utc).isoformat()
-        item["owner_blocker"] = None
-        item["owner_question_at"] = None
-        save_state(state)
+        from devctl import DATA_DIR
+        with exclusive(DATA_DIR.parent / 'worker.lock', blocking=True):
+            current = await mcp_call('get_task_report', {'task_id': item['task_id']})
+            observe_coding_turn(item, state, current)
+            if (not coding_report_successful(current, item) or item.get('review_task_id') != review_task_id or
+                    item.get('review_coding_turn') != current.get('turns')):
+                return True
+            reviewed = Repository(item["project"], current).snapshot()
+            if reviewed != item.get("review_start_tree"):
+                await fail_review_loop(issue, item, state,
+                                       "Repository changed during independent review; fresh review required", current)
+                return True
+            item["reviewed_tree"] = reviewed
+            item["review_status"] = "PASS"
+            item["owner_state"] = OWNER_STATE_READY
+            item["owner_approved_at"] = datetime.now(timezone.utc).isoformat()
+            item["owner_blocker"] = None
+            item["owner_question_at"] = None
+            save_state(state)
 
         transition_issue(
             issue,
@@ -1930,6 +2145,7 @@ Return the review again using the required machine-readable contract.
                 "Independent review still requires changes after "
                 f"{MAX_REVIEW_CORRECTIONS} correction rounds."
             ),
+            coding_report,
         )
         return True
 
@@ -1983,6 +2199,7 @@ Publication requires separate structured owner commands after independent review
     item["review_task_id"] = None
     item["reviewer_agent"] = None
     item["review_format_corrections"] = 0
+    item["review_format_restarts"] = 0
     item["review_status"] = None
     item["autopilot_corrections"] = 0
     item["last_report_signature"] = None
@@ -2069,9 +2286,13 @@ def malformed_item(item):
         return True
     if item.get("project") is not None and not isinstance(item["project"], str):
         return True
-    for field in ("processed_followups", "processed_owner_actions"):
+    for field in ("processed_followups", "processed_owner_actions", "stale_review_task_ids"):
         values = item.get(field)
         if values is not None and (not isinstance(values, list) or any(not isinstance(v, str) for v in values)):
+            return True
+    for task_id in [item.get('review_task_id'), *(item.get('stale_review_task_ids') or [])]:
+        if task_id is not None and (not isinstance(task_id, str) or
+                                   not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', task_id) or '..' in task_id):
             return True
     for field in ("pending_rpc", "publication_journal", "reviewed_tree", "review_start_tree", "task_spec", "review_hold"):
         if item.get(field) is not None and not isinstance(item[field], dict):
@@ -2085,15 +2306,21 @@ def malformed_item(item):
             not math.isfinite(retry.get("next_attempt", 0)) or retry.get("next_attempt", 0) < 0):
         return True
     for field in ("autopilot_policy_version", "autopilot_corrections", "review_round",
-                  "review_corrections", "review_format_corrections"):
+                  "review_corrections", "review_format_corrections", "review_format_restarts"):
         try:
             if int(item.get(field) or 0) < 0:
                 return True
         except (ValueError, TypeError, OverflowError):
             return True
+    for field in ('coding_turn', 'review_coding_turn', 'review_task_turn'):
+        if field in item and (type(item[field]) is not int or item[field] < 1):
+            return True
     pending = item.get("pending_rpc")
     if pending and (pending.get("name") not in ("start_task", "continue_task") or
                     not isinstance(pending.get("arguments"), dict) or not isinstance(pending.get("operation"), str)):
+        return True
+    if (pending and pending['operation'].startswith(('review:', 'review-format:')) and
+            pending['arguments'].get('role') != 'review'):
         return True
     spec = item.get("task_spec")
     if spec and (spec.get("mode") not in ("manual", AUTOPILOT_MODE) or
@@ -2116,12 +2343,14 @@ async def process_tracked(issue, item, state):
         report = await mcp_call("get_task_report", {"task_id": item["task_id"]})
         if not reconcile_project(issue, item, state, report):
             return
+        observe_coding_turn(item, state, report)
         pending = item.get("pending_rpc")
         if pending:
             args = {**pending["arguments"], "_operation": pending["operation"]}
             await mcp_call(pending["name"], args)
             transition_issue(issue, "dev:running")
             report = await mcp_call("get_task_report", {"task_id": item["task_id"]})
+            observe_coding_turn(item, state, report)
 
         if report.get("status") == "UNKNOWN":
             item["worker_uncertain"] = True
@@ -2129,19 +2358,26 @@ async def process_tracked(issue, item, state):
             transition_issue(issue, "dev:needs-owner")
             notify("NEEDS_OWNER", issue, item, report, diagnostic)
             return
-        if item.pop("worker_uncertain", False):
-            if report.get("status") == "RUNNING":
-                transition_issue(issue, "dev:running")
-            elif item.get("last_report_signature"):
-                # Reconcile the existing terminal result after a transport outage.
-                user_status, label = terminal_state(report, item)
-                transition_issue(issue, label)
+        if (report.get('status') not in ('DONE', 'FAILED') or
+                (type(report.get('turns')) is int and report['turns'] < item.get('coding_turn', report['turns']))):
+            if report.get('status') == 'RUNNING' and item.pop('worker_uncertain', False):
+                save_state(state)
+            transition_issue(issue, 'dev:running')
+            return
+        if not await drain_stale_reviews(item, state):
+            transition_issue(issue, 'dev:running')
+            return
+        if item.pop("worker_uncertain", False) and item.get("last_report_signature"):
+            # Reconcile the existing terminal result after a transport outage.
+            user_status, label = terminal_state(report, item)
+            transition_issue(issue, label)
 
         report = await process_followup(
             issue, item, state, report
         )
 
-        if report.get("status") == "RUNNING":
+        observe_coding_turn(item, state, report)
+        if report.get("status") not in ('DONE', 'FAILED'):
             return
         await process_owner_actions(issue, item, state, report)
 
@@ -2216,8 +2452,20 @@ async def process_tracked(issue, item, state):
 
 async def tick(state):
     global WORK_CONTEXT
+    reconciled = False
+    try:
+        await reconcile_tick(state)
+        reconciled = True
+    finally:
+        WORK_CONTEXT = None
+        # Outbox recovery must not depend on task discovery being available.
+        # Approval invitations still require successful coding-status reconciliation.
+        flush_effects(state, reconciled=reconciled)
+
+
+async def reconcile_tick(state):
+    global WORK_CONTEXT
     WORK_CONTEXT = None
-    flush_effects(state)
     issues = open_issues()
 
     by_number = {
@@ -2225,7 +2473,13 @@ async def tick(state):
         for issue in issues
     }
 
-    Scheduler(state).recover(await mcp_call("list_tasks", {}))
+    tasks = await mcp_call("list_tasks", {})
+    Scheduler(state).recover(tasks)
+    reports = {task['id']: task for task in tasks}
+    for item in state['issues'].values():
+        if (isinstance(item, dict) and item.get('compatibility_status') != 'QUARANTINED' and
+                not malformed_item(item) and item.get('task_id') in reports):
+            observe_coding_turn(item, state, reports[item['task_id']])
     save_state(state)
     # GitHub lists newest first; issue number provides stable oldest-first admission.
     for issue in sorted(issues, key=lambda i: i["number"]):
@@ -2268,8 +2522,6 @@ async def tick(state):
                 await start_queued(issue, state)
         else:
             await process_tracked(issue, item, state)
-    WORK_CONTEXT = None
-    flush_effects(state)
 
 
 async def main():

@@ -15,6 +15,8 @@ def review_approval_complete(item):
     """Historical PASS alone cannot authorize publication or a COMMIT invitation."""
     tree = item.get('reviewed_tree')
     return (item.get('review_status') == 'PASS' and
+            item.get('coding_status', 'DONE') == 'DONE' and
+            ('coding_turn' not in item or item.get('review_coding_turn') == item['coding_turn']) and
             item.get('owner_state') in ('READY_FOR_OWNER', 'COMMITTED', 'PUSHED', 'PR_CREATED', 'MERGED') and
             isinstance(item.get('owner_approved_at'), str) and bool(item['owner_approved_at']) and
             isinstance(tree, dict) and isinstance(tree.get('fingerprint'), str) and bool(tree['fingerprint']) and

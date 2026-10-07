@@ -15,7 +15,7 @@ def enqueue(state, number, kind, payload, event=None):
     return digest
 
 
-def flush(state, persist, comments, post_comment, transition, telegram, now=None):
+def flush(state, persist, comments, post_comment, transition, telegram, now=None, eligible=None):
     now = time.time() if now is None else now
     started = time.monotonic()
     deliveries = 0
@@ -26,6 +26,8 @@ def flush(state, persist, comments, post_comment, transition, telegram, now=None
             # A crash crossed the send boundary: acceptance cannot be queried by key.
             entry.update(status='UNCERTAIN', diagnostic='Telegram acceptance uncertain; automatic resend suppressed')
             persist()
+            continue
+        if eligible is not None and not eligible(entry):
             continue
         if deliveries >= 5 or time.monotonic() - started >= 5:
             break

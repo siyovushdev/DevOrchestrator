@@ -1,8 +1,10 @@
 # DevOrchestrator roadmap 4–10
 
 All seven phases are implemented in the development worktree. The 2026-10-06
-pre-rollout audit passes after the hardening described below. No live checkout,
-service, task bus, Telegram chat, or publication was changed during development.
+pre-rollout audit passed, but controlled rollout #18 exposed an installed MCP
+transport defect and safely rolled back. The development transport repair and next
+rollout acceptance gate are documented below. This repair changes no live checkout,
+service, task bus, Telegram chat, or publication.
 
 | Phase | Status | Implementation / verification |
 |---|---|---|
@@ -241,6 +243,184 @@ archived task. Remote histories and RPC/effect receipts are retained for recover
 
 ## Validation
 
+### Coding/review turn isolation (2026-10-07)
+
+Review eligibility now requires the registered coding task's current report to be
+`DONE`, with exit code 0 and a positive current-turn number, as well as the valid
+READY contract. RUNNING, STARTING and UNKNOWN reports cannot start, continue, accept
+or finalize a review, even when their payload still contains an older READY trailer.
+Each independent review persists `review_coding_turn`; coding continuation persists
+the expected next turn before its RPC. An older terminal report cannot authorize
+review for that new turn.
+
+Coding resumption, a changed turn discovered after polling/restart, or an active
+legacy reviewer lacking a turn binding invalidates the prior review task identity,
+start/PASS snapshots and owner approval. Invalidated reviewer IDs are preserved in
+`stale_review_task_ids` and history. Their processes are logically cancelled as
+approval sources and monitored until definitively terminal; their output is never
+parsed as a new verdict. They retain capacity/repository exclusion while active or
+uncertain. A fresh review begins only after the new coding turn succeeds and these
+old reviewers drain. No process is killed by this reconciliation.
+
+Pending review RPCs from an invalidated turn are abandoned rather than replayed.
+Queued launches are cancelled; possibly accepted launches are marked abandoned and
+reconciled against the actual reviewer report. A terminal report drains the abandoned
+reservation even if the requested format-correction turn never launched. Active or
+UNKNOWN reports retain capacity and repository exclusion. Cancellation and observed
+job status are persisted; old `cancelled_review_turn` records receive the same recovery.
+The invalidated request consumes its old review round, so a new turn gets a distinct
+request ID. Missing worker evidence retains the hold and durable backoff.
+Historical PASS without a coding-turn binding holds publication for fresh review.
+Legacy reviewer intents without an explicit review role are quarantined for inspection.
+
+The bridge refreshes coding status before reviewer RPCs and after fetching reviewer
+output. PASS snapshot/approval persistence also runs under the shared worker
+admission lock with a fresh coding report. Worker leases/admission continue to prevent
+mutable coding and read-only review from sharing a repository concurrently. Outbox
+delivery normally follows reconciliation and also runs on tick failure; cached
+active/new-turn observations invalidate approvals during per-issue backoff. A pending
+COMMIT invitation is suppressed when coding is mutable or uncertain.
+
+The live reviewer `72624bcb32db` is **not authoritative** for the resumed coding task
+`cbec4608fcc6`. A fresh independent review is required after the coding turn containing
+this fix has completed successfully. This development task has not edited live task
+state, stopped the reviewer, or changed a live service.
+
+Fourteen new deterministic regressions cover mutable reports with stale READY,
+unsuccessful/older terminal reports, late reviewer PASS after coding resumes, resumption
+during reviewer RPCs, format-RPC suppression, pending-launch cancellation with fresh
+request identity, draining stale reviewers with locks held, restart/no-resurrection,
+exactly one new review, unbound legacy reviewer rejection, stale notification suppression,
+malformed turn/ID isolation, and cancellation recovery.
+The initial turn-isolation verification passed **176 tests**, Python compilation
+and `git diff --check`; the recovery corrections below supersede its cancellation hold.
+
+### Independent-review recovery corrections (2026-10-07)
+
+Pre-rollout result: ready for owner rollout review after fixing both fresh review
+findings. Abandoned pending review-format continuations no longer require an
+imaginary future reviewer turn to release their reservation. The persisted cancelled
+job is reconciled against the actual task: DONE/FAILED drains it, RUNNING/UNKNOWN
+retains exclusion, and no cancelled RPC is replayed. A fresh reviewer starts once
+for the successful new coding turn. Older persisted cancellation records recover
+without local state edits; obsolete uncertainty diagnostics are cleared durably.
+Reviewer output from the abandoned coding turn remains invalid for publication.
+
+The bounded outbox flush now runs in the tick's `finally` path, including MCP task-list
+transport/decode and GitHub discovery failures. Already queued comments, labels and
+ordinary Telegram notices continue delivery/backoff independently of task discovery.
+Pending REVIEW_PASSED/COMMIT invitations and ready-for-review labels are deferred
+until successful reconciliation, so an outage cannot advertise stale coding approval.
+Existing comment markers, Telegram SENDING/UNCERTAIN receipts, attempt limits and
+flush budgets still apply; deferral consumes no delivery attempt.
+
+Six deterministic regressions replace the earlier future-turn hold assertion and
+cover cancellation before format-RPC dispatch, an accepted but active/UNKNOWN reviewer,
+pre-upgrade cancellation state, task-list transport/decode outages with durable effect
+replay, successful approval delivery after recovery, and coding resumption during the
+outage without a stale COMMIT invitation. Full verification: **181 tests passed**,
+`python -m py_compile *.py tests/*.py` and `git diff --check` passed. Final self-review
+covers the complete development diff, persisted recovery transitions and effect safety.
+No live checkout/state/service or publication action was changed by this repair.
+
+Remaining live E2E checks: interrupt a disposable review-format RPC before acceptance,
+resume coding and restart the bridge; verify the terminal old reviewer drains and
+exactly one fresh review starts. Repeat with an actually active/UNKNOWN reviewer and
+verify the lock stays held until terminal. During a task-list outage, queue a diagnostic
+comment/Telegram notice and verify delivery continues, while approval invitations wait
+for recovery. Follow the exact authorized rollout/rollback sequence below; this repair
+does not change service ordering or authorize deployment.
+
+### Reviewer format recovery (2026-10-07)
+
+The fresh-review failure caused by two malformed Cursor results is treated as a
+review transport/format defect. Accepted verdicts still require the strict final
+`DEVORCHESTRATOR_REVIEW` JSON object: invalid JSON, extra trailing data, missing
+trailers and invalid verdict types cannot approve publication.
+
+For each completed coding turn, the bridge allows one same-session format correction.
+If that result is still malformed, it automatically queues one fresh independent
+reviewer session. The fresh session also gets one format correction. Thus at most
+two reviewer sessions/four malformed outputs are allowed for the unchanged coding
+turn. Exhaustion produces stable `review_status=FAILED`/`dev:failed` with one terminal
+failure notification and an infrastructure diagnostic; a formatting error does not
+produce an owner/product decision. A valid CHANGES_REQUIRED result follows the
+existing bounded coding-correction loop. A new coding turn resets the format-fallback
+budget, including when its continuation RPC is recovered after a restart.
+
+The fallback counter (`review_format_restarts`) and RUNNING intent with no reviewer
+task ID are saved before a fresh launch. The bridge keeps the repository lock and
+the original `review_start_tree`, then uses the next durable review round's request
+ID and existing pending-RPC/worker receipts. Restart before launch, during an accepted
+but interrupted RPC, or before the completion-state save reuses that request rather
+than launching a second reviewer. Active/uncertain reviewers continue to be monitored.
+The fresh reviewer retains the independent review role, read-only contract/sandbox,
+and strict verdict contract. Formatting recovery leaves the coding session unchanged,
+and a changed repository still prevents PASS even after a fresh session.
+
+Ten new deterministic regressions cover malformed JSON/trailing data and invalid
+verdict types, same-session correction, missing trailers after correction, durable
+fresh-session intent, pending/running bridge restarts, accepted-RPC and completion-save
+crash boundaries, final PASS, bounded failure/deduplicated notification, original-tree
+protection, and budget reset after recovered coding correction. Verification:
+**162 tests passed** (152 existing plus 10 new), Python compilation and
+`git diff --check` passed. Self-review and full verification were repeated after fixing
+the terminal failure notification's inconsistent event identity. This change was
+made only in the development worktree; live Cursor/bridge fallback E2E remains an
+authorized rollout check.
+
+### Controlled rollout #18: installed MCP task collection repair
+
+Rollout #18 (2026-10-07) passed all 134 release tests and the real WORK startup
+guard, then failed TaskBridge recovery on three polling cycles. Installed MCP 2.3.0
+emits `list_tasks` as separate text content blocks, each holding one JSON task
+object. Read-only production inspection found 27 blocks. The old transport returned
+only the first object, so `Scheduler.recover` iterated its string keys and raised
+`AttributeError: 'str' object has no attribute 'get'`. The rollout safely restored
+live master to `55d37668101da7f4071e0ebf39285634f4195d17`; the local audited release
+`2fc29deefde491ca34d5cde8db6c9953202123df` was not pushed. Evidence is retained under
+`/home/siovush/.local/share/devorchestrator/rollout-2026-10-07-030426-833686-UTC`:
+`transport-failure.json`, `transport-failure.traceback.log`, and
+`deployed-bridge-journal.log`.
+
+The uncommitted development repair decodes every content block and explicitly
+distinguishes collection tools from single-result tools. `list_tasks` accepts one
+JSON list or one JSON task object per block, preserving the entire ordered list.
+SDK source inspection and offline execution confirm an empty Python list produces
+zero content blocks; this is valid only for the collection tool. Empty single-result
+responses, empty/non-text/malformed blocks, mixed or nested collection shapes,
+invalid task id/status fields, duplicate task IDs, error-flagged responses and
+conflicting structured collections fail closed with payload-free diagnostics.
+No malformed block is skipped and no fixed task count is assumed.
+
+Caller audit: recovery in `tick` and the owner-publication worker exclusion check
+both consume `list_tasks` as a list of task objects. `get_task_report`, `start_task`
+and `continue_task` callers consume one object for status, receipts, task IDs and
+review/coding transitions. `list_projects`, `adopt_task` and `orchestrator_health`
+also return one object in `mcp_server.py`; none is flattened or wrapped as a task
+collection. The smoke command now uses the same decoder for the project registry
+and task listing, rather than assuming `structured_content` is populated.
+
+Regression coverage in `tests/test_mcp_transport.py` reproduces the observed block
+semantics, recovers active/uncertain tasks after the first block, checks 1/2/27/31
+elements, empty and JSON-list encodings, all object tools, scalar JSON results,
+malformed responses and the smoke PASS/failure gate. Full verification: **152 tests
+passed** (134 existing plus 18 new) with `python -m unittest discover -s tests -v`,
+also run under the installed SDK interpreter without live service calls. Offline
+calls to the installed SDK's actual registered server serializer verify 0/1/3/27/31
+blocks through the decoder and in-memory scheduler, plus a single-object report.
+Python compilation and `git diff --check` passed. Final self-review covers the
+complete delta from `2fc29dee`, including the new regression file and rollout order.
+
+**Next rollout gate:** start MCP first while TaskBridge remains stopped. Run
+`python mcp_smoke.py` with the installed dependency interpreter and deployed code;
+require exit status 0 and `TASK_LIST_TRANSPORT: PASS`, checking decoded task count
+and identities against the read-only inventory. Health/project-list PASS alone is
+insufficient. A missing/failed task-list transport smoke keeps TaskBridge stopped
+and admissions frozen. Only after task-list smoke PASS may the authorized operator
+start TaskBridge and verify recovery. This development task performs no deployment,
+service restart, commit, push or merge.
+
 ### Controlled rollout retry #16: dedicated WORK queue startup fix
 
 Retry #16 stopped safely during pre-mutation checks because the development startup
@@ -308,7 +488,7 @@ hold isolation, and queued stale COMMIT notices. Full verification was rerun aft
 these corrections.
 
 Production-only validation intentionally deferred: actual Codex/Cursor sessions,
-installed MCP transport, FIREFLY SSH/network/reboot behavior, real Telegram delivery,
+live installed MCP transport, FIREFLY SSH/network/reboot behavior, real Telegram delivery,
 GitHub permissions/protections, and authorized publication to a disposable test repo.
 The exact checklist below covers each of these without claiming live E2E evidence.
 
@@ -332,7 +512,10 @@ These are post-review/post-deployment procedures, not actions performed by this 
    points to the isolated development worktree, not the live checkout.
 3. Run the full unittest suite, `python -m py_compile *.py tests/*.py`, and
    `git diff --check` on the deployed code before the authorized service restart.
-   Start the MCP/WORK bridge using their actual installed units; inspect startup logs
+   Start MCP using its actual installed unit while WORK TaskBridge remains stopped.
+   Run `python mcp_smoke.py` with the installed interpreter and require exit status 0
+   and `TASK_LIST_TRANSPORT: PASS`; compare task count/identities with the inventory.
+   Only after this PASS start the WORK bridge; inspect startup logs
    for registry errors, corrupt state and enrollment mismatch. Confirm old RUNNING
    coding and reviewer task IDs are monitored without new launches. Existing old PASS
    records must refuse publication until refreshed review. Inspect labels/outbox.
@@ -348,6 +531,19 @@ These are post-review/post-deployment procedures, not actions performed by this 
    follow-up after PASS; confirm approval/snapshot cleared before resumption and a new
    review round. An owner command from before that PASS must not publish.
 6. Separately test CHANGES_REQUIRED → same-session correction → fresh reviewer → PASS.
+   With authorized disposable fixtures, resume coding while its old READY payload
+   remains visible. Confirm no review starts while coding is RUNNING/STARTING/UNKNOWN.
+   Let an old reviewer finish: its result must be ignored, including after bridge
+   restart. After the new coding turn is DONE with exit 0 and READY, confirm exactly
+   one fresh read-only review and a new approval epoch. Drain any invalidated reviewer
+   before the fresh review; retain locks for uncertain workers. Do not reuse reviewer
+   `72624bcb32db` as rollout publication evidence.
+   With separately authorized disposable review fixtures, exercise malformed output
+   twice in the first reviewer, then one fresh independent session. Restart the bridge
+   while fallback is pending and running: confirm a single fresh reviewer, unchanged
+   coding task/session and read-only review. Confirm a valid final PASS is announced
+   once; if both sessions and their corrections are malformed, confirm stable FAILED
+   with no publication approval or further reviewer launches.
    Edit a reviewed file silently and attempt COMMIT; confirm refusal and unchanged
    HEAD. Repeat with dirty pre-task baseline, adopted/unknown baseline, detached HEAD,
    changed branch and changed HEAD. Use independent disposable tasks for these cases.
@@ -373,6 +569,11 @@ These are post-review/post-deployment procedures, not actions performed by this 
    GitHub/Telegram unavailability; confirm durable comments/labels eventually converge,
    backoff and no token-bearing logs. Check that Telegram's ambiguous acceptance is
    held UNCERTAIN and never automatically resent; inspect any missed notice manually.
+   Interrupt MCP task-list discovery with durable diagnostic effects already pending;
+   confirm comments/Telegram still flush within their bounds and approval invitations
+   wait for successful reconciliation. Cancel a saved review-format continuation by
+   resuming coding; restart the bridge, verify a terminal old reviewer drains without
+   waiting for an unlaunched turn, and an active/UNKNOWN old reviewer retains its lock.
 10. Run cleanup dry-run with a short explicit retention in an isolated state fixture.
     Inspect every planned archive/issue close. Include an unknown file and unfinished
     publication; both must be excluded. Apply once, repeat, and inspect archived
@@ -423,8 +624,12 @@ worker identity or an unaccounted in-flight publication.
    in the backup. Keep HOME unenrolled. Do not start a second bridge.
 4. In the installed runtime, run the full unittest suite, compilation and diff check.
    Start the identified MCP service first, verify health/registered project identity,
-   then start the WORK bridge. Check migration/quarantine outcomes, PID holds, request
-   receipts, labels and outbox; confirm no duplicate agents/publication/terminal notices.
+   and run `python mcp_smoke.py` with the installed interpreter while TaskBridge is
+   stopped. Require exit status 0 and `TASK_LIST_TRANSPORT: PASS`, reconciling the
+   decoded task count/identities with the inventory, before starting the WORK bridge.
+   Failure keeps the bridge stopped and admissions frozen. Check migration/quarantine
+   outcomes, PID holds, request receipts, labels and outbox; confirm no duplicate
+   agents/publication/terminal notices.
    Keep ordinary admissions frozen until startup/reconciliation is healthy.
 5. Run the disposable production E2E checklist above with separate authorization for
    each publication/reboot step. Record evidence and the current state snapshot.
@@ -451,7 +656,8 @@ Rollback after any code has run:
    actions ran since the backup, restoring that matching code/state snapshot together
    is safe. Otherwise reconcile forward from the post-rollout snapshot, preserving
    completed Git/GitHub actions; code rollback does not undo commits/pushes/PRs/merges.
-5. Start MCP then the single WORK bridge only after state/runtime compatibility is
-   verified. Re-run health/reconciliation and disposable checks before reopening
+5. After state/runtime compatibility is verified, start MCP and require the installed
+   task-list transport smoke PASS before starting the single WORK bridge. Re-run
+   health/reconciliation and disposable checks before reopening
    submissions. Keep all backups and audit evidence. No automatic cleanup, receipt
    deletion, branch reset, inverse publication or live release belongs to rollback.
