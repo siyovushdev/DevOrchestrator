@@ -219,6 +219,62 @@ def capture_git_baseline(machine, workspace):
     root_result = capture_git(machine, workspace, "rev-parse", "--show-toplevel")
     push_result = capture_git(machine, workspace, "remote", "get-url", "--push", "--all", "origin")
 
+    # Capture the exact publishable worktree state without touching the user's
+    # real index. This lets notification code prove that a reviewed task was
+    # truly read-only/no-op even when the repository was already dirty.
+    quoted_workspace = shlex.quote(workspace)
+
+    tree_result = capture(
+        machine,
+        (
+            "set -e; "
+            'tmp=$(mktemp); rm -f "$tmp"; '
+            """trap 'rm -f "$tmp"' EXIT; """
+            f"if git -C {quoted_workspace} rev-parse --verify HEAD >/dev/null 2>&1; then "
+            f'GIT_INDEX_FILE="$tmp" git -C {quoted_workspace} read-tree HEAD; '
+            "fi; "
+            f'GIT_INDEX_FILE="$tmp" git -C {quoted_workspace} add -A; '
+            f'GIT_INDEX_FILE="$tmp" git -C {quoted_workspace} write-tree'
+        ),
+        separate_stderr=True,
+    )
+
+    index_result = capture(
+        machine,
+        (
+            "set -o pipefail; "
+            f"git -C {quoted_workspace} ls-files --stage -z "
+            "| sha256sum | awk '{print $1}'"
+        ),
+        separate_stderr=True,
+    )
+
+    root = root_result.stdout.strip() if root_result.returncode == 0 else None
+    push_urls = push_result.stdout.splitlines() if push_result.returncode == 0 else []
+    worktree_tree = tree_result.stdout.strip() if tree_result.returncode == 0 else None
+    index_fingerprint = index_result.stdout.strip() if index_result.returncode == 0 else None
+
+    snapshot_fingerprint = None
+    if (
+        status_result.returncode == 0
+        and root
+        and worktree_tree
+        and index_fingerprint
+    ):
+        snapshot = {
+            "head": head,
+            "branch": branch,
+            "origin": origin,
+            "root": root,
+            "push_urls": push_urls,
+            "tree": worktree_tree,
+            "status": status_result.stdout,
+            "index": index_fingerprint,
+        }
+        snapshot_fingerprint = hashlib.sha256(
+            json.dumps(snapshot, sort_keys=True).encode()
+        ).hexdigest()
+
     return {
         "captured_at": captured_at,
         "is_repo": True,
@@ -228,8 +284,11 @@ def capture_git_baseline(machine, workspace):
         "status_porcelain": status_porcelain,
         "clean": status_porcelain == "",
         "origin": origin,
-        "root": root_result.stdout.strip() if root_result.returncode == 0 else None,
-        "push_urls": push_result.stdout.splitlines() if push_result.returncode == 0 else [],
+        "root": root,
+        "push_urls": push_urls,
+        "worktree_tree": worktree_tree,
+        "index_fingerprint": index_fingerprint,
+        "snapshot_fingerprint": snapshot_fingerprint,
         "error": (
             None
             if status_result.returncode == 0

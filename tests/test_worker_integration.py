@@ -59,6 +59,30 @@ class WorkerIntegrationTests(unittest.TestCase):
                 self.assertEqual(d.load_meta(task_id)['turns'], 2)
                 self.assertEqual(d.load_meta(task_id)['pid'], second['pid'])
 
+    def test_git_baseline_fingerprint_detects_dirty_content_change(self):
+        dirty = self.repo / 'dirty.txt'
+        dirty.write_text('one\\n')
+
+        first = d.capture_git_baseline('work', str(self.repo))
+        self.assertFalse(first['clean'])
+        self.assertTrue(first['snapshot_fingerprint'])
+
+        # Same porcelain path/status, different bytes: fingerprint must change.
+        dirty.write_text('two\\n')
+        second = d.capture_git_baseline('work', str(self.repo))
+        self.assertEqual(first['status_porcelain'], second['status_porcelain'])
+        self.assertNotEqual(
+            first['snapshot_fingerprint'],
+            second['snapshot_fingerprint'],
+        )
+
+        dirty.write_text('one\\n')
+        restored = d.capture_git_baseline('work', str(self.repo))
+        self.assertEqual(
+            first['snapshot_fingerprint'],
+            restored['snapshot_fingerprint'],
+        )
+
     def test_lease_capacity_and_traversal(self):
         task = self.data / 'active'; task.mkdir(parents=True)
         from durable import write_json

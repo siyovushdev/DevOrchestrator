@@ -30,6 +30,74 @@ class NotificationTests(unittest.TestCase):
                 self.assertFalse(n.review_approval_complete({**approved, **fields}))
         self.assertTrue(n.review_approval_complete({**approved, 'coding_turn': 2, 'review_coding_turn': 2}))
 
+    def test_review_pass_noop_does_not_invite_commit(self):
+        item = dict(
+            review_status='PASS',
+            owner_state='READY_FOR_OWNER',
+            owner_approved_at='2026-10-07T00:00:00+00:00',
+            reviewed_tree={'fingerprint': 'same-state'},
+        )
+        report = {'git_baseline': {'snapshot_fingerprint': 'same-state'}}
+
+        text = n.terminal_text(
+            'REVIEW_PASSED / READY_FOR_OWNER',
+            {'number': 1},
+            item,
+            report,
+        )
+
+        self.assertTrue(text.startswith('REVIEW_PASSED / COMPLETE'))
+        self.assertIn('Publication: NOT_REQUIRED', text)
+        self.assertNotIn('Next owner action: COMMIT', text)
+
+    def test_review_pass_real_delta_still_invites_commit(self):
+        item = dict(
+            review_status='PASS',
+            owner_state='READY_FOR_OWNER',
+            owner_approved_at='2026-10-07T00:00:00+00:00',
+            reviewed_tree={'fingerprint': 'after'},
+        )
+        report = {'git_baseline': {'snapshot_fingerprint': 'before'}}
+
+        text = n.terminal_text(
+            'REVIEW_PASSED / READY_FOR_OWNER',
+            {'number': 1},
+            item,
+            report,
+        )
+
+        self.assertTrue(text.startswith('REVIEW_PASSED / READY_FOR_OWNER'))
+        self.assertIn('Next owner action: COMMIT', text)
+
+    def test_dirty_legacy_baseline_is_conservative(self):
+        item = dict(
+            review_status='PASS',
+            owner_state='READY_FOR_OWNER',
+            owner_approved_at='2026-10-07T00:00:00+00:00',
+            reviewed_tree={
+                'fingerprint': 'reviewed',
+                'head': 'abc',
+                'status': '?? same-name.txt\\n',
+            },
+        )
+        report = {
+            'git_baseline': {
+                'head': 'abc',
+                'clean': False,
+                'status_porcelain': '?? same-name.txt',
+            }
+        }
+
+        text = n.terminal_text(
+            'REVIEW_PASSED / READY_FOR_OWNER',
+            {'number': 1},
+            item,
+            report,
+        )
+
+        self.assertTrue(text.startswith('REVIEW_PASSED / READY_FOR_OWNER'))
+        self.assertIn('Next owner action: COMMIT', text)
+
     def test_review_pass_formatter_uses_completed_publication_stage(self):
         item = dict(review_status='PASS', owner_state='COMMITTED',
                     owner_approved_at='2026-10-06T00:00:00+00:00',
