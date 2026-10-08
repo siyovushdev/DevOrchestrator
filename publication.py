@@ -82,6 +82,16 @@ class Repository:
             raise PublicationError('Cannot fingerprint registered repository')
         return json.loads(result.stdout)
 
+    def review_evidence(self, snapshot):
+        """Local registered workspace and freshly verified object IDs only."""
+        from chief_evidence import EVIDENCE_SCRIPT
+        result = devctl.capture(self.machine, shlex.join([
+            'python3', '-c', EVIDENCE_SCRIPT, self.workspace,
+            snapshot['tree'], snapshot.get('head') or '']), separate_stderr=True)
+        if result.returncode:
+            raise PublicationError('Cannot safely extract bounded Chief evidence')
+        return json.loads(result.stdout)
+
 
 def github_repo(origin):
     match = re.fullmatch(r'(?:git@github\.com:|https://github\.com/|ssh://git@github\.com/)'
@@ -109,6 +119,9 @@ def validate_baseline(item, report, snapshot):
 
 def execute(repo, item, report, command, persist):
     """Journal before mutations. Recover uncertain results by inspecting Git/GitHub."""
+    from chief_review import approval_complete
+    if not approval_complete(item):
+        raise PublicationError('Current Chief PASS is required for publication')
     action = command['action']
     current = repo.snapshot()
     journal = item.setdefault('publication_journal', {})

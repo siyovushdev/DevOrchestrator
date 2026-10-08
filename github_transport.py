@@ -206,6 +206,13 @@ class GitHubTransport:
 
     def transition_issue(self, issue: dict, target: str) -> None:
         number = self._issue_number(self.issue_ref(issue['number']))
+        if target == 'dev:awaiting-chief-review':
+            # Provision only the additive label. Concurrent creation retries via
+            # the existing outbox, and existing label settings are left intact.
+            labels = self.pages(f'repos/{self._cli_repository}/labels?per_page=100')
+            if not any(isinstance(label, dict) and label.get('name') == target for label in labels):
+                self._call('write', 'label', 'create', target, '-R', self._cli_repository,
+                           '--color', '6F42C1', '--description', 'Awaiting a bound Chief Engineer verdict')
         current = self.label_names(issue)
         args = ['issue', 'edit', number, '-R', self._cli_repository]
         for label in self._state_labels:
