@@ -58,6 +58,9 @@ class WorkerIntegrationTests(unittest.TestCase):
                 d.continue_task(task_id, 'followup', 'b' * 64)
                 self.assertEqual(d.load_meta(task_id)['turns'], 2)
                 self.assertEqual(d.load_meta(task_id)['pid'], second['pid'])
+                audit = json.loads((d.task_dir(task_id) / 'runtime_audit.json').read_text())
+                self.assertEqual(audit[first['runtime_generation']]['liveness']['exit_code'], 0)
+                self.assertEqual(audit[first['runtime_generation']]['session_id'], 'session-test')
 
     def test_git_baseline_fingerprint_detects_dirty_content_change(self):
         dirty = self.repo / 'dirty.txt'

@@ -5,6 +5,7 @@ persist classification transitions; they never manufacture a heartbeat. Linux
 boot/start identity prevents PID reuse from proving ownership after a restart.
 """
 import math
+from contextlib import nullcontext
 import os
 from pathlib import Path
 import subprocess
@@ -93,7 +94,18 @@ def initialize(directory, meta, *, clock=None):
                   phase='STARTING', started_at=now, last_heartbeat_at=now,
                   heartbeat_sequence=0, lease_expires_at=now + LEASE_SECONDS,
                   exit_code=None, terminal_reason=None, role=meta.get('role', 'coding'))
+    record['turn'] = meta.get('turns', 1)
     with exclusive(directory / 'liveness.lock', blocking=True):
+        previous = read_record(directory)
+        if previous and previous.get('generation') != record['generation']:
+            # Preserve each completed turn's original runtime/ownership/exit
+            # receipts before installing the next generation.
+            validate(previous)
+            audit = read_json(directory / 'runtime_audit.json', {})
+            audit.setdefault(previous['generation'], dict(liveness=previous,
+                process_group=read_json(directory / 'process_group.json'),
+                cleanup=meta.get('cleanup_state'), session_id=meta.get('session_id')))
+            write_json(directory / 'runtime_audit.json', audit)
         write_json(directory / 'liveness.json', record)
     return record
 
@@ -111,6 +123,11 @@ def heartbeat(directory, generation, *, worker_pid, agent_pid, phase, exit_code=
                       heartbeat_sequence=record['heartbeat_sequence'] + 1)
         if exit_code is not None:
             record.update(exit_code=exit_code, terminal_reason='process_exited')
+        # Record live group anchors before the supervisor exits, including
+        # descendants surviving a successfully exited direct agent child.
+        from worker_runtime import record_group
+        if worker_pid == os.getpid():
+            record_group(directory, record, worker_pid)
         write_json(directory / 'liveness.json', record)
         return record
 
@@ -156,7 +173,7 @@ def classify(record, now, worker_alive, process_alive, *, communication=True):
     return 'SUSPECTED_STALL', 'worker_communication_uncertain' if not communication else 'process_ownership_unproven'
 
 
-def watchdog(directory, meta, *, probe=True, terminal=None, clock=None, evidence=None):
+def watchdog(directory, meta, *, probe=True, terminal=None, clock=None, evidence=None, read_only=False):
     """One normalized, secret-free report, also used by cached MCP/SSH status.
 
     Missing legacy heartbeats cannot prove health. Remote cached evidence cannot
@@ -166,7 +183,7 @@ def watchdog(directory, meta, *, probe=True, terminal=None, clock=None, evidence
     idempotent; elapsed heartbeat ages are calculated at read time.
     """
     now = time.time() if clock is None else clock
-    with exclusive(directory / 'liveness.lock', blocking=True):
+    with nullcontext() if read_only else exclusive(directory / 'liveness.lock', blocking=True):
         record = None
         worker = process = None
         try:
@@ -205,7 +222,8 @@ def watchdog(directory, meta, *, probe=True, terminal=None, clock=None, evidence
                 not _number(previous.get('last_transition_at'))):
             observation.update(transition_sequence=sequence + 1,
                                last_transition_at=now)
-            write_json(directory / 'runtime_health.json', observation)
+            if not read_only:
+                write_json(directory / 'runtime_health.json', observation)
         else:
             observation.update(transition_sequence=sequence, last_transition_at=previous['last_transition_at'])
         report = dict(observation, task_id=meta.get('id', directory.name), project=meta.get('project', '-'),
@@ -259,6 +277,8 @@ def run(directory, generation, command):
     record = validate(read_record(directory))
     if record['generation'] != generation:
         raise RuntimeError('Runtime generation changed before launch')
+    from worker_runtime import record_group
+    record_group(directory, record, os.getpid())
     child = subprocess.Popen(['bash', '-c', command], stdin=subprocess.DEVNULL)
     phase = 'REVIEW' if record.get('role') == 'review' else 'CODING'
     heartbeat(directory, generation, worker_pid=os.getpid(), agent_pid=child.pid, phase=phase)

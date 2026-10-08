@@ -90,10 +90,14 @@ with (root / 'lock').open('a') as lock:
             extra = {}
             if (root / 'liveness.json').exists():
                 record = runtime_liveness.validate(runtime_liveness.read_record(root))
-                context = dict(id=record['task_id'], machine=record['machine'], agent=record['agent'])
+                context = dict(id=record['task_id'], machine=record['machine'], agent=record['agent'],
+                    role=record['role'], turns=record.get('turn', 1), runtime_generation=record['generation'],
+                    pid=meta['pid'], process_identity=dict(boot=meta['boot'], start=meta['start']))
                 health = runtime_liveness.watchdog(root, context)
                 status, code = runtime_liveness.task_status(health)
-                extra = dict(liveness=record, runtime_health=health)
+                import worker_runtime
+                cleanup = worker_runtime.cleanup_group(root, context, status)
+                extra = dict(liveness=record, runtime_health=health, cleanup_state=cleanup)
             # Observe exit before reading logs. A process that exits while this
             # chunk is being read must not make an incomplete chunk final.
             offset = int(sys.argv[3])
@@ -123,7 +127,7 @@ def rpc(machine, mode, key, value, context=None):
 
 def start(machine, key, command, context=None):
     if context is not None:
-        context = {k: context[k] for k in ('id', 'machine', 'agent', 'project', 'session_id', 'role', 'runtime_generation') if k in context}
+        context = {k: context[k] for k in ('id', 'machine', 'agent', 'project', 'session_id', 'role', 'runtime_generation', 'turns') if k in context}
     return rpc(machine, 'start', key, command, context)
 
 
@@ -175,6 +179,9 @@ def _refresh(meta, directory):
                 clock=health['observed_at'])
             result['status'], result['exit_code'] = runtime_liveness.task_status(health)
             meta['_runtime_health'] = health
+            if result.get('cleanup_state') in ('ABSENT', 'CLEANED', 'AMBIGUOUS', 'ACTIVE'):
+                meta['remote_cleanup_state'] = result['cleanup_state']
+                meta['remote_cleanup_generation'] = record['generation']
         local_size = meta.get("remote_local_size", log.stat().st_size if log.exists() else 0)
         if log.exists() and log.stat().st_size > local_size:
             with log.open("r+b") as stream:

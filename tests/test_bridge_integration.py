@@ -402,9 +402,9 @@ class BridgeIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item['owner_state'], 'READY_FOR_OWNER')
         self.assertFalse(b.notifications.publication_delta_present(item, self.h.tasks[item['task_id']]))
         final = [c.args[0] for c in self.h.telegram.call_args_list if 'REVIEW_PASSED' in c.args[0]]
-        self.assertEqual(len(final), 1)
-        self.assertIn('Publication: NOT_REQUIRED', final[0])
-        self.assertNotIn('Next owner action: COMMIT', final[0])
+        # Operational notification hygiene: a no-op completion has no owner
+        # action; it remains visible through durable/operator status only.
+        self.assertEqual(final, [])
         markers = [c['body'].split('DEVORCHESTRATOR_EFFECT_V1 ')[1].split(' -->')[0]
                    for c in self.h.comments[1] if 'DEVORCHESTRATOR_EFFECT_V1 ' in c['body']]
         self.assertEqual(len(markers), len(set(markers)))

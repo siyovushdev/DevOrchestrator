@@ -110,18 +110,36 @@ class Scheduler:
     def started(self, key, task_id, status="RUNNING"):
         self.jobs[key].update(status=status if status in ("RUNNING", "DONE", "FAILED") else "UNKNOWN", task_id=task_id, launch_pending=False)
 
-    def observe(self, task_id, status):
+    def observe(self, task_id, status, cleanup_state=None):
         matching = [j for j in self.jobs.values() if j.get('task_id') == task_id and j['status'] != 'QUEUED']
         if matching:
             job = max(matching, key=lambda j: j['sequence'])
+            if cleanup_state == 'AMBIGUOUS':
+                job['runtime_cleanup_pending'] = True
+            elif cleanup_state in ('ABSENT', 'CLEANED'):
+                for previous in matching:
+                    previous.pop('runtime_cleanup_pending', None)
             if job.get('launch_pending') and status in ('DONE', 'FAILED'):
                 return
             job['status'] = status if status in ('DONE', 'FAILED', 'RUNNING') else 'UNKNOWN'
             if job.get('identity_pending') and job['status'] == 'RUNNING':
                 job['status'] = 'UNKNOWN'
+            if status in ('DONE', 'FAILED'):
+                for previous in matching:
+                    if not previous.get('launch_pending'):
+                        previous['status'] = status
+            if job.get('runtime_cleanup_pending'):
+                job['status'] = 'UNKNOWN'
 
     def release(self, owner):
-        if any(j['owner'] == owner and j['status'] in ('RESERVED', 'RUNNING', 'UNKNOWN') for j in self.jobs.values()):
+        from operational_state import chief_repository_hold
+        item = self.state.get('issues', {}).get(str(owner))
+        if item is not None and chief_repository_hold(item):
+            # Both recovery and process_tracked's finally block use this path.
+            # PASS persistence precedes Chief enrollment and cannot release it.
+            return False
+        if any(j['owner'] == owner and (j['status'] in ('RESERVED', 'RUNNING', 'UNKNOWN') or
+                                       j.get('runtime_cleanup_pending')) for j in self.jobs.values()):
             return False
         for repo, lock in list(self.locks.items()):
             if lock['owner'] == owner:
@@ -135,8 +153,8 @@ class Scheduler:
             matching = [j for j in self.jobs.values() if j.get('task_id') == task['id']]
             pending = next((j for j in matching if j.get('identity_pending')), None)
             if matching and not pending:
-                self.observe(task['id'], task['status'])
-            elif task['status'] in ('RUNNING', 'UNKNOWN', 'STARTING'):
+                self.observe(task['id'], task['status'], task.get('cleanup_state'))
+            elif task['status'] in ('RUNNING', 'UNKNOWN', 'STARTING') or task.get('cleanup_state') == 'AMBIGUOUS':
                 key = 'external:' + task['id']
                 try:
                     if not project or project == '-':
@@ -160,6 +178,35 @@ class Scheduler:
         external = {t['id']: t for t in tasks}
         for key, job in self.jobs.items():
             if key.startswith('external:') and job.get('task_id') in external:
-                self.observe(job['task_id'], external[job['task_id']]['status'])
+                self.observe(job['task_id'], external[job['task_id']]['status'], external[job['task_id']].get('cleanup_state'))
                 if job['status'] in ('DONE', 'FAILED'):
                     self.release(job['owner'])
+        diagnostics = self.state.setdefault('scheduler_diagnostics', {})
+        for repo, lock in list(self.locks.items()):
+            jobs = [j for j in self.jobs.values() if j.get('repo') == repo and j.get('owner') == lock.get('owner')]
+            if not jobs:
+                diagnostics[repo] = 'Lock retained: missing queue ownership proof'
+                continue
+            if diagnostics.get(repo) == 'Lock retained: missing queue ownership proof':
+                diagnostics.pop(repo)
+            item = self.state.get('issues', {}).get(str(lock.get('owner')))
+            from operational_state import exclusion_reason
+            archived = item is not None and exclusion_reason(item)
+            if item is not None and not archived:
+                # A terminal worker turn is not a completed issue. Recovery runs
+                # before phase processing, when review/correction intent may not
+                # yet exist. Keep ownership until the bridge records its terminal
+                # review/report outcome (or an existing publication milestone).
+                finished = (item.get('review_status') in ('PASS', 'NEEDS_OWNER', 'FAILED', 'FRESH_REVIEW_REQUIRED') or
+                            item.get('last_report_signature') or
+                            item.get('compatibility_status') == 'QUARANTINED' or
+                            item.get('owner_state') in ('READY_FOR_OWNER', 'COMMITTED', 'PUSHED', 'PR_CREATED', 'MERGED'))
+                if not finished or item.get('review_status') == 'RUNNING' or item.get('pending_rpc'):
+                    continue
+            # An archival cancellation proves no launch only while its original
+            # unreserved queue identity has no task or uncertain launch receipt.
+            if (all((j['status'] in ('DONE', 'FAILED') or
+                     (archived and j['status'] == 'CANCELLED' and j.get('cancelled') == 'archived_issue' and
+                      not j.get('task_id'))) and not j.get('launch_pending') for j in jobs) and
+                    self.release(lock['owner'])):
+                diagnostics.pop(repo, None)

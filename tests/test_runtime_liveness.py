@@ -383,6 +383,167 @@ class RemoteRuntimeLivenessTests(unittest.TestCase):
         if context is not None: args.append(json.dumps(context))
         return json.loads(subprocess.check_output(args, env=self.env))
 
+    def remote_lease(self, diagnostic=None):
+        record = runtime.initialize(self.directory, self.meta)
+        self.meta['runtime_generation'] = record['generation']
+        write_json(self.directory / 'meta.json', self.meta)
+        record = runtime.heartbeat(self.directory, record['generation'], worker_pid=os.getpid(),
+                                   agent_pid=os.getpid(), phase='CODING')
+        health = runtime.watchdog(self.directory, self.meta, probe=False, evidence=(True, True))
+        parent = self.directory.parent.parent
+        leases = {'remote': {'task_id': 'task', 'machine': 'firefly'}}
+        write_json(parent / 'worker_leases.json', leases)
+        write_json(parent / 'worker_consistency.json', {'leases': {'remote': diagnostic} if diagnostic else {}})
+        return leases, dict(liveness=record, runtime_health=health, status='RUNNING',
+                           chunk='', more=False, cleanup_state='ACTIVE')
+
+    def test_skipped_remote_lease_probe_preserves_diagnostics_until_fresh_probe(self):
+        for diagnostic in (None, 'Previously classified ownership ambiguity'):
+            with self.subTest(diagnostic=diagnostic):
+                leases, response = self.remote_lease(diagnostic)
+                parent = self.directory.parent.parent
+                before = (parent / 'worker_consistency.json').read_bytes()
+                with patch.object(devctl, 'DATA_DIR', self.directory.parent), \
+                     patch.object(remote_worker, 'rpc', return_value=response) as rpc, \
+                     patch.object(worker_runtime.os, 'killpg') as kill:
+                    self.assertEqual(devctl.task_state(self.meta, self.directory, refresh_remote=False)[0], 'UNKNOWN')
+                    for _ in range(2): devctl.reconcile_workers()
+                    rpc.assert_not_called()
+                    self.assertEqual(read_json(parent / 'worker_leases.json'), leases)
+                    self.assertEqual((parent / 'worker_consistency.json').read_bytes(), before)
+                    devctl.reconcile_workers(refresh_remote=True)
+                    rpc.assert_called_once()
+                    self.assertEqual(read_json(parent / 'worker_leases.json'), leases)
+                    self.assertEqual(read_json(parent / 'worker_consistency.json')['leases'], {})
+                    devctl.reconcile_workers()
+                    self.assertEqual(read_json(parent / 'worker_consistency.json')['leases'], {})
+                    kill.assert_not_called()
+
+    def test_failed_remote_probe_is_unclassified_and_preserves_diagnostic(self):
+        for diagnostic in (None, 'Previously classified ownership ambiguity'):
+            with self.subTest(diagnostic=diagnostic):
+                leases, _ = self.remote_lease(diagnostic)
+                parent = self.directory.parent.parent
+                before = (parent / 'worker_consistency.json').read_bytes()
+                with patch.object(devctl, 'DATA_DIR', self.directory.parent), \
+                     patch.object(remote_worker, 'rpc', side_effect=OSError('offline')):
+                    devctl.reconcile_workers(refresh_remote=True)
+                self.assertEqual(read_json(parent / 'worker_leases.json'), leases)
+                self.assertEqual((parent / 'worker_consistency.json').read_bytes(), before)
+
+    def test_fresh_report_and_discovery_clear_remote_lease_diagnostic(self):
+        for command in (devctl.task_report, devctl.list_tasks):
+            with self.subTest(command=command.__name__):
+                leases, response = self.remote_lease('Previously classified ownership ambiguity')
+                parent = self.directory.parent.parent
+                with patch.object(devctl, 'DATA_DIR', self.directory.parent), \
+                     patch.object(devctl, 'load_projects', return_value={}), \
+                     patch.object(remote_worker, 'rpc', return_value=response) as rpc, \
+                     redirect_stdout(io.StringIO()) as output:
+                    if command is devctl.task_report:
+                        command('task', as_json=True)
+                    else:
+                        command(as_json=True)
+                rpc.assert_called_once()
+                report = json.loads(output.getvalue())
+                self.assertEqual((report[0] if isinstance(report, list) else report)['status'], 'RUNNING')
+                self.assertEqual(read_json(parent / 'worker_leases.json'), leases)
+                self.assertEqual(read_json(parent / 'worker_consistency.json')['leases'], {})
+
+    def test_superseded_fresh_observation_preserves_current_lease_diagnostic(self):
+        leases, response = self.remote_lease('Keep newer diagnostic')
+        parent = self.directory.parent.parent
+        with patch.object(remote_worker, 'rpc', return_value=response):
+            state, code = devctl.task_state(self.meta, self.directory)
+        newer = read_json(self.directory / 'meta.json')
+        newer['runtime_generation'] = 'newer-turn'
+        write_json(self.directory / 'meta.json', newer)
+        before = (parent / 'worker_consistency.json').read_bytes()
+        with patch.object(devctl, 'DATA_DIR', self.directory.parent), patch.object(worker_runtime.os, 'killpg') as kill:
+            devctl.reconcile_remote_observation(self.directory, self.meta, state, code)
+        kill.assert_not_called()
+        self.assertEqual(read_json(parent / 'worker_leases.json'), leases)
+        self.assertEqual((parent / 'worker_consistency.json').read_bytes(), before)
+        self.assertEqual(read_json(self.directory / 'meta.json'), newer)
+
+    def test_prepared_remote_turn_does_not_reuse_an_earlier_probe(self):
+        leases, response = self.remote_lease('Keep previous diagnostic')
+        parent = self.directory.parent.parent
+        with patch.object(remote_worker, 'rpc', return_value=response):
+            self.assertEqual(devctl.task_state(self.meta, self.directory)[0], 'RUNNING')
+        for flag in ('launch_prepared', 'resume_prepared'):
+            with self.subTest(flag=flag):
+                self.meta[flag] = True
+                devctl.save_meta(self.directory, self.meta)
+                before = (parent / 'worker_consistency.json').read_bytes()
+                with patch.object(devctl, 'DATA_DIR', self.directory.parent), \
+                     patch.object(remote_worker, 'rpc') as rpc:
+                    state, code = devctl.task_state(self.meta, self.directory)
+                    self.assertEqual(state, 'UNKNOWN')
+                    devctl.reconcile_remote_observation(self.directory, self.meta, state, code)
+                rpc.assert_not_called()
+                self.assertEqual(read_json(parent / 'worker_leases.json'), leases)
+                self.assertEqual((parent / 'worker_consistency.json').read_bytes(), before)
+                self.meta.pop(flag)
+
+    def test_terminal_ambiguity_is_not_cleared_while_final_logs_are_pending(self):
+        leases, _ = self.remote_lease('Previously classified ownership ambiguity')
+        parent = self.directory.parent.parent
+        record = runtime.heartbeat(self.directory, self.meta['runtime_generation'], worker_pid=os.getpid(),
+                                   agent_pid=os.getpid(), phase='EXITED', exit_code=0)
+        health = runtime.watchdog(self.directory, self.meta, probe=False, evidence=(False, False))
+        response = dict(liveness=record, runtime_health=health, status='DONE', exit_code=0,
+                        cleanup_state='AMBIGUOUS', chunk='', more=True)
+        with patch.object(devctl, 'DATA_DIR', self.directory.parent), \
+             patch.object(remote_worker, 'rpc', return_value=response), redirect_stdout(io.StringIO()) as output:
+            devctl.task_report('task', as_json=True)
+        self.assertEqual(json.loads(output.getvalue())['status'], 'RUNNING')
+        self.assertEqual(read_json(parent / 'worker_leases.json'), leases)
+        self.assertIn('ambiguous', read_json(parent / 'worker_consistency.json')['leases']['remote'])
+
+    def test_unvisited_remote_directory_is_not_an_orphan_but_missing_directory_is(self):
+        leases, _ = self.remote_lease()
+        parent = self.directory.parent.parent
+        leases['missing'] = {'task_id': 'missing', 'machine': 'work'}
+        write_json(parent / 'worker_leases.json', leases)
+        with patch.object(devctl, 'DATA_DIR', self.directory.parent), \
+             patch.object(devctl.time, 'monotonic', side_effect=[0, 6]), \
+             patch.object(remote_worker, 'rpc') as rpc:
+            devctl.reconcile_workers()
+        rpc.assert_not_called()
+        self.assertEqual(read_json(parent / 'worker_leases.json'), leases)
+        self.assertEqual(set(read_json(parent / 'worker_consistency.json')['leases']), {'missing'})
+
+    def test_remote_terminal_lease_requires_classified_cleanup_evidence(self):
+        for cleanup in ('CLEANED', 'AMBIGUOUS'):
+            with self.subTest(cleanup=cleanup):
+                (self.directory / 'exit_code').unlink(missing_ok=True)
+                leases, _ = self.remote_lease()
+                parent = self.directory.parent.parent
+                record = runtime.heartbeat(self.directory, self.meta['runtime_generation'], worker_pid=os.getpid(),
+                                           agent_pid=os.getpid(), phase='EXITED', exit_code=0)
+                health = runtime.watchdog(self.directory, self.meta, probe=False, evidence=(False, False))
+                chunk = json.dumps({'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'complete'}}) + '\n'
+                response = dict(liveness=record, runtime_health=health, status='DONE', exit_code=0,
+                                cleanup_state=cleanup, chunk=base64.b64encode(chunk.encode()).decode(), more=False)
+                with patch.object(devctl, 'DATA_DIR', self.directory.parent), \
+                     patch.object(remote_worker, 'rpc', return_value=response), \
+                     patch.object(worker_runtime.os, 'killpg') as kill:
+                    devctl.reconcile_workers()
+                    self.assertEqual(read_json(parent / 'worker_leases.json'), leases)
+                    self.assertEqual(read_json(parent / 'worker_consistency.json')['leases'], {})
+                    devctl.reconcile_workers(refresh_remote=True)
+                    if cleanup == 'CLEANED':
+                        self.assertEqual(read_json(parent / 'worker_leases.json'), {})
+                        self.assertEqual(read_json(parent / 'worker_consistency.json')['leases'], {})
+                    else:
+                        self.assertEqual(read_json(parent / 'worker_leases.json'), leases)
+                        self.assertIn('remote', read_json(parent / 'worker_consistency.json')['leases'])
+                    before = (parent / 'worker_consistency.json').read_bytes()
+                    devctl.reconcile_workers()
+                    self.assertEqual((parent / 'worker_consistency.json').read_bytes(), before)
+                    kill.assert_not_called()
+
     def test_real_remote_probe_and_restart_cached_report_are_distinct(self):
         with patch.object(remote_worker, 'rpc', side_effect=self.rpc):
             remote_worker.start('firefly', 'task-turn-1', "exec python3 -c 'import time; time.sleep(1)'", self.meta)
