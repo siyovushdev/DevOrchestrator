@@ -138,6 +138,30 @@ under the admission lock and only while the metadata snapshot is current. A
 healthy observation clears an older lease warning only for the matching machine;
 terminal release still requires bound absent/cleaned runtime evidence.
 
+### Offline cleanup attestation for historical local runtimes
+
+A completed local runtime without `process_group.json` remains AMBIGUOUS even
+when its direct PIDs are gone. Exit codes, null agent identities and missing
+receipts cannot prove that escaped descendants are absent. Normal startup and
+reconciliation never migrate those tasks automatically.
+
+After an operator independently verifies that the owning systemd MCP control
+group has been completely stopped/reset, an offline migration can explicitly call
+`devctl.certify_local_absent(task_id, expected_runtime_generation,
+control_group_reset_verified=True)`. Keep MCP and TaskBridge stopped during the
+migration. The helper uses the worker admission lock, re-reads metadata, refuses
+remote or non-terminal tasks and rejects a changed/missing generation. The flag
+asserts external reset evidence; the helper does not verify systemd itself.
+
+It durably writes `cleanup_state=ABSENT`, `cleanup_generation=runtime_generation`
+and `cleanup_proof=systemd_control_group_reset` without signalling historical
+PIDs. Terminal local cleanup trusts ABSENT/CLEANED only for that exact generation;
+active/prepared turns cannot use it. Normal successful local cleanup also saves
+its generation. A subsequent continue/resume creates a different generation and
+cannot reuse the old certification. Valid certification allows capacity admission
+and lease reconciliation to converge while retaining task records and original
+runtime evidence. Remote cleanup keeps its separate generation contract.
+
 ## Verification
 
 Run `python3 -m unittest discover -s tests`, `python3 -m py_compile *.py tests/*.py`,

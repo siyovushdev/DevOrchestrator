@@ -140,7 +140,7 @@ def group_ownership(receipt, group=None):
 
 
 def cleanup_group(directory, meta, state, *, grace_seconds=1):
-    """Terminal evidence + generation + live identity fences every signal."""
+    """Terminal generation-bound proof fences cleanup and every signal."""
     if state not in ('DONE', 'FAILED') or meta.get('launch_prepared') or meta.get('resume_prepared'):
         return 'ACTIVE'
     if meta.get('remote_key'):
@@ -151,16 +151,20 @@ def cleanup_group(directory, meta, state, *, grace_seconds=1):
                 meta.get('remote_cleanup_state') in ('ABSENT', 'CLEANED')):
             return meta['remote_cleanup_state']
         return 'AMBIGUOUS'
+    if (meta.get('machine') == 'work' and meta.get('runtime_generation') and
+            meta.get('cleanup_generation') == meta['runtime_generation'] and
+            meta.get('cleanup_state') in ('ABSENT', 'CLEANED')):
+        return meta['cleanup_state']
     try:
         receipt = read_json(directory / 'process_group.json')
         if receipt is None:
             if meta.get('runtime_generation'):
                 import runtime_liveness
                 record = runtime_liveness.validate(runtime_liveness.read_record(directory), meta)
-                for slot in ('worker', 'agent'):
-                    pid = record[slot + '_pid']
-                    if pid and (runtime_liveness.owned(pid, record[slot + '_identity']) is not False or session_members(pid)):
-                        return 'AMBIGUOUS'
+                # Only a never-registered launch can use the absence fallback.
+                # Exited direct PIDs cannot rule out escaped historical children.
+                if record['phase'] != 'STARTING' or record['worker_pid'] or record['agent_pid']:
+                    return 'AMBIGUOUS'
             if alive(meta):
                 return 'AMBIGUOUS'
             leader = process_details(meta.get('pid', 0)) if meta.get('pid', 0) else None
@@ -254,6 +258,9 @@ def reconcile_task(directory, meta, state, code):
     meta['effective_exit_code'] = code
     # Preserve a successful receipt on repeated absence observations.
     meta['cleanup_state'] = 'CLEANED' if result == 'ABSENT' and meta.get('cleanup_state') == 'CLEANED' else result
+    if (meta.get('machine') == 'work' and not meta.get('remote_key') and
+            meta.get('runtime_generation') and result in ('ABSENT', 'CLEANED')):
+        meta['cleanup_generation'] = meta['runtime_generation']
     if result == 'AMBIGUOUS':
         meta['consistency_diagnostic'] = 'Terminal runtime ownership ambiguous; group and lease retained'
     else:

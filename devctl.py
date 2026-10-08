@@ -715,6 +715,32 @@ def reconcile_workers(refresh_remote=False):
         pass
 
 
+def certify_local_absent(task_id, generation, *, control_group_reset_verified=False):
+    """Offline operator attestation, only after verifying a complete MCP cgroup reset.
+
+    The reset is external evidence asserted by the caller, not inferred from PIDs.
+    No startup or reconciliation path calls this helper.
+    """
+    if control_group_reset_verified is not True:
+        raise ValueError('A verified complete MCP control-group reset is required')
+    with exclusive(DATA_DIR.parent / 'worker.lock', blocking=True):
+        directory = task_dir(task_id)
+        meta = load_meta(task_id)
+        if not isinstance(meta, dict) or meta.get('id') != task_id:
+            raise ValueError('Task metadata identity does not match its directory')
+        if meta.get('remote_key') or MACHINES.get(meta.get('machine'), {}).get('type') != 'local':
+            raise ValueError('Cleanup attestation requires a local task')
+        if not isinstance(generation, str) or not generation or meta.get('runtime_generation') != generation:
+            raise ValueError('Runtime generation changed or is missing')
+        state, _ = task_state(meta, directory, refresh_remote=False)
+        if state not in ('DONE', 'FAILED'):
+            raise ValueError('Cleanup attestation requires a terminal task')
+        meta.update(cleanup_state='ABSENT', cleanup_generation=generation,
+                    cleanup_proof='systemd_control_group_reset')
+        save_meta(directory, meta)
+        return meta
+
+
 
 def adopt_task(
     project,

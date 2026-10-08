@@ -461,6 +461,8 @@ class OwnedCleanupTests(unittest.TestCase):
         d.reconcile_workers()
         terminal = d.load_meta(task_id)
         self.assertEqual(terminal['status'], 'DONE')
+        self.assertEqual(terminal['cleanup_state'], 'CLEANED')
+        self.assertEqual(terminal['cleanup_generation'], terminal['runtime_generation'])
         self.assertEqual(terminal['effective_exit_code'], 0)
         self.assertEqual(terminal['session_id'] if 'session_id' in terminal else d.task_output(terminal, directory)['session_id'], 'owned-session')
         self.assertEqual(terminal['created_at'], original_created)
