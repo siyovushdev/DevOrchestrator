@@ -1188,6 +1188,10 @@ def format_report(report):
             f"- **Session:** `{report['session_id']}`"
         )
 
+    health = report.get('liveness')
+    if isinstance(health, dict):
+        text.extend(runtime_evidence_lines(health))
+
     if report.get("model"):
         text.append(
             f"- **Model:** `{report['model']}`"
@@ -1215,6 +1219,49 @@ def format_report(report):
         ]
 
     return "\n".join(text)
+
+
+def runtime_evidence_lines(health):
+    return [
+        f"- **Runtime:** `{health.get('state')}` — {health.get('reason')}",
+        f"- **Phase:** `{health.get('phase')}`; **lease:** `{health.get('lease_state')}`",
+        f"- **Heartbeat age (seconds):** `{health.get('heartbeat_age_seconds')}`",
+        f"- **Worker owned/alive:** `{health.get('worker_alive')}`; **agent process owned/alive:** `{health.get('process_alive')}`",
+        f"- **Runtime generation:** `{health.get('generation')}`; **transition:** `{health.get('transition_sequence')}`",
+    ]
+
+
+def project_runtime_health(issue, item, state, report, slot='coding'):
+    """Project evidence through the existing outbox, never advance a workflow.
+
+    Suspected/ambiguous workers retain scheduler ownership. No retry, kill,
+    review or publication is authorized by these observations. External labels
+    cannot override the durable local report, including on duplicate ticks.
+    """
+    health = report.get('liveness')
+    if not isinstance(health, dict):
+        return False  # V1/test transports without the additive contract.
+    if health.get('reason') == 'heartbeat_not_registered':
+        return False  # Legacy tasks retain their existing process/exit handling.
+    runtime_state = health.get('state')
+    if runtime_state not in ('SUSPECTED_STALL', 'LOST_ORPHANED'):
+        if runtime_state == 'RUNNING_HEALTHY':
+            item.setdefault('runtime_observations', {}).pop(slot, None)
+        return False
+    lost = runtime_state == 'LOST_ORPHANED'
+    item['review_uncertain' if slot == 'review' else 'worker_uncertain'] = True
+    transition_issue(issue, 'dev:failed' if lost else 'dev:needs-owner')
+    signature = [report.get('id'), health.get('generation'), health.get('transition_sequence'),
+                 runtime_state, health.get('reason')]
+    observations = item.setdefault('runtime_observations', {})
+    if observations.get(slot) != signature:
+        diagnostic = f"{slot.capitalize()} task {report.get('id')}: {runtime_state}: {health.get('reason')}. No automatic recovery is scheduled."
+        add_comment(issue['number'], '\n'.join([
+            '<!-- DEVORCHESTRATOR_RUNTIME_V1 -->', diagnostic, *runtime_evidence_lines(health)]))
+        notify('FAILED' if lost else 'NEEDS_OWNER', issue, item, report, diagnostic)
+        observations[slot] = signature
+        save_state(state)
+    return report.get('status') not in ('DONE', 'FAILED')
 
 
 async def start_queued(issue, state):
@@ -1920,6 +1967,10 @@ async def process_review_loop(
     if type(review_report.get('turns')) is int:
         item['review_task_turn'] = review_report['turns']
 
+    if project_runtime_health(issue, item, state, review_report, 'review'):
+        item['review_uncertain'] = True
+        return True
+
     if review_process_status in {"RUNNING", "UNKNOWN"}:
         if review_process_status == "UNKNOWN":
             item["review_uncertain"] = True
@@ -2298,7 +2349,7 @@ def malformed_item(item):
     return False
 
 
-async def process_tracked(issue, item, state):
+async def process_tracked(issue, item, state, runtime_reports=None):
     global WORK_CONTEXT
     WORK_CONTEXT = (state, str(issue["number"]), item)
     failed = False
@@ -2319,6 +2370,9 @@ async def process_tracked(issue, item, state):
             report = await mcp_call("get_task_report", {"task_id": item["task_id"]})
             observe_coding_turn(item, state, report)
 
+        if project_runtime_health(issue, item, state, report):
+            item['worker_uncertain'] = True
+            return
         if report.get("status") == "UNKNOWN":
             item["worker_uncertain"] = True
             diagnostic = "Worker state is uncertain. Inspect the registered machine and task metadata before recovering this task; no duplicate worker will start."
@@ -2403,6 +2457,13 @@ async def process_tracked(issue, item, state):
         pass
     except Exception:
         failed = True
+        # Cached observations can still expose expired/uncertain leases when
+        # the worker report RPC is unavailable. Do not leave a stale running
+        # label as the only evidence, or infer recovery from a failed refresh.
+        for slot, key in (('coding', 'task_id'), ('review', 'review_task_id')):
+            cached = (runtime_reports or {}).get(item.get(key))
+            if cached:
+                project_runtime_health(issue, item, state, cached, slot)
         defer_issue(item, state, issue['number'])
         if not item.get("project") and item["reconciliation_retry"]["attempts"] >= 3:
             quarantine_item(issue, item, state,
@@ -2487,7 +2548,7 @@ async def reconcile_tick(state):
             if item.get("queue_status") != "FAILED" and issue.get("state", "OPEN").upper() == "OPEN":
                 await start_queued(issue, state)
         else:
-            await process_tracked(issue, item, state)
+            await process_tracked(issue, item, state, reports)
 
 
 async def main():

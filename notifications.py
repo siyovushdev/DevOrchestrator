@@ -133,6 +133,14 @@ def terminal_text(status, issue, item, report=None, blocker=None):
               ('Branch', item.get('publication_branch') or (item.get('reviewed_tree') or {}).get('branch')
                or (report.get('git_baseline') or {}).get('branch')),
               ('Commit', item.get('commit_sha')), ('PR', item.get('pr_url'))]
+    health = report.get('liveness')
+    if isinstance(health, dict):
+        values.extend([
+            ('Runtime', f"{health.get('state')}: {health.get('reason')}"),
+            ('Task', health.get('task_id')), ('Phase', health.get('phase')),
+            ('Lease', health.get('lease_state')), ('Heartbeat age (seconds)', health.get('heartbeat_age_seconds')),
+            ('Worker/process owned', f"{health.get('worker_alive')}/{health.get('process_alive')}"),
+        ])
     created = report.get('created_at')
     if created:
         try:
