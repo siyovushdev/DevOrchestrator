@@ -19,7 +19,11 @@ def flush(state, persist, comments, post_comment, transition, telegram, now=None
     now = time.time() if now is None else now
     started = time.monotonic()
     deliveries = 0
-    for key, entry in list(state.get('outbox', {}).items()):
+    # Prioritize labels and launch receipts within the existing bounded batch.
+    entries = list(state.get('outbox', {}).items())
+    entries.sort(key=lambda pair: 0 if pair[1]['kind'] == 'transition' else
+                 1 if pair[1]['kind'] == 'comment' and 'Task started:' in pair[1]['payload'] else 2)
+    for key, entry in entries:
         chief_reconcile = entry['kind'] == 'chief_comment' and entry['status'] in ('SENDING', 'UNCERTAIN')
         if not chief_reconcile and (entry['status'] in ('DONE', 'UNCERTAIN', 'FAILED') or entry.get('next_attempt', 0) > now):
             continue
@@ -66,8 +70,10 @@ def flush(state, persist, comments, post_comment, transition, telegram, now=None
             elif entry['kind'] == 'comment':
                 marker = f'<!-- DEVORCHESTRATOR_EFFECT_V1 {key} -->'
                 from chief_review import is_evidence_comment
-                if not any(marker in (c.get('body') or '') and not is_evidence_comment(c.get('body'))
-                           for c in comments(entry['number'])):
+                if not any((marker in (c.get('body') or '') or
+                            ('Task started:' in entry['payload'] and
+                             (c.get('body') or '').split('\n\n<!-- DEVORCHESTRATOR_EFFECT_V1 ')[0] == entry['payload']))
+                           and not is_evidence_comment(c.get('body')) for c in comments(entry['number'])):
                     post_comment(entry['number'], entry['payload'] + '\n\n' + marker)
             elif entry['kind'] == 'transition':
                 transition(entry['payload']['issue'], entry['payload']['target'])

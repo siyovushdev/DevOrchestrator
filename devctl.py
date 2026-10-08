@@ -11,7 +11,7 @@ import re
 import hashlib
 import time
 import signal
-from durable import write_json, exclusive
+from durable import read_json, write_json, exclusive
 from health import DOCTOR_TIMEOUT, PROBE_TIMEOUT, SSH_CONNECT_TIMEOUT, health_result
 import worker_runtime
 import remote_worker
@@ -552,6 +552,7 @@ def spawn_runtime(directory, meta, command, log_file):
 
 def list_tasks(as_json=False, show_all=False, cached=False):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    reconcile_workers()
 
     rows = []
 
@@ -582,6 +583,8 @@ def list_tasks(as_json=False, show_all=False, cached=False):
 
         try:
             state, exit_code = task_state(meta, directory, refresh_remote=not cached)
+            if meta.get('remote_key') and not cached:
+                reconcile_remote_observation(directory, meta, state, exit_code)
         except Exception:
             state, exit_code = 'UNKNOWN', None
         if meta.get("archived", False) and not show_all and state in ("DONE", "FAILED"):
@@ -602,6 +605,8 @@ def list_tasks(as_json=False, show_all=False, cached=False):
             "exit_code": exit_code,
             "archived": bool(meta.get("archived", False)),
             "liveness": runtime_status(meta, directory, state),
+            "cleanup_state": meta.get('cleanup_state'),
+            "consistency_diagnostic": meta.get('consistency_diagnostic'),
         })
 
     rows.sort(
@@ -629,6 +634,85 @@ def list_tasks(as_json=False, show_all=False, cached=False):
         )
 
     return 0
+
+
+def worker_lease_evidence(directory, meta, state, code, refresh_remote=False):
+    """Called under worker.lock; return None when ownership was not classified."""
+    if meta.get('launch_prepared') or meta.get('resume_prepared'):
+        return None  # task_state deliberately deferred probing this launch/turn.
+    remote = meta.get('remote_key') or MACHINES.get(meta.get('machine'), {}).get('type') == 'ssh'
+    health = meta.get('_runtime_health') or {}
+    # A skipped/failed probe is not a negative ownership probe. Bound durable
+    # terminal cleanup remains usable on recovery without another SSH request.
+    bound_cleanup = (meta.get('runtime_generation') and
+                     meta.get('remote_cleanup_generation') == meta['runtime_generation'] and
+                     meta.get('remote_cleanup_state') in ('ABSENT', 'CLEANED', 'AMBIGUOUS'))
+    cached_terminal = state in ('DONE', 'FAILED') and bound_cleanup
+    probed = (refresh_remote and meta.get('remote_key') and
+              (any(type(health.get(k)) is bool for k in ('worker_alive', 'process_alive')) or
+               (not meta.get('runtime_generation') and state == 'RUNNING')))
+    if remote and not cached_terminal and not probed:
+        return None
+    if (remote and probed and state not in ('DONE', 'FAILED') and health.get('state') == 'TERMINAL' and
+            bound_cleanup and meta['remote_cleanup_state'] == 'AMBIGUOUS'):
+        # RUNNING can mean final logs are still downloading, not live ownership.
+        return dict(machine=meta.get('machine'), cleanup='AMBIGUOUS')
+    result = worker_runtime.reconcile_task(directory, meta, state, code)
+    return dict(machine=meta.get('machine'),
+                cleanup=result or ('ACTIVE' if state in ('RUNNING', 'STARTING') else 'AMBIGUOUS'))
+
+
+def reconcile_remote_observation(directory, meta, state, code):
+    """Use an existing fresh report probe, without repeating SSH or a stale write."""
+    try:
+        with exclusive(DATA_DIR.parent / 'worker.lock'):
+            snapshot = {k: v for k, v in meta.items() if k != '_runtime_health'}
+            if read_json(directory / 'meta.json') != snapshot:
+                return  # A resume/newer observation superseded this report.
+            proof = worker_lease_evidence(directory, meta, state, code, refresh_remote=True)
+            if proof is not None:
+                worker_runtime.reconcile_leases(DATA_DIR, {meta['id']: proof})
+    except OSError:
+        pass  # A busy lock/failed read leaves evidence unclassified for a later report.
+
+
+def reconcile_workers(refresh_remote=False):
+    """Bounded self-healing; skipped remote probes leave leases unclassified."""
+    try:
+        with exclusive(DATA_DIR.parent / 'worker.lock'):
+            started = time.monotonic()
+            directories = [p for p in DATA_DIR.iterdir() if p.name != 'archives'] if DATA_DIR.exists() else []
+            if (DATA_DIR / 'archives').exists():
+                directories.extend((DATA_DIR / 'archives').iterdir())
+            present = {p.name for p in directories}
+            terminal = {}
+            for directory in directories:
+                if time.monotonic() - started >= 5:
+                    break  # Continue on the next discovery; never block the bridge indefinitely.
+                if not directory.is_dir() or directory.is_symlink():
+                    continue
+                try:
+                    meta = read_json(directory / 'meta.json')
+                    if not isinstance(meta, dict) or meta.get('id') != directory.name:
+                        raise ValueError('Task metadata identity does not match its directory')
+                    state, code = task_state(meta, directory, refresh_remote=refresh_remote)
+                    proof = worker_lease_evidence(directory, meta, state, code, refresh_remote)
+                    if proof is not None:
+                        terminal[meta['id']] = proof
+                except OSError:
+                    continue  # A failed read is unclassified, not negative evidence.
+                except (ValueError, TypeError, KeyError):
+                    # Visited corrupt metadata is evidence of unbound ownership.
+                    terminal[directory.name] = dict(machine=None, cleanup='AMBIGUOUS')
+            # The complete directory inventory proves absence, even if the
+            # bounded classification sweep did not visit every present task.
+            for lease in read_json(DATA_DIR.parent / 'worker_leases.json', {}).values():
+                task_id = lease.get('task_id') if isinstance(lease, dict) else None
+                if isinstance(task_id, str) and task_id not in present:
+                    terminal[task_id] = dict(machine=None, cleanup='MISSING')
+            worker_runtime.reconcile_leases(DATA_DIR, terminal)
+    except BlockingIOError:
+        pass
 
 
 
@@ -1037,7 +1121,50 @@ def process_alive(pid):
         return True
 
 
-def status(task_id):
+def readonly_runtime(task_id):
+    directory = task_dir(task_id)
+    if not (directory / 'meta.json').exists():
+        return None
+    try:
+        meta = load_meta(task_id)
+        terminal = meta.get('status') in ('DONE', 'FAILED')
+        if not meta.get('runtime_generation') and (directory / 'exit_code').exists():
+            terminal = True
+        health = runtime_liveness.watchdog(directory, meta, probe=not meta.get('remote_key'),
+            terminal=terminal, read_only=True)
+        health['session_id'] = task_output(meta, directory)['session_id']
+        health['cleanup_state'] = meta.get('cleanup_state')
+        health['diagnostic'] = meta.get('consistency_diagnostic')
+        return health
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return {'state': 'UNKNOWN', 'reason': 'invalid_task_metadata'}
+
+
+def status(task_id, as_json=False, issue=False):
+    if issue:
+        from operational_state import status_view
+        bridge = read_json(DATA_DIR.parent / 'task_bridge_state.json', {'issues': {}})
+        item = bridge.get('issues', {}).get(str(task_id), {})
+        # Never probe SSH, write observations or clean processes.
+        runtime = readonly_runtime(item['task_id']) if item.get('task_id') else None
+        view = status_view(bridge, task_id, runtime)
+        if item.get('review_task_id'):
+            view['review_runtime'] = readonly_runtime(item['review_task_id']) or view['review_runtime']
+        diagnostics = read_json(DATA_DIR.parent / 'worker_consistency.json', {})
+        view['worker_diagnostics'] = diagnostics if diagnostics.get('leases') else {}
+        if as_json:
+            print(json.dumps(view, ensure_ascii=False, indent=2))
+        else:
+            health = view['runtime']
+            print(f"Issue #{view['issue']} | {view['project']} | {view['lifecycle']}")
+            print(f"Coding: {view['coding_agent']} / {view['model']} / {view['effort']} | task {view['task']} | session {view['session']} | turn {view['coding_turn']}")
+            print(f"Review: {view['reviewer']} | task {view['review_task']} | round {view['review_round']} | Chief: {view['chief_state']} / {view['chief_bundle']}")
+            print(f"Runtime: coding {health.get('state')} ({health.get('reason')}) | review {view['review_runtime'].get('state')} | cleanup {health.get('cleanup_state')} | queue {json.dumps(view['queue'])} | locks {len(view['locks'])}")
+            print(f"Publication: {view['publication']} | next action: {view['next_action']} | projection: {view['projection'].get('health')}")
+            diagnostics = [view['diagnostics'], view['scheduler_diagnostics'], view['worker_diagnostics'], health.get('diagnostic')]
+            if any(diagnostics):
+                print('Diagnostics: ' + json.dumps([v for v in diagnostics if v], ensure_ascii=False))
+        return 0
     directory = task_dir(task_id)
     meta = load_meta(task_id)
 
@@ -1133,8 +1260,11 @@ def continue_task(task_id, prompt, request_id=None):
         _, canonical = scheduler.project_identity(project)
         signature = hashlib.sha256(json.dumps([task_id, prompt]).encode()).hexdigest()
         def prepare():
-            if task_state(meta, task_dir(task_id))[0] not in ("DONE", "FAILED"):
+            state, code = task_state(meta, task_dir(task_id))
+            if state not in ("DONE", "FAILED"):
                 raise RuntimeError("Task is active or uncertain; resume is blocked")
+            if worker_runtime.reconcile_task(task_dir(task_id), meta, state, code) == 'AMBIGUOUS':
+                raise RuntimeError('Previous turn runtime ownership is ambiguous; resume is blocked')
             finder = find_codex_session_id if meta["agent"] == "codex" else find_cursor_session_id
             session_id = meta.get("session_id") or finder(task_id)
             if not session_id:
@@ -1295,6 +1425,7 @@ def _continue_task(task_id, prompt):
 
     command_string = shlex.join(actual_command)
 
+    meta['turns'] = meta.get('turns', 1) + 1
     process = spawn_runtime(directory, meta, command_string, log_file)
 
     meta["pid"] = process.pid
@@ -1302,7 +1433,6 @@ def _continue_task(task_id, prompt):
     meta["status"] = "RUNNING"
     meta["session_id"] = session_id
     meta["updated_at"] = now()
-    meta["turns"] = meta.get("turns", 1) + 1
 
     save_meta(directory, meta)
 
@@ -1401,10 +1531,13 @@ def task_output(meta, directory):
 
 
 def task_report(task_id, as_json=False):
+    reconcile_workers()
     directory = task_dir(task_id)
     meta = load_meta(task_id)
 
     state, exit_code = task_state(meta, directory)
+    if meta.get('remote_key'):
+        reconcile_remote_observation(directory, meta, state, exit_code)
 
     output = task_output(meta, directory)
     session_id = output['session_id']
@@ -1446,6 +1579,8 @@ def task_report(task_id, as_json=False):
         "result": redact(result) if result else result,
         "error": redact(last_error) if last_error else last_error,
         "liveness": health,
+        "cleanup_state": meta.get('cleanup_state'),
+        "consistency_diagnostic": meta.get('consistency_diagnostic'),
     }
 
     if as_json:
@@ -1553,6 +1688,8 @@ def main():
 
     p_status = sub.add_parser("status")
     p_status.add_argument("task_id")
+    p_status.add_argument('--issue', action='store_true', help='Read the durable bridge/operator view by issue number')
+    p_status.add_argument('--json', action='store_true')
 
     p_log = sub.add_parser("log")
     p_log.add_argument("task_id")
@@ -1631,7 +1768,7 @@ def main():
         )
 
     if args.action == "status":
-        raise SystemExit(status(args.task_id))
+        raise SystemExit(status(args.task_id, args.json, args.issue))
 
     if args.action == "log":
         raise SystemExit(show_log(args.task_id, args.lines))

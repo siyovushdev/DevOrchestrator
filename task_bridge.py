@@ -12,13 +12,14 @@ from pathlib import Path
 import notifications
 import bridge_effects
 import chief_review
+from operational_state import exclusion_reason, lifecycle_state, next_action, notification_fingerprint
 from github_transport import GitHubTransport
 from lifecycle import WORK_QUEUE_LABEL, worker_guard
 from datetime import datetime, timezone
 from durable import read_json, write_json, exclusive
 from scheduler import Scheduler, QueueWait, project_identity, registered_project
 import hashlib
-from redaction import redact
+from redaction import redact, redact_data
 
 from publication import Repository, PublicationError, execute as publish
 
@@ -137,12 +138,20 @@ def send_telegram(text):
 
 
 def notify(status, issue, item, report=None, blocker=None):
+    if exclusion_reason(item, issue):
+        return
     text = redact(notifications.terminal_text(status, issue, item, report, blocker))
     if WORK_CONTEXT:
         state, number, _ = WORK_CONTEXT
-        event = [status, item.get("task_id"), item.get("review_round"),
-                 (report or {}).get("turns"), blocker]
-        bridge_effects.enqueue(state, number, "telegram", text, event)
+        # Keep only bounded, redacted display data. Delivery recomputes the
+        # action and checks the durable semantic identity, never trusts text.
+        item['notification_report'] = redact_data({k: (report or {}).get(k) for k in
+            ('id', 'agent', 'model', 'reasoning_effort', 'session_id', 'git_baseline', 'created_at', 'updated_at')})
+        fingerprint = notification_fingerprint(item)
+        event = [status, fingerprint, blocker]
+        key = bridge_effects.enqueue(state, number, "telegram", text, event)
+        state['outbox'][key]['notification'] = dict(status=status, fingerprint=fingerprint,
+            issue={k: issue.get(k) for k in ('number', 'title', 'url')}, blocker=redact(blocker) if blocker else None)
         save_state(state)
     else:
         send_telegram(text)
@@ -639,7 +648,7 @@ def coding_report_successful(report, item):
 
 def observe_coding_turn(item, state, report):
     """Invalidate reviews on mutable/new coding turns, never adopt old review evidence."""
-    if report.get('id') != item.get('task_id'):
+    if exclusion_reason(item) or report.get('id') != item.get('task_id'):
         return
     turn = report.get('turns')
     bound = item.get('review_coding_turn')
@@ -668,6 +677,8 @@ def observe_coding_turn(item, state, report):
     if type(turn) is int and turn > 0:
         item['coding_turn'] = max(item.get('coding_turn', 0), turn)
     item['coding_status'] = report.get('status') if report.get('status') in ('RUNNING', 'STARTING', 'UNKNOWN', 'DONE', 'FAILED') else 'UNKNOWN'
+    if report.get('session_id'):
+        item['coding_session_id'] = report['session_id']
     save_state(state)
 
 
@@ -867,6 +878,92 @@ def save_state(state):
     write_json(STATE_FILE, state)
 
 
+def archive_issue(issue, item, state):
+    reason = exclusion_reason(item, issue)
+    if not reason:
+        return False
+    before = json.dumps(item, sort_keys=True)
+    item.setdefault('runtime_exclusion', reason)
+    if str(issue.get('state', '')).upper() == 'CLOSED':
+        item['issue_closed'] = True
+    number = str(issue['number'])
+    task_ids = {t for t in (item.get('task_id'), item.get('review_task_id')) if t}
+    jobs = [j for j in state.get('work_queue', {}).values() if str(j.get('owner')) == number or j.get('task_id') in task_ids]
+    queue_changed = False
+    for job in jobs:
+        if str(job.get('owner')) == number and job.get('status') == 'QUEUED' and not job.get('launch_pending'):
+            # No launch crossed the reservation boundary. Keep its receipt for
+            # audit, but do not let archived FIFO intent block new admissions.
+            job.update(status='CANCELLED', cancelled='archived_issue')
+            queue_changed = True
+    active = any(j.get('status') in ('RESERVED', 'RUNNING', 'UNKNOWN') or j.get('launch_pending') for j in jobs)
+    unproven = not jobs and (item.get('coding_status') in ('RUNNING', 'STARTING', 'UNKNOWN') or item.get('pending_rpc'))
+    if active or unproven:
+        item.setdefault('consistency_diagnostics', {})['archival'] = 'Archived issue has active or uncertain runtime; ownership retained until terminal proof'
+    else:
+        item.setdefault('consistency_diagnostics', {}).pop('archival', None)
+    if item.get('issue_closed') and str(issue.get('state', '')).upper() == 'OPEN':
+        item.setdefault('consistency_diagnostics', {})['reopen'] = 'Reopened historical issue remains archived; create a new task issue'
+    if json.dumps(item, sort_keys=True) != before or queue_changed:
+        save_state(state)
+    return True
+
+
+def reconcile_projection(issue, item, state):
+    if exclusion_reason(item, issue):
+        return
+    global WORK_CONTEXT
+    WORK_CONTEXT = (state, str(issue['number']), item)
+    target = item.get('desired_label')
+    current = lifecycle_state(item)
+    if current == 'RUNNING':
+        target = 'dev:running'
+    elif current == 'AWAITING_CHIEF_REVIEW':
+        target = 'dev:awaiting-chief-review'
+    if target:
+        if label_names(issue) & STATE_LABELS != {target}:
+            if item.get('projection', {}).get('health') != 'ERROR':
+                item['projection'] = {'health': 'DRIFT', 'target': target, 'failures': 0}
+            transition_issue(issue, target)
+        elif item.get('projection', {}).get('health') != 'ERROR':
+            item['projection'] = {'health': 'SYNCED', 'target': target, 'failures': 0}
+    if item.get('queue_status') == 'STARTED' and item.get('task_id'):
+        add_comment(issue['number'], start_comment(item))
+    save_state(state)
+
+
+def start_comment(item):
+    machine = item.get('coding_machine')
+    if not machine:
+        import devctl
+        machine = devctl.load_projects().get(item.get('project'), {}).get('machine')
+    return '\n'.join(['<!-- DEVORCHESTRATOR_BRIDGE_V1 -->', '## DevOrchestrator', '',
+        f"Task started: `{item['task_id']}`", f"Project: `{item.get('project')}`",
+        f"Agent: `{item.get('coding_agent')}`", f"Machine: `{machine}`"])
+
+
+def prepare_notification(entry, item, issue=None):
+    """Fence/regenerate at delivery, including persisted pre-upgrade events."""
+    notification = entry.get('notification')
+    known = {'NEEDS_OWNER', 'FAILED', 'FRESH_REVIEW_REQUIRED', 'READY_FOR_REVIEW',
+             'REVIEW_PASSED / READY_FOR_OWNER', 'REVIEW_PASSED / COMPLETE',
+             'COMMITTED', 'PUSHED', 'PR_CREATED', 'MERGED'}
+    if not notification and entry['payload'].split('\n', 1)[0] not in known:
+        return True  # Existing independent transport/recovery diagnostics.
+    if notification and notification['fingerprint'] != notification_fingerprint(item):
+        return False
+    action = next_action(item)
+    if action in ('NONE', 'CHIEF_VERDICT'):
+        return False
+    status = notification['status'] if notification else lifecycle_state(item)
+    if status == 'READY_FOR_OWNER':
+        status = 'REVIEW_PASSED / READY_FOR_OWNER'
+    view = issue or (notification or {}).get('issue') or {'number': entry['number']}
+    entry['payload'] = redact(notifications.terminal_text(status, view, item, item.get('notification_report'),
+        item.get('owner_blocker') or (notification or {}).get('blocker'), current_action=action))
+    return True
+
+
 def label_names(issue):
     return GitHubTransport.label_names(issue)
 
@@ -892,6 +989,8 @@ def transition_issue(issue, target):
     if not WORK_CONTEXT:
         return raw_transition_issue(issue, target)
     state, number, item = WORK_CONTEXT
+    if exclusion_reason(item, issue):
+        return
     event = [target, item.get("task_id"), item.get("review_task_id"), item.get("review_round"),
              item.get("autopilot_corrections"), item.get("last_report_signature"),
              item.get("processed_followups")]
@@ -909,7 +1008,9 @@ def add_comment(number, body):
     body = redact(body)
     if not WORK_CONTEXT:
         return raw_add_comment(number, body)
-    state, _, _ = WORK_CONTEXT
+    state, _, item = WORK_CONTEXT
+    if exclusion_reason(item):
+        return
     bridge_effects.enqueue(state, number, "comment", body)
     save_state(state)
 
@@ -920,6 +1021,15 @@ def flush_effects(state, reconciled=True):
         item = state.get('issues', {}).get(str(entry['number']), {})
         if not isinstance(item, dict):
             item = {}
+        if entry['status'] not in ('DONE', 'UNCERTAIN', 'FAILED') and exclusion_reason(item):
+            entry.update(status='DONE', diagnostic='Suppressed: archived task')
+            suppressed = True
+            continue
+        if entry['kind'] == 'telegram' and entry['status'] == 'PENDING' and not prepare_notification(entry, item):
+            entry.update(status='DONE', diagnostic='Notification superseded before send')
+            item.setdefault('consistency_diagnostics', {})['notification'] = 'Superseded notification dropped'
+            suppressed = True
+            continue
         if (entry['kind'] == 'telegram' and entry['status'] == 'PENDING' and
                 entry['payload'].startswith('REVIEW_PASSED / READY_FOR_OWNER') and
                 (not notifications.review_approval_complete(item) or item.get('owner_state') != OWNER_STATE_READY)):
@@ -930,9 +1040,51 @@ def flush_effects(state, reconciled=True):
     def transition(issue, target):
         # Read current labels, since outbox payload may predate a restart or another transition.
         adapter = github_task_transport()
-        current = adapter.fetch_labels(adapter.issue_ref(issue["number"]))
-        raw_transition_issue(current, target)
+        item = state.get('issues', {}).get(str(issue['number']), {})
+        if exclusion_reason(item) or item.get('desired_label', target) != target:
+            return
+        try:
+            current = adapter.fetch_issue(adapter.issue_ref(issue['number']))
+            if archive_issue(current, item, state):
+                return
+            raw_transition_issue(current, target)
+            observed = adapter.fetch_labels(adapter.issue_ref(issue['number']))
+            if label_names(observed) & STATE_LABELS != {target}:
+                raise ValueError('Projection not confirmed')
+            item['projection'] = {'health': 'SYNCED', 'target': target, 'failures': 0}
+            item.setdefault('consistency_diagnostics', {}).pop('projection', None)
+        except Exception:
+            failures = item.get('projection', {}).get('failures', 0) + 1
+            item['projection'] = {'health': 'ERROR', 'target': target, 'failures': min(failures, 3)}
+            if failures >= 3:
+                item.setdefault('consistency_diagnostics', {})['projection'] = 'GitHub projection failed repeatedly; automatic retry pending'
+            raise
     def eligible(entry):
+        item = state.get('issues', {}).get(str(entry['number']), {})
+        if exclusion_reason(item):
+            return False
+        if entry['kind'] == 'transition' and item.get('desired_label', entry['payload']['target']) != entry['payload']['target']:
+            entry.update(status='DONE', diagnostic='Superseded projection')
+            save_state(state)
+            return False
+        if entry['kind'] in ('telegram', 'comment', 'chief_comment'):
+            # A fresh issue observation at the send boundary prevents a close
+            # during a long coding/review tick from leaking an owner alert.
+            try:
+                current = fetch_issue(entry['number'])
+            except Exception:
+                entry['attempts'] += 1
+                entry['next_attempt'] = time.time() + min(300, 2 ** min(entry['attempts'], 8))
+                entry['diagnostic'] = 'Issue observation unavailable; delivery deferred'
+                save_state(state)
+                return False
+            if not current or archive_issue(current, item, state):
+                return False
+            if entry['kind'] == 'telegram' and not prepare_notification(entry, item, current):
+                entry.update(status='DONE', diagnostic='Notification superseded before send')
+                item.setdefault('consistency_diagnostics', {})['notification'] = 'Superseded notification dropped'
+                save_state(state)
+                return False
         if entry['kind'] == 'chief_comment':
             item = state.get('issues', {}).get(str(entry['number']), {})
             record = item.get('chief_review') or {}
@@ -964,6 +1116,20 @@ def flush_effects(state, reconciled=True):
 
     bridge_effects.flush(state, lambda: save_state(state), issue_comments,
                         post, transition, send_telegram, eligible=eligible)
+    for number, item in state.get('issues', {}).items():
+        if not isinstance(item, dict) or exclusion_reason(item):
+            continue
+        pending = [e for e in state.get('outbox', {}).values() if str(e['number']) == str(number) and
+                   e['kind'] in ('transition', 'comment', 'chief_comment') and e['status'] != 'DONE']
+        if pending:
+            repeated = any(e.get('attempts', 0) >= 3 or e['status'] in ('UNCERTAIN', 'FAILED') for e in pending)
+            item.setdefault('projection', {})['health'] = 'ERROR' if repeated else 'DRIFT'
+            if repeated:
+                item.setdefault('consistency_diagnostics', {})['projection'] = 'External projection incomplete after repeated delivery failures'
+        elif item.get('desired_label') and item.get('projection', {}).get('target') == item['desired_label']:
+            item['projection']['health'] = 'SYNCED'
+            item.setdefault('consistency_diagnostics', {}).pop('projection', None)
+    save_state(state)
 
 
 def parse_task(issue):
@@ -1117,7 +1283,7 @@ async def mcp_call(name, arguments):
         result = await transport_call(name, arguments)
         if WORK_CONTEXT and name == "get_task_report":
             state, _, _ = WORK_CONTEXT
-            Scheduler(state).observe(arguments["task_id"], result.get("status"))
+            Scheduler(state).observe(arguments["task_id"], result.get("status"), result.get('cleanup_state'))
             save_state(state)
         return result
     state, number, item = WORK_CONTEXT
@@ -1270,9 +1436,16 @@ def project_runtime_health(issue, item, state, report, slot='coding'):
     review or publication is authorized by these observations. External labels
     cannot override the durable local report, including on duplicate ticks.
     """
+    if exclusion_reason(item, issue):
+        return False
     health = report.get('liveness')
     if not isinstance(health, dict):
         return False  # V1/test transports without the additive contract.
+    item.setdefault('runtime_health', {})[slot] = health
+    if report.get('cleanup_state') == 'AMBIGUOUS':
+        item.setdefault('consistency_diagnostics', {})['runtime_' + slot] = 'Terminal runtime ownership ambiguous; capacity and publication held'
+    elif report.get('cleanup_state') in ('ABSENT', 'CLEANED'):
+        item.setdefault('consistency_diagnostics', {}).pop('runtime_' + slot, None)
     if health.get('reason') == 'heartbeat_not_registered':
         return False  # Legacy tasks retain their existing process/exit handling.
     runtime_state = health.get('state')
@@ -1300,6 +1473,8 @@ async def start_queued(issue, state):
     number = str(issue["number"])
     global WORK_CONTEXT
     WORK_CONTEXT = (state, number, state["issues"].setdefault(number, {"queue_status": "QUEUED"}))
+    if archive_issue(issue, state['issues'][number], state):
+        return
 
     try:
         queued = state["issues"][number]
@@ -1338,14 +1513,17 @@ async def start_queued(issue, state):
             "task_id": task_id,
             "project": project,
             "coding_agent": result.get("agent"),
+            "coding_machine": result.get("machine"),
+            "coding_status": result.get('status', 'UNKNOWN'),
+            "coding_session_id": result.get('session_id'),
             "mode": mode,
             "autopilot_policy_version": (
                 AUTOPILOT_POLICY_VERSION
                 if mode == AUTOPILOT_MODE
                 else None
             ),
-            "model": model,
-            "effort": effort,
+            "model": result.get('model') or model,
+            "effort": result.get('reasoning_effort') or effort,
             "autopilot_corrections": 0,
             "review_policy_version": REVIEW_POLICY_VERSION,
             "review_task_id": None,
@@ -1370,18 +1548,8 @@ async def start_queued(issue, state):
 
         transition_issue(issue, "dev:running")
 
-        add_comment(
-            issue["number"],
-            "\n".join([
-                "<!-- DEVORCHESTRATOR_BRIDGE_V1 -->",
-                "## DevOrchestrator",
-                "",
-                f"Task started: `{task_id}`",
-                f"Project: `{project}`",
-                f"Agent: `{result.get('agent')}`",
-                f"Machine: `{result.get('machine')}`",
-            ]),
-        )
+        add_comment(issue['number'], start_comment(state['issues'][number]))
+        flush_effects(state)
 
         print(
             f"[bridge] issue #{number} -> task {task_id}",
@@ -1414,6 +1582,8 @@ def owner_logins():
 
 def stale_chief(item, state, number, diagnostic):
     """Revoke quality gates, retaining the old Chief receipt as historical evidence."""
+    if exclusion_reason(item):
+        return
     chief_review.invalidate(item)
     item.update(owner_state=None, owner_approved_at=None, reviewed_tree=None,
                 review_status='FRESH_REVIEW_REQUIRED',
@@ -1426,6 +1596,8 @@ def stale_chief(item, state, number, diagnostic):
 
 
 def chief_tree_current(item, state, number):
+    if exclusion_reason(item):
+        return False
     try:
         chief_review.validate_identity(item['chief_review']['identity'], item)
         if Repository(item['project']).snapshot() != item['reviewed_tree']:
@@ -1459,6 +1631,8 @@ async def process_chief_review(issue, item, state, report):
     Reuse its task/turn/round/tree; historical or interrupted publication is not
     retroactively enrolled. Return True while Chief review owns this task.
     """
+    if exclusion_reason(item, issue):
+        return False
     if item.get('owner_state') in OWNER_STATE_SEQUENCE[1:] or item.get('publication_journal'):
         return False
     if item.get('review_status') != 'PASS':
@@ -1620,6 +1794,8 @@ async def process_chief_review(issue, item, state, report):
 
 
 async def process_owner_actions(issue, item, state, report):
+    if exclusion_reason(item, issue):
+        return
     if not chief_review.approval_complete(item):
         return
     if report.get("status") not in ("DONE", "FAILED") or item.get("review_status") == "RUNNING":
@@ -1674,7 +1850,8 @@ async def process_owner_actions(issue, item, state, report):
                     repository = Repository(item["project"], report)
                     tasks = await transport_call("list_tasks", {})
                     for task in tasks:
-                        if task.get("status") not in ("RUNNING", "UNKNOWN", "STARTING"):
+                        if (task.get("status") not in ("RUNNING", "UNKNOWN", "STARTING") and
+                                task.get('cleanup_state') != 'AMBIGUOUS'):
                             continue
                         if task.get("machine") not in (None, "-", machine):
                             continue
@@ -1708,6 +1885,8 @@ async def process_owner_actions(issue, item, state, report):
 
 
 async def process_followup(issue, item, state, report):
+    if exclusion_reason(item, issue):
+        return report
     if report.get("status") not in ("DONE", "FAILED") or item.get("review_status") == "RUNNING":
         return report
 
@@ -1804,6 +1983,8 @@ async def maybe_continue_autopilot(
     state,
     report,
 ):
+    if exclusion_reason(item, issue):
+        return report, False
     if item.get("mode") != AUTOPILOT_MODE:
         return report, False
 
@@ -2008,6 +2189,8 @@ async def start_independent_review(
     state,
     coding_report,
 ):
+    if exclusion_reason(item, issue):
+        return
     if not coding_report_successful(coding_report, item):
         return
     project = item.get("project")
@@ -2116,6 +2299,8 @@ async def fail_review_loop(
 
 
 def hold_review_for_refresh(issue, item, state, diagnostic, coding_report=None, active=False):
+    if exclusion_reason(item, issue):
+        return
     if item.get('review_hold') is None:
         item['review_hold'] = {'diagnostic': diagnostic, 'previous_status': item.get('review_status'),
                               'review_task_id': item.get('review_task_id')}
@@ -2136,6 +2321,8 @@ async def process_review_loop(
     state,
     coding_report,
 ):
+    if exclusion_reason(item, issue):
+        return False
     if item.get("mode") != AUTOPILOT_MODE:
         return False
 
@@ -2599,6 +2786,8 @@ def malformed_item(item):
 
 
 async def process_tracked(issue, item, state, runtime_reports=None):
+    if archive_issue(issue, item, state):
+        return
     global WORK_CONTEXT
     WORK_CONTEXT = (state, str(issue["number"]), item)
     failed = False
@@ -2737,6 +2926,22 @@ async def tick(state):
         reconciled = True
     finally:
         WORK_CONTEXT = None
+        if not reconciled:
+            # Worker discovery failure does not disable repair of durable
+            # desired projections. Approval sends retain the freshness gate.
+            started = time.monotonic()
+            for number, item in state.get('issues', {}).items():
+                if time.monotonic() - started >= 5:
+                    break
+                if not str(number).isdigit() or not isinstance(item, dict) or exclusion_reason(item) or malformed_item(item):
+                    continue
+                try:
+                    issue = fetch_issue(number)
+                    if issue and not archive_issue(issue, item, state):
+                        reconcile_projection(issue, item, state)
+                except Exception:
+                    continue
+            WORK_CONTEXT = None
         # Outbox recovery must not depend on task discovery being available.
         # Approval invitations still require successful coding-status reconciliation.
         flush_effects(state, reconciled=reconciled)
@@ -2755,10 +2960,6 @@ async def reconcile_tick(state):
     tasks = await mcp_call("list_tasks", {})
     Scheduler(state).recover(tasks)
     reports = {task['id']: task for task in tasks}
-    for item in state['issues'].values():
-        if (isinstance(item, dict) and item.get('compatibility_status') != 'QUARANTINED' and
-                not malformed_item(item) and item.get('task_id') in reports):
-            observe_coding_turn(item, state, reports[item['task_id']])
     save_state(state)
     # GitHub lists newest first; issue number provides stable oldest-first admission.
     for issue in sorted(issues, key=lambda i: i["number"]):
@@ -2777,14 +2978,6 @@ async def reconcile_tick(state):
             item.update(compatibility_status="QUARANTINED", compatibility_diagnostic="Invalid tracked issue identity")
             save_state(state)
             continue
-        if "legacy_value" in item or malformed_item(item):
-            issue = by_number.get(number) or {"number": int(number), "labels": []}
-            quarantine_item(issue, item, state, "Malformed tracked state held for local inspection.")
-            Scheduler(state).release(number)
-            save_state(state)
-            continue
-        if item.get("reconciliation_retry", {}).get("next_attempt", 0) > time.time():
-            continue
         try:
             issue = by_number.get(number)
             if not issue:
@@ -2794,6 +2987,18 @@ async def reconcile_tick(state):
             defer_issue(item, state, number)
             continue
         if not issue:
+            continue
+        if archive_issue(issue, item, state):
+            continue
+        if "legacy_value" in item or malformed_item(item):
+            quarantine_item(issue, item, state, 'Malformed tracked state held for local inspection.')
+            Scheduler(state).release(number)
+            save_state(state)
+            continue
+        if item.get('task_id') in reports:
+            observe_coding_turn(item, state, reports[item['task_id']])
+        reconcile_projection(issue, item, state)
+        if item.get('reconciliation_retry', {}).get('next_attempt', 0) > time.time():
             continue
         if not item.get("task_id"):
             if item.get("queue_status") != "FAILED" and issue.get("state", "OPEN").upper() == "OPEN":

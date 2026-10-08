@@ -101,7 +101,7 @@ def send(text, opener=None, sleep=time.sleep):
     return False
 
 
-def terminal_text(status, issue, item, report=None, blocker=None):
+def terminal_text(status, issue, item, report=None, blocker=None, *, current_action=None):
     report = report or {}
     if status == 'REVIEW_PASSED / READY_FOR_OWNER':
         if not review_approval_complete(item):
@@ -124,6 +124,8 @@ def terminal_text(status, issue, item, report=None, blocker=None):
                    "FRESH_REVIEW_REQUIRED": "FOLLOWUP_FOR_FRESH_REVIEW"}.get(status)
     if status == 'NEEDS_OWNER' and (item.get('worker_uncertain') or item.get('review_uncertain')):
         next_action = 'INSPECT_WORKER'
+    if current_action is not None:
+        next_action = None if current_action == 'NONE' else current_action
     if next_action:
         lines.append("Next owner action: " + next_action)
     if no_publication_required:
