@@ -111,4 +111,4 @@ os.fsync = audited_fsync
 '''
         script = r.SCRIPT.replace('mode, key = sys.argv[1:3]', audit + '\nmode, key = sys.argv[1:3]')
         with patch.object(r, 'SCRIPT', script): self.rpc('start', value='true')
-        self.assertEqual(sentinel.read_text(), 'xx')  # Both pre-launch intent and PID receipt.
+        self.assertEqual(sentinel.read_text(), 'xxx')  # Launch intent, runtime intent, and PID receipt.

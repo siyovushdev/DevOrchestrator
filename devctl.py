@@ -15,6 +15,7 @@ from durable import write_json, exclusive
 from health import DOCTOR_TIMEOUT, PROBE_TIMEOUT, SSH_CONNECT_TIMEOUT, health_result
 import worker_runtime
 import remote_worker
+import runtime_liveness
 from redaction import redact, redact_data
 
 from collections import deque
@@ -457,8 +458,21 @@ def run_project(
 
 def task_state(meta, directory, refresh_remote=True):
     reap_processes()
+    if not refresh_remote:
+        meta.pop('_runtime_health', None)
     if meta.get("resume_prepared") or meta.get("launch_prepared"):
         return "UNKNOWN", None
+    if meta.get('runtime_generation') or (directory / 'liveness.json').exists():
+        if meta.get('remote_key') and refresh_remote:
+            state, code = remote_worker.refresh(meta, directory)
+            # Final log draining remains an existing control-plane barrier.
+            if meta.get('remote_logs_pending'):
+                return 'RUNNING', None
+            if meta.get('_runtime_health'):
+                return runtime_task_state(meta, directory, meta['_runtime_health'])
+            return state, code
+        health = runtime_liveness.watchdog(directory, meta, probe=not meta.get('remote_key'))
+        return runtime_task_state(meta, directory, health)
     if meta.get("remote_key"):
         if not refresh_remote:
             exit_path = directory / "exit_code"
@@ -487,6 +501,21 @@ def task_state(meta, directory, refresh_remote=True):
     return "UNKNOWN", None
 
 
+def runtime_task_state(meta, directory, health):
+    """Every status consumer diagnoses completed turns using the same parser."""
+    state, code = runtime_liveness.task_status(health)
+    if health['state'] == 'TERMINAL' and meta.get('remote_key'):
+        if meta.get('remote_logs_pending'):
+            return 'RUNNING', None
+        if not (directory / 'exit_code').exists():
+            return 'UNKNOWN', None  # Remote final logs have not been confirmed.
+    if state == 'DONE' and not task_output(meta, directory)['result']:
+        runtime_liveness.final_report_missing(directory, dict(meta, runtime_generation=health['generation']))
+        meta.pop('_runtime_health', None)
+        return 'FAILED', code
+    return state, code
+
+
 def project_for_task(meta):
     try:
         projects = load_projects()
@@ -501,6 +530,24 @@ def project_for_task(meta):
             return name
 
     return "-"
+
+
+def runtime_status(meta, directory, state=None):
+    if meta.get('remote_key') and meta.get('_runtime_health'):
+        return meta['_runtime_health']
+    return runtime_liveness.watchdog(directory, meta, probe=not meta.get('remote_key'),
+                                     terminal=state in ('DONE', 'FAILED'))
+
+
+def spawn_runtime(directory, meta, command, log_file):
+    meta['project'] = project_for_task(meta)
+    meta.pop('runtime_generation', None)
+    record = runtime_liveness.initialize(directory, meta)
+    meta['runtime_generation'] = record['generation']
+    save_meta(directory, meta)
+    runner = shlex.join([sys.executable, str(Path(runtime_liveness.__file__).resolve()),
+                         str(directory), record['generation'], command])
+    return spawn_detached('exec ' + runner, log_file)
 
 
 def list_tasks(as_json=False, show_all=False, cached=False):
@@ -554,6 +601,7 @@ def list_tasks(as_json=False, show_all=False, cached=False):
             "updated_at": str(meta.get("updated_at") or ""),
             "exit_code": exit_code,
             "archived": bool(meta.get("archived", False)),
+            "liveness": runtime_status(meta, directory, state),
         })
 
     rows.sort(
@@ -767,7 +815,8 @@ def task_dir(task_id):
 
 def save_meta(directory, meta):
     path = directory / "meta.json"
-    write_json(path, meta)
+    # A live SSH probe is scoped to this call, never proof after a restart.
+    write_json(path, {k: v for k, v in meta.items() if k != '_runtime_health'})
     os.chmod(path, 0o600)
 
 
@@ -777,7 +826,10 @@ def load_meta(task_id):
     if not path.exists():
         raise SystemExit(f"Unknown task: {task_id}")
 
-    return json.loads(path.read_text())
+    meta = json.loads(path.read_text())
+    if isinstance(meta, dict):
+        meta.pop('_runtime_health', None)
+    return meta
 
 
 def build_agent_command(
@@ -882,7 +934,7 @@ def run_agent(machine, agent, workspace, prompt, model=None, effort=None,
             _run_agent(machine, agent, workspace, prompt, model, effort, task_id, role)
             meta = load_meta(task_id)
         if meta.get("remote_key"):
-            remote_worker.start(machine, meta["remote_key"], meta["remote_command"])
+            remote_worker.start(machine, meta["remote_key"], meta["remote_command"], meta)
         return result
 
 
@@ -949,9 +1001,12 @@ def _run_agent(
     save_meta(directory, meta)
 
     if MACHINES[machine]["type"] == "ssh":
-        meta.update(remote_key=f"{task_id}-turn-1", remote_command=agent_command)
+        meta.update(remote_key=f"{task_id}-turn-1", remote_command=agent_command,
+                    project=project_for_task(meta))
+        record = runtime_liveness.initialize(directory, meta)
+        meta['runtime_generation'] = record['generation']
         save_meta(directory, meta)
-        remote_worker.start(machine, meta["remote_key"], agent_command)
+        remote_worker.start(machine, meta["remote_key"], agent_command, meta)
         print(task_id)
         return 0
 
@@ -959,14 +1014,7 @@ def _run_agent(
     os.chmod(log_path, 0o600)
 
     command_string = shlex.join(actual_command)
-    wrapper = (
-        f"{command_string}; "
-        f"rc=$?; "
-        f"printf '%s\\n' \"$rc\" > {shlex.quote(str(exit_path))}; "
-        f"exit \"$rc\""
-    )
-
-    process = spawn_detached(wrapper, log_file)
+    process = spawn_runtime(directory, meta, command_string, log_file)
 
     meta["pid"] = process.pid
     meta["process_identity"] = worker_runtime.process_identity(process.pid)
@@ -1003,6 +1051,9 @@ def status(task_id):
     print(f"agent:     {meta['agent']}")
     print(f"workspace: {meta['workspace']}")
     print(f"pid:       {meta['pid']}")
+    health = runtime_status(meta, directory, state)
+    print(f"liveness:  {health['state']} ({health['reason']})")
+    print(f"lease:     {health['lease_state']}; heartbeat age: {health['heartbeat_age_seconds']}")
     if exit_code is not None:
         print(f"exit_code: {exit_code}")
 
@@ -1106,7 +1157,7 @@ def continue_task(task_id, prompt, request_id=None):
             _continue_task(task_id, prompt)
             meta = load_meta(task_id)
         if meta.get("remote_key"):
-            remote_worker.start(meta["machine"], meta["remote_key"], meta["remote_command"])
+            remote_worker.start(meta["machine"], meta["remote_key"], meta["remote_command"], meta)
         return result
 
 
@@ -1213,11 +1264,16 @@ def _continue_task(task_id, prompt):
         meta.update(remote_key=f"{task_id}-turn-{meta.get('turns', 1) + 1}", remote_command=command, resume_prepared=False, remote_status='UNKNOWN',
                     remote_offset=0, session_id=session_id, updated_at=now(), turns=meta.get("turns", 1) + 1)
         meta.pop("remote_local_size", None)
+        meta.pop('runtime_generation', None)
+        meta.pop('_runtime_health', None)
+        meta['project'] = project_for_task(meta)
+        record = runtime_liveness.initialize(directory, meta)
+        meta['runtime_generation'] = record['generation']
         save_meta(directory, meta)
         # Keep prior log history; refresh appends this turn using a separate remote offset.
         with (directory / "events.jsonl").open("ab") as log:
             log.write((json.dumps({"type": "devorchestrator.continue", "timestamp": now()}) + "\n").encode())
-        remote_worker.start(machine, meta["remote_key"], command)
+        remote_worker.start(machine, meta["remote_key"], command, meta)
         print(task_id)
         return 0
 
@@ -1239,14 +1295,7 @@ def _continue_task(task_id, prompt):
 
     command_string = shlex.join(actual_command)
 
-    wrapper = (
-        f"{command_string}; "
-        f"rc=$?; "
-        f"printf '%s\\n' \"$rc\" > {shlex.quote(str(exit_path))}; "
-        f"exit \"$rc\""
-    )
-
-    process = spawn_detached(wrapper, log_file)
+    process = spawn_runtime(directory, meta, command_string, log_file)
 
     meta["pid"] = process.pid
     meta["process_identity"] = worker_runtime.process_identity(process.pid)
@@ -1262,14 +1311,9 @@ def _continue_task(task_id, prompt):
 
 
 
-def task_report(task_id, as_json=False):
-    directory = task_dir(task_id)
-    meta = load_meta(task_id)
-
-    exit_path = directory / "exit_code"
+def task_output(meta, directory):
+    """Parse only this coding/review turn; shared by status and full reports."""
     log_path = directory / "events.jsonl"
-
-    state, exit_code = task_state(meta, directory)
 
     session_id = meta.get("session_id")
     model = meta.get("model")
@@ -1292,6 +1336,8 @@ def task_report(task_id, as_json=False):
                     last_non_json = line
                     continue
 
+                if not isinstance(event, dict):
+                    continue
                 event_type = event.get("type")
 
                 if event_type == "devorchestrator.continue":
@@ -1306,10 +1352,12 @@ def task_report(task_id, as_json=False):
 
                 elif event_type == "item.completed":
                     item = event.get("item") or {}
+                    if not isinstance(item, dict):
+                        continue
 
                     if item.get("type") == "agent_message":
                         text = item.get("text")
-                        if text:
+                        if isinstance(text, str) and text.strip():
                             result = text.strip()
 
                     elif item.get("type") == "error":
@@ -1317,12 +1365,16 @@ def task_report(task_id, as_json=False):
 
                 elif event_type == "assistant":
                     message = event.get("message") or {}
+                    if not isinstance(message, dict):
+                        continue
                     content = message.get("content") or []
+                    if not isinstance(content, list):
+                        continue
 
                     texts = [
                         part.get("text", "")
                         for part in content
-                        if part.get("type") == "text"
+                        if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get('text', ''), str)
                     ]
 
                     text = "".join(texts).strip()
@@ -1344,8 +1396,37 @@ def task_report(task_id, as_json=False):
                 elif event_type == "error":
                     last_error = event.get("message")
 
+    return dict(session_id=session_id, model=model, reasoning_effort=reasoning_effort,
+                result=result, last_error=last_error, last_non_json=last_non_json)
+
+
+def task_report(task_id, as_json=False):
+    directory = task_dir(task_id)
+    meta = load_meta(task_id)
+
+    state, exit_code = task_state(meta, directory)
+
+    output = task_output(meta, directory)
+    session_id = output['session_id']
+    model = output['model']
+    reasoning_effort = output['reasoning_effort']
+    result = output['result']
+    last_error = output['last_error']
+    last_non_json = output['last_non_json']
+
     if state == "FAILED" and not last_error:
         last_error = last_non_json
+
+    if session_id and meta.get('runtime_generation'):
+        try:
+            runtime_liveness.annotate_session(directory, meta, session_id)
+        except (OSError, ValueError, TypeError):
+            pass  # The normalized watchdog below reports invalid records closed.
+    health = runtime_status(meta, directory, state)
+    if session_id:
+        health['session_id'] = session_id
+    if state == 'FAILED' and not last_error:
+        last_error = health['reason']
 
     report = {
         "id": task_id,
@@ -1364,6 +1445,7 @@ def task_report(task_id, as_json=False):
         "exit_code": exit_code,
         "result": redact(result) if result else result,
         "error": redact(last_error) if last_error else last_error,
+        "liveness": health,
     }
 
     if as_json:
@@ -1372,6 +1454,7 @@ def task_report(task_id, as_json=False):
 
     print(f"id:        {report['id']}")
     print(f"status:    {report['status']}")
+    print(f"liveness:  {health['state']} ({health['reason']})")
     print(f"machine:   {report['machine']}")
     print(f"agent:     {report['agent']}")
     print(f"workspace: {report['workspace']}")

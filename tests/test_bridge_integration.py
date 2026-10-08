@@ -3,6 +3,9 @@ import asyncio
 import copy
 from datetime import datetime, timezone
 import json
+import io
+import os
+from contextlib import redirect_stdout
 from pathlib import Path
 import subprocess
 import tempfile
@@ -14,7 +17,8 @@ import scheduler
 import task_bridge as b
 from github_transport import GitHubTransport
 from transports import TransportError
-from durable import read_json
+from durable import read_json, write_json
+from worker_runtime import process_identity
 from tests_helpers import coding_result, review_result
 
 
@@ -160,6 +164,97 @@ class BridgeIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.h.finish(item['task_id'], coding_result())
         await self.tick()
         return item
+
+    def legacy_running_report(self, task_id):
+        directory = devctl.task_dir(task_id)
+        directory.mkdir(parents=True)
+        meta = dict(self.h.tasks[task_id], pid=os.getpid(), process_identity=process_identity(os.getpid()))
+        write_json(directory / 'meta.json', meta)
+        with redirect_stdout(io.StringIO()) as output:
+            devctl.task_report(task_id, as_json=True)
+        report = json.loads(output.getvalue())
+        self.assertEqual(report['status'], 'RUNNING')
+        self.assertEqual(report['liveness']['reason'], 'heartbeat_not_registered')
+        self.assertFalse((directory / 'liveness.json').exists())
+        return report
+
+    async def test_real_legacy_running_coding_report_keeps_running_projection(self):
+        await self.tick()
+        item = self.h.state['issues']['1']
+        self.h.tasks[item['task_id']].update(self.legacy_running_report(item['task_id']))
+        notifications = self.h.telegram.call_count
+        comments = len(self.h.comments[1])
+        await self.tick()
+        self.h.restart(); await self.tick()
+        item = self.h.state['issues']['1']
+        self.assertIn('dev:running', b.label_names(self.h.issues[1]))
+        self.assertFalse(item.get('worker_uncertain'))
+        self.assertNotIn('coding', item.get('runtime_observations', {}))
+        self.assertEqual(self.h.telegram.call_count, notifications)
+        self.assertEqual(len(self.h.comments[1]), comments)
+        self.assertEqual(len(self.h.starts), 1)
+        self.assertTrue(self.h.state['repo_locks'])
+
+    async def test_real_legacy_running_review_report_keeps_running_projection(self):
+        item = await self.running_review()
+        review_id = item['review_task_id']
+        self.h.tasks[review_id].update(self.legacy_running_report(review_id))
+        notifications = self.h.telegram.call_count
+        comments = len(self.h.comments[1])
+        await self.tick()
+        self.h.restart(); await self.tick()
+        item = self.h.state['issues']['1']
+        self.assertIn('dev:running', b.label_names(self.h.issues[1]))
+        self.assertEqual(item['review_status'], 'RUNNING')
+        self.assertFalse(item.get('review_uncertain'))
+        self.assertEqual(self.h.telegram.call_count, notifications)
+        self.assertEqual(len(self.h.comments[1]), comments)
+        self.assertEqual(len(self.h.starts), 2)
+        self.assertTrue(self.h.state['repo_locks'])
+
+    async def test_runtime_loss_corrects_external_running_and_retains_uncertain_reservation(self):
+        await self.tick()
+        item = self.h.state['issues']['1']
+        task_id = item['task_id']
+        self.h.tasks[task_id].update(status='UNKNOWN', liveness=dict(
+            state='LOST_ORPHANED', reason='lease_expired_without_owned_process',
+            generation='runtime-turn', transition_sequence=1, lease_state='EXPIRED',
+            heartbeat_age_seconds=60, worker_alive=None, process_alive=None, phase='CODING'))
+        await self.tick()
+        self.assertIn('dev:failed', b.label_names(self.h.issues[1]))
+        first_comments = len(self.h.comments[1])
+        first_notifications = self.h.telegram.call_count
+        self.assertTrue(any('LOST_ORPHANED' in c['body'] for c in self.h.comments[1]))
+        self.h.restart(); await self.tick()
+        self.assertEqual(len(self.h.comments[1]), first_comments)
+        self.assertEqual(self.h.telegram.call_count, first_notifications)
+        self.assertEqual(len(self.h.starts), 1)
+        self.assertEqual(self.h.continues, [])
+        self.assertTrue(self.h.state['repo_locks'])
+        self.assertEqual(next(iter(self.h.state['work_queue'].values()))['status'], 'UNKNOWN')
+        self.assertIsNone(self.h.state['issues']['1'].get('owner_state'))
+
+    async def test_runtime_suspected_reviewer_is_held_until_fresh_owned_heartbeat(self):
+        item = await self.running_review()
+        review_id = item['review_task_id']
+        self.h.tasks[review_id].update(status='UNKNOWN', liveness=dict(
+            state='SUSPECTED_STALL', reason='lease_stale_but_process_owned',
+            generation='review-runtime', transition_sequence=1, lease_state='EXPIRED',
+            heartbeat_age_seconds=60, worker_alive=True, process_alive=True, phase='REVIEW'))
+        await self.tick()
+        self.assertIn('dev:needs-owner', b.label_names(self.h.issues[1]))
+        self.assertEqual(item['review_status'], 'RUNNING')
+        self.assertTrue(item['review_uncertain'])
+        self.assertEqual(len(self.h.starts), 2)
+        self.assertEqual(self.h.continues, [])
+        self.h.tasks[review_id].update(status='RUNNING', liveness=dict(
+            state='RUNNING_HEALTHY', reason='lease_fresh_and_processes_owned',
+            generation='review-runtime', transition_sequence=2, lease_state='FRESH',
+            heartbeat_age_seconds=1, worker_alive=True, process_alive=True, phase='REVIEW'))
+        await self.tick()
+        self.assertIn('dev:running', b.label_names(self.h.issues[1]))
+        self.assertEqual(item['review_status'], 'RUNNING')
+        self.assertNotIn('review_uncertain', item)
 
     async def test_github_discovery_crosses_normalized_boundary_once_per_tick(self):
         observed = []

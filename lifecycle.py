@@ -11,7 +11,8 @@ from durable import exclusive, read_json, write_json
 import devctl
 import worker_runtime
 
-KNOWN_FILES = {'meta.json', 'events.jsonl', 'exit_code', 'prompt.txt', 'report.json', 'remote-refresh.lock'}
+KNOWN_FILES = {'meta.json', 'events.jsonl', 'exit_code', 'prompt.txt', 'report.json', 'remote-refresh.lock',
+               'liveness.json', 'liveness.lock', 'runtime_health.json'}
 WORK_QUEUE_LABEL = 'work:queued'
 
 

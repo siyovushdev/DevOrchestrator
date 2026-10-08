@@ -2,9 +2,25 @@
 import base64
 import json
 import shlex
+from pathlib import Path
+
+import runtime_liveness
+from durable import write_json
+
+# Ship the same standard-library runtime implementation to the registered SSH
+# worker, without requiring a checkout/install or a second liveness algorithm.
+SOURCES = {name: Path(__file__).with_name(name + '.py').read_text()
+           for name in ('durable', 'worker_runtime', 'runtime_liveness')}
+BUNDLE = '''import types, sys
+for module_name, source in SOURCES.items():
+    module = types.ModuleType(module_name)
+    sys.modules[module_name] = module
+    exec(source, module.__dict__)
+import runtime_liveness
+'''.replace('SOURCES', repr(SOURCES), 1)
 
 # Self-contained standard-library script, sent only to a registered machine.
-SCRIPT = r'''
+SCRIPT = BUNDLE + r'''
 import base64, json, os, pathlib, re, subprocess, sys, tempfile
 mode, key = sys.argv[1:3]
 if not re.fullmatch(r'[A-Za-z0-9_-]{1,160}', key):
@@ -36,9 +52,11 @@ with (root / 'lock').open('a') as lock:
         if not meta_path.exists():
             save(dict(pid=0, boot=boot, start=None, state='STARTING'))
             command = sys.argv[3]
-            runner = "import pathlib,subprocess,sys; p=pathlib.Path(sys.argv[1]); rc=subprocess.call(['bash','-c',sys.argv[2]]); (p/'exit.tmp').write_text(str(rc)); (p/'exit.tmp').replace(p/'exit_code')"
+            context = json.loads(sys.argv[4]) if len(sys.argv) > 4 else dict(id=key, machine='remote', agent='unknown', project='-')
+            record = runtime_liveness.initialize(root, context)
+            runner = BUNDLE + "\nraise SystemExit(runtime_liveness.run(*sys.argv[1:4]))"
             with (root / 'events.jsonl').open('ab', buffering=0) as log:
-                process = subprocess.Popen(['python3', '-c', runner, str(root), command],
+                process = subprocess.Popen(['python3', '-c', runner, str(root), record['generation'], command],
                     stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
             save(dict(pid=process.pid, boot=boot, start=identity(process.pid), state='RUNNING'))
         print(meta_path.read_text())
@@ -69,43 +87,94 @@ with (root / 'lock').open('a') as lock:
                                 if fields[0] != 'Z' and fields[2] == str(meta['pid']) and fields[3] == str(meta['pid']):
                                     status = 'RUNNING'; break
                             except (OSError, IndexError): pass
+            extra = {}
+            if (root / 'liveness.json').exists():
+                record = runtime_liveness.validate(runtime_liveness.read_record(root))
+                context = dict(id=record['task_id'], machine=record['machine'], agent=record['agent'])
+                health = runtime_liveness.watchdog(root, context)
+                status, code = runtime_liveness.task_status(health)
+                extra = dict(liveness=record, runtime_health=health)
+            # Observe exit before reading logs. A process that exits while this
+            # chunk is being read must not make an incomplete chunk final.
             offset = int(sys.argv[3])
             path = root / 'events.jsonl'
             chunk = b''; more = False
             if path.exists():
                 with path.open('rb') as log:
                     log.seek(offset); chunk = log.read(524288); more = bool(log.read(1))
-            print(json.dumps(dict(status=status, exit_code=code, chunk=base64.b64encode(chunk).decode(), more=more)))
+            print(json.dumps(dict(status=status, exit_code=code, chunk=base64.b64encode(chunk).decode(), more=more, **extra)))
     else:
         raise ValueError('Unknown remote operation')
 '''
+# Available to the detached runner too; Python -c does not inherit modules.
+SCRIPT = SCRIPT.replace('runner = BUNDLE +', 'runner = ' + repr(BUNDLE) + ' +')
 
 
-def rpc(machine, mode, key, value):
+def rpc(machine, mode, key, value, context=None):
     import devctl
-    result = devctl.capture(machine, shlex.join(['python3', '-c', SCRIPT, mode, key, str(value)]), separate_stderr=True)
+    args = ['python3', '-c', SCRIPT, mode, key, str(value)]
+    if context is not None:
+        args.append(json.dumps(context))
+    result = devctl.capture(machine, shlex.join(args), separate_stderr=True)
     if result.returncode:
         raise RuntimeError('Registered remote worker is unavailable')
     return json.loads(result.stdout)
 
 
-def start(machine, key, command):
-    return rpc(machine, 'start', key, command)
+def start(machine, key, command, context=None):
+    if context is not None:
+        context = {k: context[k] for k in ('id', 'machine', 'agent', 'project', 'session_id', 'role', 'runtime_generation') if k in context}
+    return rpc(machine, 'start', key, command, context)
 
 
 def refresh(meta, directory):
     from durable import exclusive, read_json
     with exclusive(directory / 'remote-refresh.lock', blocking=True):
         meta.update(read_json(directory / 'meta.json'))
+        meta.pop('_runtime_health', None)
         return _refresh(meta, directory)
 
 
 def _refresh(meta, directory):
+    from durable import exclusive, read_json
     key = meta['remote_key']
     log = directory / 'events.jsonl'
     offset = meta.get("remote_offset", 0)
     try:
         result = rpc(meta['machine'], 'report', key, offset)
+        record = result.get('liveness')
+        if record is None and meta.get('runtime_generation'):
+            raise ValueError('Worker did not return runtime evidence')
+        if record is not None:
+            runtime_liveness.validate(record, meta)
+            health = result.get('runtime_health')
+            if (not isinstance(health, dict) or health.get('state') not in runtime_liveness.STATES or
+                    health.get('generation') != record['generation'] or health.get('task_id') != record['task_id'] or
+                    not runtime_liveness._number(health.get('heartbeat_age_seconds')) or
+                    not runtime_liveness._number(health.get('observed_at')) or
+                    any(type(health.get(k)) not in (bool, type(None)) for k in ('worker_alive', 'process_alive'))):
+                raise ValueError('Invalid remote runtime evidence')
+            with exclusive(directory / 'liveness.lock', blocking=True):
+                previous = runtime_liveness.read_record(directory)
+                if (directory / 'liveness.json').exists():
+                    runtime_liveness.validate(previous, meta)
+                previous = previous or {}
+                if (previous.get('generation') == record['generation'] and
+                        previous.get('heartbeat_sequence', 0) > record['heartbeat_sequence']):
+                    raise ValueError('Worker heartbeat sequence regressed')
+                if (previous.get('generation') == record['generation'] and
+                        previous.get('terminal_reason') == 'process_exited_without_final_report'):
+                    record['terminal_reason'] = previous['terminal_reason']
+                if previous.get('generation') == record['generation'] and not record.get('session_id'):
+                    record['session_id'] = previous.get('session_id')
+                write_json(directory / 'liveness.json', record)
+            # Recalculate from the validated source record and ownership probe,
+            # never from remote_status or an external provider label.
+            health = runtime_liveness.watchdog(directory, meta, probe=False,
+                evidence=(health['worker_alive'], health['process_alive']),
+                clock=health['observed_at'])
+            result['status'], result['exit_code'] = runtime_liveness.task_status(health)
+            meta['_runtime_health'] = health
         local_size = meta.get("remote_local_size", log.stat().st_size if log.exists() else 0)
         if log.exists() and log.stat().st_size > local_size:
             with log.open("r+b") as stream:
@@ -127,16 +196,21 @@ def _refresh(meta, directory):
         status = result['status']
         # Don't expose incomplete final logs to AutoPilot/review.
         if result.get('more') and status in ('DONE', 'FAILED'):
+            meta['remote_logs_pending'] = True
             meta['remote_status'] = 'RUNNING'
             import devctl
             devctl.save_meta(directory, meta)
             return 'RUNNING', None
         code = result.get('exit_code')
+        meta['remote_logs_pending'] = False
         if status in ('DONE', 'FAILED') and code is not None:
             (directory / 'exit_code').write_text(str(code))
         meta['remote_status'] = status
         import devctl
         devctl.save_meta(directory, meta)
         return status, code
-    except (OSError, ValueError, RuntimeError):
+    except (OSError, ValueError, RuntimeError, TypeError, KeyError):
+        meta.pop('_runtime_health', None)
+        if meta.get('runtime_generation'):
+            meta['_runtime_health'] = runtime_liveness.watchdog(directory, meta, probe=False)
         return 'UNKNOWN', None
