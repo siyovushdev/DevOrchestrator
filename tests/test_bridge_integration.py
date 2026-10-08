@@ -72,6 +72,8 @@ class Harness:
         """Fake provider I/O; real GitHubTransport and V1 wrappers stay active."""
         if args[0] == 'api':
             endpoint = args[1]
+            if '/labels?' in endpoint:
+                return json.dumps([{'name': name} for name in b.STATE_LABELS])
             if '/comments?' in endpoint:
                 number = int(endpoint.split('/issues/', 1)[1].split('/')[0])
                 return json.dumps(self.comments[number])
@@ -146,7 +148,21 @@ class BridgeIntegrationTests(unittest.IsolatedAsyncioTestCase):
         for p in patches: p.start(); self.addCleanup(p.stop)
         self.addCleanup(lambda: setattr(b, 'WORK_CONTEXT', None))
 
-    async def tick(self): await b.tick(self.h.state)
+    async def tick(self):
+        # These downstream owner/recovery tests explicitly drive both quality
+        # gates. Chief runtime tests use raw ticks to verify waiting/rejection.
+        await b.tick(self.h.state)
+        item = self.h.state['issues'].get('1', {})
+        record = item.get('chief_review')
+        if item.get('chief_status') == 'AWAITING_CHIEF_REVIEW' and record:
+            for _ in range(3):
+                if all(self.h.state['outbox'][key]['status'] == 'DONE' for key in record['effects']):
+                    break
+                await b.tick(self.h.state)
+            if all(self.h.state['outbox'][key]['status'] == 'DONE' for key in record['effects']):
+                self.h.comment('<!-- DEVORCHESTRATOR_CHIEF_REVIEW_V1 ' + json.dumps(dict(
+                    bundle_id=record['identity']['bundle_id'], verdict='PASS', summary='Chief reviewed', findings=[])) + ' -->')
+                await b.tick(self.h.state)
 
     async def ready(self):
         await self.tick()
@@ -1051,7 +1067,8 @@ class BridgeIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.h.comment('<!-- DEVORCHESTRATOR_OWNER_V1 {"action":"COMMIT"} -->')
         await self.tick()
         self.assertEqual(self.h.git('rev-parse', 'HEAD'), head)
-        self.assertEqual(item['owner_state'], 'READY_FOR_OWNER')
+        self.assertIsNone(item['owner_state'])
+        self.assertEqual(item['chief_status'], 'STALE')
 
     async def test_unresolved_recovery_hold_prevents_owner_publication(self):
         item = await self.ready()

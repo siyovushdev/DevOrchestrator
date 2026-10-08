@@ -11,6 +11,7 @@ from pathlib import Path
 
 import notifications
 import bridge_effects
+import chief_review
 from github_transport import GitHubTransport
 from lifecycle import WORK_QUEUE_LABEL, worker_guard
 from datetime import datetime, timezone
@@ -38,6 +39,7 @@ STATE_LABELS = {
     "dev:running",
     "dev:done",
     "dev:ready-for-review",
+    "dev:awaiting-chief-review",
     "dev:needs-owner",
     "dev:failed",
 }
@@ -606,6 +608,7 @@ def invalidate_quality_gates(item):
             "review_hold": item.get("review_hold"), "review_task_id": item.get("review_task_id"),
             "coding_turn": item.get("review_coding_turn"),
         })
+    chief_review.invalidate(item)
     item["autopilot_corrections"] = 0
 
     item["review_task_id"] = None
@@ -929,11 +932,38 @@ def flush_effects(state, reconciled=True):
         adapter = github_task_transport()
         current = adapter.fetch_labels(adapter.issue_ref(issue["number"]))
         raw_transition_issue(current, target)
+    def eligible(entry):
+        if entry['kind'] == 'chief_comment':
+            item = state.get('issues', {}).get(str(entry['number']), {})
+            record = item.get('chief_review') or {}
+            if not reconciled or chief_review.malformed_runtime(item):
+                return False
+            for index, key in enumerate(record.get('effects', [])):
+                if state.get('outbox', {}).get(key) is entry:
+                    return (chief_effect_valid(state, entry['number'], record, index) and
+                            chief_tree_current(item, state, str(entry['number'])))
+            return False
+        return reconciled or not (
+            (entry['kind'] == 'telegram' and entry['payload'].startswith('REVIEW_PASSED / READY_FOR_OWNER')) or
+            (entry['kind'] == 'transition' and entry['payload']['target'] == 'dev:ready-for-review'))
+
+    def post(number, body):
+        match = re.search(r'<!-- DEVORCHESTRATOR_EFFECT_V1 ([0-9a-f]{64}) -->$', body)
+        entry = state.get('outbox', {}).get(match[1]) if match else None
+        if entry and entry['kind'] == 'chief_comment':
+            from devctl import DATA_DIR
+            with exclusive(DATA_DIR.parent / 'worker.lock', blocking=True):
+                item = state.get('issues', {}).get(str(number), {})
+                if not chief_tree_current(item, state, str(number)):
+                    raise PublicationError('Chief tree changed before comment publication')
+                raw_add_comment(number, body)
+                if not chief_tree_current(item, state, str(number)):
+                    raise PublicationError('Chief tree changed during comment publication')
+        else:
+            raw_add_comment(number, body)
+
     bridge_effects.flush(state, lambda: save_state(state), issue_comments,
-                        raw_add_comment, transition, send_telegram,
-                        eligible=lambda entry: reconciled or not (
-                            (entry['kind'] == 'telegram' and entry['payload'].startswith('REVIEW_PASSED / READY_FOR_OWNER')) or
-                            (entry['kind'] == 'transition' and entry['payload']['target'] == 'dev:ready-for-review')))
+                        post, transition, send_telegram, eligible=eligible)
 
 
 def parse_task(issue):
@@ -1074,6 +1104,8 @@ def complete_rpc(item, operation, result):
         item["review_format_corrections"] = int(operation.rsplit(":", 1)[1])
         item["review_status"] = "RUNNING"
     elif operation.startswith("review:"):
+        chief_review.invalidate(item)
+        item.update(owner_state=None, owner_approved_at=None)
         item.update(review_task_id=result.get("task_id") or result["id"],
                     reviewer_agent=result.get("agent"), review_round=int(operation.split(":")[1]),
                     review_status="RUNNING", review_format_corrections=0)
@@ -1380,7 +1412,216 @@ def owner_logins():
         "DEVORCHESTRATOR_OWNERS", REPO.split("/")[0]).split(",") if login.strip()}
 
 
+def stale_chief(item, state, number, diagnostic):
+    """Revoke quality gates, retaining the old Chief receipt as historical evidence."""
+    chief_review.invalidate(item)
+    item.update(owner_state=None, owner_approved_at=None, reviewed_tree=None,
+                review_status='FRESH_REVIEW_REQUIRED',
+                review_hold={'diagnostic': diagnostic, 'previous_status': 'PASS'})
+    item['desired_label'] = 'dev:failed'
+    bridge_effects.enqueue(state, number, 'transition',
+        {'issue': {'number': int(number)}, 'target': 'dev:failed'},
+        ['chief-stale', item.get('task_id'), item.get('coding_turn'), item.get('review_round')])
+    save_state(state)
+
+
+def chief_tree_current(item, state, number):
+    try:
+        chief_review.validate_identity(item['chief_review']['identity'], item)
+        if Repository(item['project']).snapshot() != item['reviewed_tree']:
+            stale_chief(item, state, number, 'Repository changed after independent PASS; fresh independent review and Chief bundle required.')
+            return False
+        return True
+    except PublicationError:
+        return False  # Unavailable evidence cannot authorize a send or verdict.
+    except (ValueError, KeyError, TypeError):
+        stale_chief(item, state, number, 'Chief identity is stale; fresh independent review and Chief bundle required.')
+        return False
+
+
+def chief_effect_key(number, bundle_id, index, body):
+    event = ['chief-bundle', bundle_id, index, hashlib.sha256(body.encode()).hexdigest()]
+    return hashlib.sha256(json.dumps([str(number), 'chief_comment', event], sort_keys=True).encode()).hexdigest()
+
+
+def chief_effect_valid(state, number, record, index):
+    key = record['effects'][index]
+    entry = state.get('outbox', {}).get(key)
+    return (isinstance(entry, dict) and entry.get('kind') == 'chief_comment' and
+            str(entry.get('number')) == str(number) and isinstance(entry.get('payload'), str) and
+            len(entry['payload'].encode()) <= 50000 and
+            chief_effect_key(number, record['identity']['bundle_id'], index, entry['payload']) == key)
+
+
+async def process_chief_review(issue, item, state, report):
+    """Backfill pending independent PASS before the existing owner flow executes.
+
+    Reuse its task/turn/round/tree; historical or interrupted publication is not
+    retroactively enrolled. Return True while Chief review owns this task.
+    """
+    if item.get('owner_state') in OWNER_STATE_SEQUENCE[1:] or item.get('publication_journal'):
+        return False
+    if item.get('review_status') != 'PASS':
+        return False
+    current = await mcp_call('get_task_report', {'task_id': item['task_id']})
+    observe_coding_turn(item, state, current)
+    if not coding_report_successful(current, item) or item.get('review_status') != 'PASS':
+        return True
+    report = current
+    try:
+        identity = chief_review.build_identity(item)
+    except ValueError:
+        return False  # Existing historical-review holds handle missing evidence.
+    item.update(chief_required=True, owner_state=None, owner_approved_at=None)
+    record = item.get('chief_review')
+    if record and record['identity'] != identity.to_dict():
+        chief_review.invalidate(item)
+        record = None
+    if not record:
+        item['chief_status'] = 'AWAITING_CHIEF_REVIEW'
+        transition_issue(issue, 'dev:awaiting-chief-review')
+    save_state(state)
+
+    from devctl import DATA_DIR
+    with exclusive(DATA_DIR.parent / 'worker.lock', blocking=True):
+        repository = Repository(item['project'], report)
+        snapshot = repository.snapshot()
+        if snapshot != item['reviewed_tree']:
+            stale_chief(item, state, str(issue['number']), 'Repository changed after independent PASS; fresh review required.')
+            return True
+        if not record:
+            coding_data, _ = parse_autopilot_result(report.get('result'))
+            if coding_data:
+                verification = {name: coding_data[name] for name in ('implementation', 'verification', 'self_review', 'state')}
+                verification['summary'] = chief_review.sanitize(coding_data['summary'])[:500]
+                item['chief_verification_summary'] = json.dumps(verification, ensure_ascii=False)
+            else:
+                item['chief_verification_summary'] = chief_review.sanitize(str(report.get('result') or ''))[:2000]
+            if not item.get('independent_review_summary') and item.get('review_task_id'):
+                # Backfill reads an existing completed review; never relaunches it.
+                try:
+                    review = await mcp_call('get_task_report', {'task_id': item['review_task_id']})
+                    data, _ = parse_review_result(review.get('result'))
+                except Exception:
+                    data = None  # Durable PASS/tree evidence does not depend on log retention.
+                item['independent_review_summary'] = chief_review.sanitize(data['summary'])[:2000] if (
+                    data and data['verdict'] == 'PASS') else 'Independent PASS recorded in durable bridge state; reviewer summary unavailable.'
+            evidence = repository.review_evidence(snapshot)
+            bodies = chief_review.evidence_comments(identity, item['project'],
+                repository.cfg.get('github_repo') or snapshot.get('origin') or '(local registered repository)',
+                item, report, evidence)
+            if repository.snapshot() != snapshot:
+                stale_chief(item, state, str(issue['number']), 'Repository changed during Chief evidence extraction; fresh review required.')
+                return True
+            keys = [bridge_effects.enqueue(state, issue['number'], 'chief_comment', body,
+                ['chief-bundle', identity.bundle_id, index, hashlib.sha256(body.encode()).hexdigest()])
+                for index, body in enumerate(bodies)]
+            record = item['chief_review'] = dict(identity=identity.to_dict(), revision=1,
+                                                effects=keys, complete=False, verdict=None)
+            save_state(state)
+
+    comments = issue_comments(issue['number'])
+    complete = True
+    for index, key in enumerate(record['effects']):
+        if not chief_effect_valid(state, issue['number'], record, index):
+            complete = False
+            break
+        entry = state['outbox'][key]
+        expected = entry['payload'] + '\n\n' + f'<!-- DEVORCHESTRATOR_EFFECT_V1 {key} -->'
+        matches = [c for c in comments if c.get('body') == expected]
+        if len(matches) != 1:
+            complete = False
+        else:
+            entry['status'] = 'DONE'  # Prove acceptance across timeout/crash.
+    record['complete'] = complete
+    if not complete:
+        item['chief_status'] = 'AWAITING_CHIEF_REVIEW'
+        save_state(state)
+        transition_issue(issue, 'dev:awaiting-chief-review')
+        return True
+
+    processed = set(item.get('processed_chief_comments') or [])
+    accepted_source = record.get('verdict')
+    if accepted_source:
+        sources = [c for c in comments if comment_id(c) == accepted_source['source']]
+        if (len(sources) != 1 or hashlib.sha256((sources[0].get('body') or '').encode()).hexdigest() != accepted_source['source_revision']):
+            record['conflict'] = True
+            item['chief_status'] = 'CONFLICT'
+            add_comment(issue['number'], 'Accepted Chief verdict was edited or removed; fresh review required.')
+    for comment in comments:
+        if chief_review.is_evidence_comment(comment.get('body')) or not authorized_comment(comment):
+            continue
+        cid = comment_id(comment)
+        if comment_already_processed(comment, processed):
+            continue
+        try:
+            data = chief_review.parse_verdict(comment.get('body'))
+            if data is None:
+                continue
+            if not re.fullmatch(r'[1-9][0-9]*', str(comment.get('id'))):
+                raise ValueError('Chief command requires a stable GitHub comment id')
+            if data['bundle_id'] != identity.bundle_id:
+                raise ValueError('Chief verdict rejected: stale or wrong bundle_id')
+            if record.get('conflict'):
+                raise ValueError('Conflicting Chief verdicts; fresh review required')
+            previous = record.get('verdict')
+            if previous:
+                if previous['data'] != data:
+                    record['conflict'] = True
+                    item['chief_status'] = 'CONFLICT'
+                    raise ValueError('Conflicting Chief verdict; approval blocked pending fresh review')
+            else:
+                with exclusive(DATA_DIR.parent / 'worker.lock', blocking=True):
+                    current = await mcp_call('get_task_report', {'task_id': item['task_id']})
+                    observe_coding_turn(item, state, current)
+                    if not coding_report_successful(current, item) or not chief_tree_current(item, state, str(issue['number'])):
+                        return True
+                    record['verdict'] = dict(data=data, source=cid, revision=1,
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                        source_revision=hashlib.sha256(comment['body'].encode()).hexdigest(),
+                        source_timestamp=chief_review.sanitize(str(comment.get('createdAt') or ''))[:128],
+                        actor=chief_review.sanitize((comment.get('author') or {}).get('login', ''))[:128])
+                    save_state(state)
+            processed.add(cid)
+        except ValueError as exc:
+            processed.add(cid)
+            add_comment(issue['number'], str(exc))
+    item['processed_chief_comments'] = sorted(processed)
+    save_state(state)
+    if record.get('conflict'):
+        item['chief_status'] = 'CONFLICT'
+        transition_issue(issue, 'dev:failed')
+        return True
+    accepted = record.get('verdict')
+    if not accepted:
+        item['chief_status'] = 'AWAITING_CHIEF_REVIEW'
+        transition_issue(issue, 'dev:awaiting-chief-review')
+        return True
+    if accepted['data']['verdict'] == 'PASS':
+        item.update(chief_status='PASS', owner_state=OWNER_STATE_READY,
+                    owner_approved_at=accepted['timestamp'])
+        save_state(state)
+        transition_issue(issue, 'dev:ready-for-review')
+        notify('REVIEW_PASSED / READY_FOR_OWNER', issue, item, report)
+        return False
+
+    item['chief_status'] = 'CHANGES_REQUIRED'
+    save_state(state)
+    data = accepted['data']
+    prompt = ('CHIEF ENGINEER: CHANGES REQUIRED\n\n' + data['summary'] + '\n\n' +
+              '\n'.join('- ' + finding for finding in data['findings']) +
+              '\n\nContinue in the SAME coding session. Fix these findings, run relevant checks, '
+              'self-review and rerun verification. A fresh independent review and Chief bundle are required.\n\n' +
+              autopilot_contract())
+    await mcp_call('continue_task', {'task_id': item['task_id'],
+        '_operation': 'chief-correction:' + identity.bundle_id, 'prompt': coding_prompt(prompt)})
+    transition_issue(issue, 'dev:running')
+    return True
+
+
 async def process_owner_actions(issue, item, state, report):
+    if not chief_review.approval_complete(item):
+        return
     if report.get("status") not in ("DONE", "FAILED") or item.get("review_status") == "RUNNING":
         return
     if item.get('review_hold'):
@@ -1400,6 +1641,8 @@ async def process_owner_actions(issue, item, state, report):
         notify(item["owner_state"], issue, item, report)
     processed = set(item.get("processed_owner_actions") or [])
     for comment in issue_comments(issue["number"]):
+        if chief_review.is_evidence_comment(comment.get('body')):
+            continue
         cid = comment_id(comment)
         if comment_already_processed(comment, processed) or not authorized_comment(comment):
             continue
@@ -1423,6 +1666,11 @@ async def process_owner_actions(issue, item, state, report):
                     raise PublicationError("Repository has another active or uncertain task")
                 from devctl import DATA_DIR
                 with exclusive(DATA_DIR.parent / "worker.lock", blocking=True):
+                    if item.get('chief_required'):
+                        current_report = await mcp_call('get_task_report', {'task_id': item['task_id']})
+                        observe_coding_turn(item, state, current_report)
+                        if not coding_report_successful(current_report, item) or not chief_review.approval_complete(item):
+                            raise PublicationError('Coding turn changed before owner publication; fresh quality gates required')
                     repository = Repository(item["project"], report)
                     tasks = await transport_call("list_tasks", {})
                     for task in tasks:
@@ -1468,7 +1716,7 @@ async def process_followup(issue, item, state, report):
     for comment in issue_comments(issue["number"]):
         body = comment.get("body") or ""
 
-        if not authorized_comment(comment):
+        if chief_review.is_evidence_comment(body) or not authorized_comment(comment):
             continue
         cid = comment_id(comment)
         if comment_already_processed(comment, processed):
@@ -1792,6 +2040,9 @@ async def start_independent_review(
         args["model"] = REVIEWER_CODEX_MODEL
         args["effort"] = REVIEWER_CODEX_EFFORT
 
+    chief_review.invalidate(item)
+    item["owner_state"] = None
+    item["owner_approved_at"] = None
     if not item.get("review_start_tree"):
         item["review_start_tree"] = Repository(project, coding_report).snapshot()
     item['review_coding_turn'] = coding_report['turns']
@@ -2113,18 +2364,16 @@ Return the review again using the required machine-readable contract.
                 return True
             item["reviewed_tree"] = reviewed
             item["review_status"] = "PASS"
-            item["owner_state"] = OWNER_STATE_READY
-            item["owner_approved_at"] = datetime.now(timezone.utc).isoformat()
+            item["chief_required"] = True
+            item["chief_status"] = "AWAITING_CHIEF_REVIEW"
+            item["independent_review_summary"] = chief_review.sanitize(review_data["summary"])[:2000]
+            item["owner_state"] = None
+            item["owner_approved_at"] = None
             item["owner_blocker"] = None
             item["owner_question_at"] = None
             save_state(state)
 
-        transition_issue(
-            issue,
-            "dev:ready-for-review",
-        )
-
-        notify("REVIEW_PASSED / READY_FOR_OWNER", issue, item, coding_report)
+        await process_chief_review(issue, item, state, current)
 
         print(
             f"[bridge] independent review PASS "
@@ -2304,7 +2553,7 @@ def malformed_item(item):
         return True
     if item.get("project") is not None and not isinstance(item["project"], str):
         return True
-    for field in ("processed_followups", "processed_owner_actions", "stale_review_task_ids"):
+    for field in ("processed_followups", "processed_owner_actions", "stale_review_task_ids", "processed_chief_comments"):
         values = item.get(field)
         if values is not None and (not isinstance(values, list) or any(not isinstance(v, str) for v in values)):
             return True
@@ -2346,7 +2595,7 @@ def malformed_item(item):
                  not isinstance(spec["arguments"].get("project"), str) or
                  not isinstance(spec["arguments"].get("prompt"), str)):
         return True
-    return False
+    return chief_review.malformed_runtime(item)
 
 
 async def process_tracked(issue, item, state, runtime_reports=None):
@@ -2399,6 +2648,8 @@ async def process_tracked(issue, item, state, runtime_reports=None):
 
         observe_coding_turn(item, state, report)
         if report.get("status") not in ('DONE', 'FAILED'):
+            return
+        if await process_chief_review(issue, item, state, report):
             return
         await process_owner_actions(issue, item, state, report)
 

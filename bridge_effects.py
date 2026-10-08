@@ -20,7 +20,8 @@ def flush(state, persist, comments, post_comment, transition, telegram, now=None
     started = time.monotonic()
     deliveries = 0
     for key, entry in list(state.get('outbox', {}).items()):
-        if entry['status'] in ('DONE', 'UNCERTAIN', 'FAILED') or entry.get('next_attempt', 0) > now:
+        chief_reconcile = entry['kind'] == 'chief_comment' and entry['status'] in ('SENDING', 'UNCERTAIN')
+        if not chief_reconcile and (entry['status'] in ('DONE', 'UNCERTAIN', 'FAILED') or entry.get('next_attempt', 0) > now):
             continue
         if entry['kind'] == 'telegram' and entry['status'] == 'SENDING':
             # A crash crossed the send boundary: acceptance cannot be queried by key.
@@ -32,14 +33,41 @@ def flush(state, persist, comments, post_comment, transition, telegram, now=None
         if deliveries >= 5 or time.monotonic() - started >= 5:
             break
         deliveries += 1
-        if entry['kind'] == 'telegram':
+        if chief_reconcile:
+            expected = entry['payload'] + '\n\n' + f'<!-- DEVORCHESTRATOR_EFFECT_V1 {key} -->'
+            try:
+                matches = [c for c in comments(entry['number']) if c.get('body') == expected]
+                entry['status'] = 'DONE' if len(matches) == 1 else 'UNCERTAIN'
+            except Exception:
+                entry['status'] = 'UNCERTAIN'
+            persist()
+            continue
+        if entry['kind'] == 'chief_comment':
+            expected = entry['payload'] + '\n\n' + f'<!-- DEVORCHESTRATOR_EFFECT_V1 {key} -->'
+            try:
+                matches = [c for c in comments(entry['number']) if c.get('body') == expected]
+            except Exception:
+                # No POST was attempted: a failed preflight read is safe to retry.
+                entry['attempts'] += 1
+                entry['next_attempt'] = now + min(300, 2 ** min(entry['attempts'], 8))
+                persist()
+                continue
+            if matches:
+                entry['status'] = 'DONE' if len(matches) == 1 else 'UNCERTAIN'
+                persist()
+                continue
+        if entry['kind'] in ('telegram', 'chief_comment'):
             entry['status'] = 'SENDING'
             persist()  # Must be durable before the POST; persistence errors must stop delivery.
         result = None
         try:
-            if entry['kind'] == 'comment':
+            if entry['kind'] == 'chief_comment':
+                post_comment(entry['number'], expected)
+            elif entry['kind'] == 'comment':
                 marker = f'<!-- DEVORCHESTRATOR_EFFECT_V1 {key} -->'
-                if not any(marker in (c.get('body') or '') for c in comments(entry['number'])):
+                from chief_review import is_evidence_comment
+                if not any(marker in (c.get('body') or '') and not is_evidence_comment(c.get('body'))
+                           for c in comments(entry['number'])):
                     post_comment(entry['number'], entry['payload'] + '\n\n' + marker)
             elif entry['kind'] == 'transition':
                 transition(entry['payload']['issue'], entry['payload']['target'])
@@ -58,6 +86,8 @@ def flush(state, persist, comments, post_comment, transition, telegram, now=None
             # Never persist exception messages (URLs/tokens/credentials may appear in them).
             entry['attempts'] += 1
             entry['next_attempt'] = now + min(300, 2 ** min(entry['attempts'], 8))
+            if entry['kind'] == 'chief_comment':
+                entry.update(status='UNCERTAIN', diagnostic='Chief evidence acceptance uncertain; exact receipt reconciliation required')
             if entry['kind'] == 'telegram':
                 # A thrown callback may have sent; a known False is safe to retry.
                 if result is not False:

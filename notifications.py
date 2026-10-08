@@ -14,7 +14,8 @@ from redaction import redact
 def review_approval_complete(item):
     """Historical PASS alone cannot authorize publication or a COMMIT invitation."""
     tree = item.get('reviewed_tree')
-    return (item.get('review_status') == 'PASS' and
+    from chief_review import approval_complete
+    return (approval_complete(item) and item.get('review_status') == 'PASS' and
             item.get('coding_status', 'DONE') == 'DONE' and
             ('coding_turn' not in item or item.get('review_coding_turn') == item['coding_turn']) and
             item.get('owner_state') in ('READY_FOR_OWNER', 'COMMITTED', 'PUSHED', 'PR_CREATED', 'MERGED') and
