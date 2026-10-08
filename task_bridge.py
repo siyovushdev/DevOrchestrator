@@ -16,7 +16,7 @@ from operational_state import exclusion_reason, lifecycle_state, next_action, no
 from github_transport import GitHubTransport
 from lifecycle import WORK_QUEUE_LABEL, worker_guard
 from datetime import datetime, timezone
-from durable import read_json, write_json, exclusive
+from durable import read_json, write_json_if_changed, exclusive
 from scheduler import Scheduler, QueueWait, project_identity, registered_project
 import hashlib
 from redaction import redact, redact_data
@@ -875,7 +875,7 @@ def load_state():
 
 
 def save_state(state):
-    write_json(STATE_FILE, state)
+    return write_json_if_changed(STATE_FILE, state)
 
 
 def archive_issue(issue, item, state):

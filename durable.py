@@ -16,6 +16,30 @@ def read_json(path, default=None, *, object_pairs_hook=None):
     return json.loads(path.read_text(), object_pairs_hook=object_pairs_hook)
 
 
+def write_json_if_changed(path, data):
+    """
+    Durably replace a JSON file only when its serialized contents changed.
+
+    Real state transitions keep the existing atomic write/fsync semantics.
+    Repeated no-op save_state() calls do not rewrite the whole file.
+    """
+    path = Path(path)
+    serialized = json.dumps(
+        data,
+        indent=2,
+        ensure_ascii=False,
+    )
+
+    try:
+        if path.read_text() == serialized:
+            return False
+    except FileNotFoundError:
+        pass
+
+    write_json(path, data)
+    return True
+
+
 def write_json(path, data):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
