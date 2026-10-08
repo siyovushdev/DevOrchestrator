@@ -33,6 +33,126 @@ class SchedulerTests(unittest.TestCase):
         self.assertTrue(self.s.release('a'))
         self.job('b'); self.s.reserve('b')
 
+    def test_recovery_keeps_repo_for_next_phase_before_intent_is_admitted(self):
+        for status in ('DONE', 'FAILED'):
+            with self.subTest(status=status):
+                state = {'issues': {'5': {'task_id': 'task-5', 'coding_status': 'RUNNING'},
+                                    '3': {'queue_status': 'QUEUED'}}}
+                s = Scheduler(state, self.s.limits)
+                s.enqueue('coding-5', '5', 'coding', 'work', 'repo')
+                s.reserve('coding-5'); s.started('coding-5', 'task-5')
+                s.enqueue('coding-3', '3', 'coding', 'work', 'repo')
+                s = Scheduler(state, self.s.limits)  # Restart before phase processing.
+                for _ in range(2):
+                    s.recover([{'id': 'task-5', 'status': status, 'cleanup_state': 'CLEANED'}])
+                    self.assertEqual(s.jobs['coding-5']['status'], status)
+                    with self.assertRaises(QueueWait): s.reserve('coding-3')
+                    self.assertEqual(s.locks['repo']['owner'], '5')
+                # Although queued later, the owner's next phase remains eligible.
+                s.enqueue('next-5', '5', 'review', 'work', 'repo')
+                s.reserve('next-5')
+                self.assertEqual(s.locks['repo']['key'], 'next-5')
+
+    def test_recovery_releases_repo_after_durable_issue_outcome(self):
+        outcomes = ([{'review_status': status} for status in
+                     ('NEEDS_OWNER', 'FAILED', 'FRESH_REVIEW_REQUIRED')] +
+                    [{'owner_state': status} for status in
+                     ('READY_FOR_OWNER', 'COMMITTED', 'PUSHED', 'PR_CREATED', 'MERGED')] +
+                    [{'last_report_signature': 'DONE:1:0'}, {'compatibility_status': 'QUARANTINED'},
+                     {'issue_closed': True}, {'completed': True}, {'superseded': True}])
+        # Already published records must not acquire a retroactive Chief hold.
+        outcomes += [dict(owner_state=status, review_status='PASS', chief_required=True,
+                          chief_status='STALE') for status in ('COMMITTED', 'PUSHED', 'PR_CREATED', 'MERGED')]
+        outcomes += [{'review_status': 'PASS', 'chief_required': True, 'issue_closed': True},
+                     {'review_status': 'PASS', 'publication_journal': {'commit': {'status': 'DONE'}}}]
+        for outcome in outcomes:
+            with self.subTest(outcome=outcome):
+                state = {'issues': {'5': dict(task_id='task-5', coding_status='DONE', **outcome)}}
+                s = Scheduler(state, self.s.limits)
+                s.enqueue('coding-5', '5', 'coding', 'work', 'repo')
+                s.reserve('coding-5'); s.started('coding-5', 'task-5')
+                s.enqueue('coding-3', '3', 'coding', 'work', 'repo')
+                for _ in range(2):
+                    s.recover([{'id': 'task-5', 'status': 'DONE', 'cleanup_state': 'CLEANED'}])
+                    self.assertNotIn('repo', s.locks)
+                s.reserve('coding-3')
+
+    def test_independent_pass_and_incomplete_chief_keep_repo_owned(self):
+        outcomes = [{'review_status': 'PASS'},
+                    {'review_status': 'PASS', 'owner_state': 'READY_FOR_OWNER',
+                     'owner_approved_at': '2026-10-07T00:00:00+00:00',
+                     'reviewed_tree': {'fingerprint': 'a' * 64}},
+                    {'review_status': 'PASS', 'chief_required': True, 'chief_status': 'AWAITING_CHIEF_REVIEW'},
+                    {'review_status': 'PASS', 'chief_required': True, 'chief_status': 'PASS'},
+                    {'chief_required': True, 'chief_status': 'CHANGES_REQUIRED', 'last_report_signature': 'DONE:1:0'}]
+        for outcome in outcomes:
+            with self.subTest(outcome=outcome):
+                s = Scheduler({'issues': {'5': dict(task_id='task-5', coding_status='DONE', **outcome)}}, self.s.limits)
+                s.enqueue('coding-5', '5', 'coding', 'work', 'repo')
+                s.reserve('coding-5'); s.started('coding-5', 'task-5')
+                s.enqueue('coding-3', '3', 'coding', 'work', 'repo')
+                for _ in range(2):
+                    s.recover([{'id': 'task-5', 'status': 'DONE', 'cleanup_state': 'CLEANED'}])
+                    with self.assertRaises(QueueWait): s.reserve('coding-3')
+                    self.assertFalse(s.release('5'))
+                    self.assertEqual(s.locks['repo']['owner'], '5')
+
+    def test_missing_queue_diagnostic_clears_when_ownership_is_proven(self):
+        for item in ({'review_status': 'RUNNING'},
+                     {'review_status': 'PASS', 'chief_required': True, 'chief_status': 'AWAITING_CHIEF_REVIEW'}):
+            for status in ('QUEUED', 'RUNNING', 'DONE'):
+                with self.subTest(item=item, status=status):
+                    s = Scheduler({'issues': {'5': item},
+                                   'repo_locks': {'repo': {'owner': '5', 'key': 'job'}}}, self.s.limits)
+                    s.recover([])
+                    self.assertIn('repo', s.state['scheduler_diagnostics'])
+                    job = s.enqueue('job', '5', 'review', 'work', 'repo')
+                    job['status'] = status
+                    for _ in range(2):
+                        s.recover([])
+                        self.assertEqual(s.state['scheduler_diagnostics'], {})
+                        self.assertEqual(s.locks['repo']['owner'], '5')
+                    s.jobs.clear()
+                    s.recover([])
+                    self.assertIn('repo', s.state['scheduler_diagnostics'])
+
+    def test_pending_next_phase_overrides_old_terminal_markers(self):
+        for intent in ({'pending_rpc': {'operation': 'review:2'}}, {'review_status': 'RUNNING'}, {}):
+            with self.subTest(intent=intent):
+                # Even an empty tracked record cannot prove lifecycle completion.
+                item = dict(last_report_signature='DONE:1:0', owner_state='READY_FOR_OWNER', **intent) if intent else {}
+                s = Scheduler({'issues': {'5': item}}, self.s.limits)
+                s.enqueue('coding-5', '5', 'coding', 'work', 'repo')
+                s.reserve('coding-5'); s.started('coding-5', 'task-5')
+                s.recover([{'id': 'task-5', 'status': 'DONE', 'cleanup_state': 'CLEANED'}])
+                self.assertEqual(s.locks['repo']['owner'], '5')
+
+    def test_tracked_orphan_lock_is_retained_with_diagnostic(self):
+        state = {'issues': {'5': {'task_id': 'task-5', 'coding_status': 'RUNNING'}},
+                 'repo_locks': {'repo': {'owner': '5', 'key': 'missing'}}}
+        s = Scheduler(state, self.s.limits)
+        for _ in range(2):
+            s.recover([])
+            self.assertEqual(s.locks['repo']['owner'], '5')
+            self.assertEqual(state['scheduler_diagnostics'],
+                             {'repo': 'Lock retained: missing queue ownership proof'})
+
+    def test_archived_handoff_releases_only_proven_unlaunched_cancellation(self):
+        cases = [({}, True), ({'cancelled': None}, False), ({'task_id': 'uncertain-task'}, False),
+                 ({'launch_pending': True}, False), ({'runtime_cleanup_pending': True}, False)]
+        for extra, released in cases:
+            with self.subTest(extra=extra):
+                s = Scheduler({'issues': {'5': {'issue_closed': True, 'pending_rpc': {'operation': 'review:1'}}}},
+                              self.s.limits)
+                s.enqueue('coding-5', '5', 'coding', 'work', 'repo')
+                s.reserve('coding-5'); s.started('coding-5', 'task-5')
+                job = s.enqueue('review-5', '5', 'review', 'work', 'repo')
+                job.update(status='CANCELLED', cancelled='archived_issue')
+                job.update(extra)
+                for _ in range(2):
+                    s.recover([{'id': 'task-5', 'status': 'DONE', 'cleanup_state': 'CLEANED'}])
+                    self.assertEqual('repo' not in s.locks, released)
+
     def test_review_capacity_and_restart(self):
         self.job('coding'); self.s.reserve('coding'); self.s.started('coding', 'task')
         self.job('review', 'b', 'firefly', 'review'); self.s.reserve('review')

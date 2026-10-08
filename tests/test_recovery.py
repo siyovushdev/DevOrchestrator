@@ -18,6 +18,25 @@ from tests_helpers import proc_fixture
 
 
 class RecoveryTests(unittest.TestCase):
+    def test_unclassified_lease_evidence_preserves_diagnostic_and_requires_machine_binding(self):
+        with tempfile.TemporaryDirectory() as root:
+            data = Path(root) / 'tasks'
+            leases = {'lease': {'task_id': 'remote', 'machine': 'firefly'}}
+            write_json(data.parent / 'worker_leases.json', leases)
+            diagnostic = {'leases': {'lease': 'Previous classified diagnostic'}}
+            write_json(data.parent / 'worker_consistency.json', diagnostic)
+            before = (data.parent / 'worker_consistency.json').read_bytes()
+            for evidence in ({}, {'remote': {'cleanup': 'UNCLASSIFIED', 'machine': 'firefly'}}):
+                worker.reconcile_leases(data, evidence)
+                self.assertEqual(read_json(data.parent / 'worker_leases.json'), leases)
+                self.assertEqual((data.parent / 'worker_consistency.json').read_bytes(), before)
+            worker.reconcile_leases(data, {'remote': {'cleanup': 'ACTIVE', 'machine': 'work'}})
+            self.assertEqual(read_json(data.parent / 'worker_leases.json'), leases)
+            self.assertIn('ambiguous', read_json(data.parent / 'worker_consistency.json')['leases']['lease'])
+            worker.reconcile_leases(data, {'remote': {'cleanup': 'ACTIVE', 'machine': 'firefly'}})
+            self.assertEqual(read_json(data.parent / 'worker_consistency.json')['leases'], {})
+            self.assertEqual(read_json(data.parent / 'worker_leases.json'), leases)
+
     def test_corrupt_state_fails_closed_and_atomic_save(self):
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / 'state.json'
@@ -40,7 +59,7 @@ class RecoveryTests(unittest.TestCase):
         self.assertTrue(worker.alive({'pid': os.getpid(), 'process_identity': worker.process_identity(os.getpid())}))
         self.assertFalse(worker.alive({'pid': os.getpid(), 'process_identity': {'boot': 'old', 'start': '1'}}))
 
-    def test_reused_session_leader_start_mismatch_releases_local_lease(self):
+    def test_reused_session_leader_start_mismatch_retains_ambiguous_lease(self):
         leader = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], start_new_session=True)
         try:
             self.assertEqual(os.getsid(leader.pid), leader.pid)
@@ -55,8 +74,9 @@ class RecoveryTests(unittest.TestCase):
                 directory = data / 'old'; directory.mkdir(parents=True)
                 write_json(directory / 'meta.json', meta)
                 worker.admit(data, 'work', '/registered', 'old', devctl.task_state)
-                worker.admit(data, 'work', '/registered', 'new', devctl.task_state)
-                self.assertEqual(next(iter(read_json(data.parent / 'worker_leases.json').values()))['task_id'], 'new')
+                with self.assertRaises(RuntimeError):
+                    worker.admit(data, 'work', '/registered', 'new', devctl.task_state)
+                self.assertEqual(next(iter(read_json(data.parent / 'worker_leases.json').values()))['task_id'], 'old')
             self.assertIsNone(leader.poll())
         finally:
             leader.terminate(); leader.wait()
@@ -133,6 +153,10 @@ class RecoveryTests(unittest.TestCase):
             worker.admit(data, 'work', '/repo', 'old', devctl.task_state)
             with self.assertRaises(RuntimeError): worker.admit(data, 'work', '/repo', 'new', devctl.task_state)
             (task / 'exit_code').write_text('1')
+            # An exit marker cannot release an unbound live process. Once the
+            # process is demonstrably absent, the legacy lease can be freed.
+            with self.assertRaises(RuntimeError): worker.admit(data, 'work', '/repo', 'new', devctl.task_state)
+            write_json(task / 'meta.json', {'pid': 99999999, 'machine': 'work'})
             worker.admit(data, 'work', '/repo', 'new', devctl.task_state)
 
     def test_telegram_crash_after_acceptance_restart_does_not_resend(self):

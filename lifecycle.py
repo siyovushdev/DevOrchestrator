@@ -12,7 +12,7 @@ import devctl
 import worker_runtime
 
 KNOWN_FILES = {'meta.json', 'events.jsonl', 'exit_code', 'prompt.txt', 'report.json', 'remote-refresh.lock',
-               'liveness.json', 'liveness.lock', 'runtime_health.json'}
+               'liveness.json', 'liveness.lock', 'runtime_health.json', 'process_group.json', 'runtime_audit.json'}
 WORK_QUEUE_LABEL = 'work:queued'
 
 

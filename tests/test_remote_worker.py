@@ -3,6 +3,8 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import shlex
+import signal
 import tempfile
 import time
 import unittest
@@ -11,7 +13,7 @@ from unittest.mock import patch
 import devctl
 from durable import write_json
 import remote_worker as r
-from worker_runtime import process_identity
+from worker_runtime import process_identity, group_members
 from tests_helpers import proc_fixture
 
 
@@ -38,6 +40,23 @@ class RemoteWorkerTests(unittest.TestCase):
         self.assertEqual(report['status'], 'DONE')
         self.assertEqual(sentinel.read_text(), 'x')
         self.assertIn('final result', __import__('base64').b64decode(report['chunk']).decode())
+
+    def test_registered_worker_cleans_only_its_terminal_owned_group(self):
+        source = 'import subprocess,sys; subprocess.Popen([sys.executable,"-c","import time; time.sleep(60)"]); print("final result")'
+        launch = self.rpc('start', value=shlex.join([sys.executable, '-c', source]))
+        def finish():
+            try: os.killpg(launch['pid'], signal.SIGKILL)
+            except ProcessLookupError: pass
+        self.addCleanup(finish)
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            report = self.rpc('report')
+            if report['status'] == 'DONE' and report.get('cleanup_state') in ('CLEANED', 'ABSENT'): break
+            time.sleep(.02)
+        self.assertEqual(report['status'], 'DONE')
+        self.assertIn(report['cleanup_state'], ('CLEANED', 'ABSENT'))
+        self.assertFalse(group_members(launch['pid']))
+        self.assertEqual(self.rpc('report')['cleanup_state'], 'ABSENT')
 
     def test_remote_reboot_and_ambiguous_start_are_safe(self):
         directory = self.root / '.local/share/devorchestrator/remote-tasks/task-turn-1'; directory.mkdir(parents=True)
