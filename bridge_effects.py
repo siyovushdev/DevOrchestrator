@@ -15,7 +15,7 @@ def enqueue(state, number, kind, payload, event=None):
     return digest
 
 
-def flush(state, persist, comments, post_comment, transition, telegram, now=None, eligible=None):
+def flush(state, persist, comments, post_comment, transition, telegram, now=None, eligible=None, complete=None, telegram_dispatch=None, telegram_inflight=()):
     now = time.time() if now is None else now
     started = time.monotonic()
     deliveries = 0
@@ -27,15 +27,17 @@ def flush(state, persist, comments, post_comment, transition, telegram, now=None
         chief_reconcile = entry['kind'] == 'chief_comment' and entry['status'] in ('SENDING', 'UNCERTAIN')
         if not chief_reconcile and (entry['status'] in ('DONE', 'UNCERTAIN', 'FAILED') or entry.get('next_attempt', 0) > now):
             continue
+        if entry['kind'] == 'telegram' and entry['status'] == 'SENDING' and key in telegram_inflight:
+            continue
         if entry['kind'] == 'telegram' and entry['status'] == 'SENDING':
             # A crash crossed the send boundary: acceptance cannot be queried by key.
             entry.update(status='UNCERTAIN', diagnostic='Telegram acceptance uncertain; automatic resend suppressed')
             persist()
             continue
-        if eligible is not None and not eligible(entry):
-            continue
         if deliveries >= 5 or time.monotonic() - started >= 5:
             break
+        if eligible is not None and not eligible(entry):
+            continue
         deliveries += 1
         if chief_reconcile:
             expected = entry['payload'] + '\n\n' + f'<!-- DEVORCHESTRATOR_EFFECT_V1 {key} -->'
@@ -77,7 +79,12 @@ def flush(state, persist, comments, post_comment, transition, telegram, now=None
                     post_comment(entry['number'], entry['payload'] + '\n\n' + marker)
             elif entry['kind'] == 'transition':
                 transition(entry['payload']['issue'], entry['payload']['target'])
+            elif entry['kind'] == 'completion':
+                complete(entry['number'])
             elif entry['kind'] == 'telegram':
+                if telegram_dispatch is not None:
+                    telegram_dispatch(key, entry['payload'])
+                    continue  # SENDING is durable; the single writer applies acceptance later.
                 result = telegram(entry['payload'])
                 if result is None:
                     entry.update(status='UNCERTAIN', diagnostic='Telegram acceptance uncertain; automatic resend suppressed')

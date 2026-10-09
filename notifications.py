@@ -109,6 +109,8 @@ def terminal_text(status, issue, item, report=None, blocker=None, *, current_act
             blocker = 'Historical review PASS lacks owner approval or reviewed-tree evidence. Send a trusted follow-up for a fresh independent review before publication.'
         elif item['owner_state'] != 'READY_FOR_OWNER':
             status = item['owner_state']
+    if status == 'CHIEF_REVIEW_REQUIRED':
+        blocker = None
     no_publication_required = (
         status == 'REVIEW_PASSED / READY_FOR_OWNER'
         and publication_delta_present(item, report) is False
@@ -128,6 +130,9 @@ def terminal_text(status, issue, item, report=None, blocker=None, *, current_act
         next_action = None if current_action == 'NONE' else current_action
     if next_action:
         lines.append("Next owner action: " + next_action)
+    if status == 'CHIEF_REVIEW_REQUIRED':
+        lines.append('Chief review is required. Open or continue ChatGPT to review the complete bundle.')
+        lines.append('Bundle: ' + str((item.get('chief_review') or {}).get('identity', {}).get('bundle_id', '?'))[:16])
     if no_publication_required:
         lines.append("Publication: NOT_REQUIRED (no repository delta)")
     values = [('Model', report.get('model') or item.get('model')),

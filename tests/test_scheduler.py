@@ -97,6 +97,46 @@ class SchedulerTests(unittest.TestCase):
                     self.assertFalse(s.release('5'))
                     self.assertEqual(s.locks['repo']['owner'], '5')
 
+    def test_post_merge_hold_survives_recovery_archival_and_missing_lock(self):
+        for status in ('PENDING', 'BLOCKED'):
+            for archived in (False, True):
+                with self.subTest(status=status, archived=archived):
+                    state = {'issues': {'5': {'owner_state': 'MERGED', 'merged': True,
+                             'issue_closed': archived, 'post_merge_convergence': {'status': status}}}}
+                    s = Scheduler(state, self.s.limits)
+                    s.hold_publication_repository('5', 'work', 'repo')
+                    s.enqueue('next', '3', 'coding', 'work', 'repo')
+                    s.locks.clear()  # Repair records produced by the previous release bug.
+                    self.assertTrue(s.repository_busy('3', 'work', 'repo'))
+                    with self.assertRaises(QueueWait): s.reserve('next')
+                    s = Scheduler(state, self.s.limits)
+                    s.recover([])
+                    self.assertFalse(s.release('5'))
+                    self.assertEqual(s.locks['repo']['owner'], '5')
+                    self.assertIn('post-merge', state['scheduler_diagnostics']['repo'])
+                    state['issues']['5']['post_merge_convergence']['status'] = 'DONE'
+                    s.recover([])
+                    self.assertNotIn('repo', s.locks)
+                    self.assertNotIn('repo', state['scheduler_diagnostics'])
+                    s.reserve('next')
+
+    def test_publication_hold_cannot_steal_another_owner_repository(self):
+        self.job('other', 'repo'); self.s.reserve('other')
+        with self.assertRaises(QueueWait):
+            self.s.hold_publication_repository('5', 'work', 'repo')
+        self.assertEqual(self.s.locks['repo']['owner'], 'other')
+
+    def test_not_required_must_explicitly_exclude_convergence_before_release(self):
+        import operational_state
+        for required, released in ((True, False), (None, False), (False, True)):
+            with self.subTest(required=required):
+                item = {'owner_state': 'MERGED', 'merged': True,
+                        'post_merge_convergence': {'status': 'NOT_REQUIRED', 'required': required}}
+                s = Scheduler({'issues': {'5': item}}, self.s.limits)
+                s.hold_publication_repository('5', 'work', 'repo')
+                self.assertEqual(operational_state.merge_convergence_complete(item), released)
+                self.assertEqual(s.release('5'), released)
+
     def test_missing_queue_diagnostic_clears_when_ownership_is_proven(self):
         for item in ({'review_status': 'RUNNING'},
                      {'review_status': 'PASS', 'chief_required': True, 'chief_status': 'AWAITING_CHIEF_REVIEW'}):

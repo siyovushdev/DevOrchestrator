@@ -550,11 +550,13 @@ def spawn_runtime(directory, meta, command, log_file):
     return spawn_detached('exec ' + runner, log_file)
 
 
-def list_tasks(as_json=False, show_all=False, cached=False):
+def list_tasks(as_json=False, show_all=False, cached=False, control=False, control_project=None):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    reconcile_workers()
+    if not control:
+        reconcile_workers()
 
     rows = []
+    scope = load_projects()[control_project] if control_project else None
 
     directories = [p for p in DATA_DIR.iterdir() if p.name != "archives"]
     if (DATA_DIR / "archives").exists():
@@ -581,8 +583,16 @@ def list_tasks(as_json=False, show_all=False, cached=False):
                          'exit_code': None, 'archived': directory.parent.name == 'archives'})
             continue
 
+        if scope and meta['machine'] != scope['machine']:
+            continue
         try:
             state, exit_code = task_state(meta, directory, refresh_remote=not cached)
+            if control and state in ('DONE', 'FAILED'):
+                # A control read never performs historical process cleanup. It
+                # blocks on surviving/uncertain ownership until heavy recovery
+                # supplies cleanup proof, including terminal wrapper children.
+                if not worker_runtime.publication_safe(directory, meta):
+                    state, exit_code = 'UNKNOWN', None
             if meta.get('remote_key') and not cached:
                 reconcile_remote_observation(directory, meta, state, exit_code)
         except Exception:
@@ -609,6 +619,14 @@ def list_tasks(as_json=False, show_all=False, cached=False):
             "consistency_diagnostic": meta.get('consistency_diagnostic'),
         })
 
+    if control:
+        present = {p.name for p in directories if p.is_dir()}
+        for lease in read_json(DATA_DIR.parent / 'worker_leases.json', {}).values():
+            if not isinstance(lease, dict):
+                raise ValueError('Worker lease identity unavailable')
+            if lease.get('task_id') not in present:
+                rows.append(dict(id='missing-lease-' + str(lease.get('task_id')), status='UNKNOWN',
+                                 machine=lease.get('machine', '-'), project='-', workspace=None))
     rows.sort(
         key=lambda x: x.get("updated_at") or x.get("created_at") or "",
         reverse=True,
@@ -1187,6 +1205,11 @@ def status(task_id, as_json=False, issue=False):
             print(f"Review: {view['reviewer']} | task {view['review_task']} | round {view['review_round']} | Chief: {view['chief_state']} / {view['chief_bundle']}")
             print(f"Runtime: coding {health.get('state')} ({health.get('reason')}) | review {view['review_runtime'].get('state')} | cleanup {health.get('cleanup_state')} | queue {json.dumps(view['queue'])} | locks {len(view['locks'])}")
             print(f"Publication: {view['publication']} | next action: {view['next_action']} | projection: {view['projection'].get('health')}")
+            timings = {row['stage']: row['seconds'] for row in view['timings'].get('samples', [])}
+            if timings:
+                print('Timings (seconds): ' + json.dumps(timings, sort_keys=True))
+            if view.get('convergence'):
+                print('Post-merge convergence: ' + json.dumps(view['convergence'], sort_keys=True))
             diagnostics = [view['diagnostics'], view['scheduler_diagnostics'], view['worker_diagnostics'], health.get('diagnostic')]
             if any(diagnostics):
                 print('Diagnostics: ' + json.dumps([v for v in diagnostics if v], ensure_ascii=False))
@@ -1667,6 +1690,8 @@ def main():
     p_tasks = sub.add_parser("tasks")
     p_tasks.add_argument("--json", action="store_true")
     p_tasks.add_argument("--all", dest="show_all", action="store_true")
+    p_tasks.add_argument("--control", action="store_true", help="Read worker ownership without recovery sweeps")
+    p_tasks.add_argument("--control-project", help="Target registered repository for control safety checks")
     p_tasks.add_argument("--cached", action="store_true", help="Use durable remote status without SSH probes")
 
     p_archive = sub.add_parser("archive")
@@ -1740,7 +1765,8 @@ def main():
 
     if args.action == "tasks":
         raise SystemExit(
-            list_tasks(args.json, args.show_all, args.cached)
+            list_tasks(args.json, args.show_all, args.cached, **(
+                {"control": True, "control_project": args.control_project} if args.control else {}))
         )
 
     if args.action == "archive":

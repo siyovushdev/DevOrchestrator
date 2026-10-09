@@ -300,7 +300,8 @@ class BridgeIntegrationTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(TransportError) as error: await self.tick()
         self.assertNotIn('credential-secret', str(error.exception))
         rpc.assert_not_awaited()
-        self.assertEqual(self.h.state, before)
+        self.assertEqual({k: v for k, v in self.h.state.items() if k != 'timings'},
+                         {k: v for k, v in before.items() if k != 'timings'})
         self.h.restart(); await self.tick()
         self.assertEqual(len(self.h.starts), 1)
 
@@ -922,13 +923,21 @@ class BridgeIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.h.issues[number] = self.h.issue(number)
             self.h.issues[number]['labels'] = [label]
             self.h.comments[number] = []
+        sleep = asyncio.sleep
+        cycles = 0
+        async def drive_cycle(delay):
+            nonlocal cycles
+            cycles += 1
+            if self.h.starts or cycles > 20:
+                raise asyncio.CancelledError
+            await sleep(.01)
         with patch.dict('os.environ', {
             'DEVORCHESTRATOR_WORKER': 'work',
             'DEVORCHESTRATOR_WORK_HOST': 'siovush-Thin-15-B12UC',
             'DEVORCHESTRATOR_QUEUE_LABEL': 'work:queued',
         }), patch('lifecycle.socket.gethostname', return_value='siovush-Thin-15-B12UC'), \
              patch.object(b, 'load_state', return_value=self.h.state), \
-             patch.object(b.asyncio, 'sleep', new=AsyncMock(side_effect=asyncio.CancelledError)):
+             patch.object(b.asyncio, 'sleep', new=AsyncMock(side_effect=drive_cycle)):
             with self.assertRaises(asyncio.CancelledError):
                 await b.main()
         self.assertEqual(set(self.h.state['issues']), {'1'})

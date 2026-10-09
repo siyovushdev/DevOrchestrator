@@ -76,7 +76,7 @@ class OperationalBridgeTests(unittest.IsolatedAsyncioTestCase):
             self.h.restart()
             await b.tick(self.h.state)
             item = self.h.state['issues']['5']
-        self.h.telegram.assert_not_called()
+        self.assertEqual(sum(c.args[0].startswith('CHIEF_REVIEW_REQUIRED') for c in self.h.telegram.call_args_list), 1)
         self.h.comments[5].append({'id': '123', 'author': {'login': 'siyovushdev'},
             'createdAt': '2050-01-01T00:00:00Z',
             'body': '<!-- DEVORCHESTRATOR_CHIEF_REVIEW_V1 ' + json.dumps(dict(
@@ -108,7 +108,7 @@ class OperationalBridgeTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn('review_hold', item)
             self.assertEqual([lock['owner'] for lock in self.h.state['repo_locks'].values()], ['5'])
         self.assertTrue(item['chief_review'])
-        self.h.telegram.assert_not_called()
+        self.assertEqual(sum(c.args[0].startswith('CHIEF_REVIEW_REQUIRED') for c in self.h.telegram.call_args_list), 1)
 
     async def test_operator_status_clears_recovered_ownership_diagnostic(self):
         await b.tick(self.h.state)

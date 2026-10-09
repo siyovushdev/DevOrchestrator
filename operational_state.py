@@ -1,4 +1,21 @@
 """Read-only lifecycle policy and operator view over the durable bridge state."""
+from copy import deepcopy
+
+
+def merge_convergence_complete(item):
+    """Missing historical evidence is archival, never proof of completion."""
+    result = item.get('post_merge_convergence') or {}
+    return result.get('status') == 'DONE' or (
+        result.get('status') == 'NOT_REQUIRED' and result.get('required') is False)
+
+
+def post_merge_repository_hold(item):
+    """Keep an attempted merge's workspace fenced even if its issue is archived."""
+    result = item.get('post_merge_convergence') or {}
+    if (result.get('status') == 'NOT_MERGED' and not item.get('merged') and
+            item.get('owner_state') != 'MERGED' and not result.get('master_sha')):
+        return False
+    return item.get('post_merge_convergence') is not None and not merge_convergence_complete(item)
 
 
 def exclusion_reason(item, issue=None):
@@ -8,7 +25,8 @@ def exclusion_reason(item, issue=None):
         return item.get('runtime_exclusion') or 'ISSUE_CLOSED'
     if issue and str(issue.get('state', 'OPEN')).upper() == 'CLOSED':
         return 'ISSUE_CLOSED'
-    if item.get('merged') or item.get('owner_state') == 'MERGED':
+    if (item.get('merged') or item.get('owner_state') == 'MERGED') and (
+            item.get('post_merge_convergence') is None or merge_convergence_complete(item)):
         return 'PUBLICATION_TERMINAL'
     if (item.get('completed_at') or item.get('completed') is True or item.get('superseded') or
             item.get('desired_label') == 'dev:done' or
@@ -38,6 +56,13 @@ def chief_repository_hold(item):
 def lifecycle_state(item):
     if exclusion_reason(item):
         return 'ARCHIVED'
+    if item.get('merged') and not merge_convergence_complete(item):
+        return 'POST_MERGE_BLOCKED'
+    result = item.get('post_merge_convergence') or {}
+    if result.get('status') == 'NOT_MERGED':
+        return 'MERGE_NOT_COMPLETED'
+    if result.get('status') == 'PENDING':
+        return 'MERGE_UNCERTAIN'
     if item.get('coding_status') in ('RUNNING', 'STARTING') or item.get('pending_rpc'):
         return 'RUNNING'
     if item.get('worker_uncertain') or item.get('review_uncertain'):
@@ -65,6 +90,10 @@ def next_action(item, report=None):
         return 'NONE'
     if any(key.startswith('runtime_') for key in item.get('consistency_diagnostics', {})):
         return 'INSPECT_WORKER'
+    if state == 'POST_MERGE_BLOCKED':
+        return 'INSPECT_POST_MERGE_CONVERGENCE'
+    if state in ('MERGE_NOT_COMPLETED', 'MERGE_UNCERTAIN'):
+        return 'INSPECT_MERGE_RESULT'
     if state == 'READY_FOR_OWNER':
         from notifications import review_approval_complete, publication_delta_present
         if not review_approval_complete(item):
@@ -108,6 +137,8 @@ def status_view(state, number, runtime=None):
                            if str(lock.get('owner')) == str(number)], publication=item.get('owner_state'),
         next_action=next_action(item), projection=item.get('projection', {'health': 'UNKNOWN'}),
         diagnostics=item.get('consistency_diagnostics', {}),
+        convergence=item.get('post_merge_convergence'),
+        timings=deepcopy(state.get('timings', {'samples': []})),
         scheduler_diagnostics={repo: state.get('scheduler_diagnostics', {}).get(repo)
             for repo, lock in state.get('repo_locks', {}).items() if str(lock.get('owner')) == str(number)
             and repo in state.get('scheduler_diagnostics', {})})

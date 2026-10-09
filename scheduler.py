@@ -81,12 +81,30 @@ class Scheduler:
     def repository_busy(self, owner, machine, repo):
         # An unresolved workspace may alias any repository on its registered machine.
         # If even that machine is unknown, hold all new admissions until reconciliation.
+        from operational_state import post_merge_repository_hold
         return (self.locks.get(repo, {}).get('owner', owner) != owner or
+                any(j.get('repo') == repo and j['owner'] != owner and
+                    post_merge_repository_hold(self.state.get('issues', {}).get(str(j['owner']), {}))
+                    for j in self.jobs.values()) or
                 any(j['status'] in ('RESERVED', 'RUNNING', 'UNKNOWN') and
                     ((j.get('identity_pending') and j.get('machine') in (None, machine)) or
                      (j['repo'] == repo and j['owner'] != owner)) for j in self.jobs.values()))
 
+    def hold_publication_repository(self, owner, machine, repo):
+        """Reacquire ownership before MERGE; this receipt is not a worker slot."""
+        if self.repository_busy(owner, machine, repo):
+            raise QueueWait()
+        key = 'publication:' + str(owner)
+        job = self.enqueue(key, owner, 'publication', machine, repo)
+        if (job['owner'], job['machine'], job['repo']) != (owner, machine, repo):
+            raise ValueError('Publication repository identity changed')
+        job['status'] = 'DONE'
+        self.locks[repo] = {'owner': owner, 'key': key}
+
     def available(self, job):
+        from operational_state import post_merge_repository_hold
+        if post_merge_repository_hold(self.state.get('issues', {}).get(str(job['owner']), {})):
+            return False
         active = [j for j in self.jobs.values() if j['status'] in ('RESERVED', 'RUNNING', 'UNKNOWN')]
         limit = self.limits.coding if job['kind'] == 'coding' else self.limits.review
         return (not self.repository_busy(job['owner'], job['machine'], job['repo']) and
@@ -132,11 +150,11 @@ class Scheduler:
                 job['status'] = 'UNKNOWN'
 
     def release(self, owner):
-        from operational_state import chief_repository_hold
+        from operational_state import chief_repository_hold, post_merge_repository_hold
         item = self.state.get('issues', {}).get(str(owner))
-        if item is not None and chief_repository_hold(item):
+        if item is not None and (post_merge_repository_hold(item) or chief_repository_hold(item)):
             # Both recovery and process_tracked's finally block use this path.
-            # PASS persistence precedes Chief enrollment and cannot release it.
+            # Review/merge milestones alone cannot release an unproven workspace.
             return False
         if any(j['owner'] == owner and (j['status'] in ('RESERVED', 'RUNNING', 'UNKNOWN') or
                                        j.get('runtime_cleanup_pending')) for j in self.jobs.values()):
@@ -146,8 +164,9 @@ class Scheduler:
                 del self.locks[repo]
         return True
 
-    def recover(self, tasks):
+    def recover(self, tasks, identity_resolver=None):
         """Import active legacy/direct tasks; never steal an uncertain lock."""
+        identity_resolver = identity_resolver or project_identity
         for task in tasks:
             project = task.get('project')
             matching = [j for j in self.jobs.values() if j.get('task_id') == task['id']]
@@ -159,7 +178,7 @@ class Scheduler:
                 try:
                     if not project or project == '-':
                         project = registered_project(task)
-                    machine, repo = project_identity(project)
+                    machine, repo = identity_resolver(project)
                 except Exception:
                     # Failure is isolated to this task, never discarded or treated as a free slot.
                     try:
@@ -182,6 +201,13 @@ class Scheduler:
                 if job['status'] in ('DONE', 'FAILED'):
                     self.release(job['owner'])
         diagnostics = self.state.setdefault('scheduler_diagnostics', {})
+        from operational_state import post_merge_repository_hold
+        # Repair a previously released lock from durable queue ownership. The
+        # admission predicate also honors this hold before recovery can run.
+        for key, job in self.jobs.items():
+            if job.get('repo') and post_merge_repository_hold(
+                    self.state.get('issues', {}).get(str(job['owner']), {})):
+                self.locks.setdefault(job['repo'], {'owner': job['owner'], 'key': key})
         for repo, lock in list(self.locks.items()):
             jobs = [j for j in self.jobs.values() if j.get('repo') == repo and j.get('owner') == lock.get('owner')]
             if not jobs:
@@ -190,6 +216,11 @@ class Scheduler:
             if diagnostics.get(repo) == 'Lock retained: missing queue ownership proof':
                 diagnostics.pop(repo)
             item = self.state.get('issues', {}).get(str(lock.get('owner')))
+            if item is not None and post_merge_repository_hold(item):
+                diagnostics[repo] = 'Lock retained: post-merge convergence is unproven'
+                continue
+            if diagnostics.get(repo) == 'Lock retained: post-merge convergence is unproven':
+                diagnostics.pop(repo)
             from operational_state import exclusion_reason
             archived = item is not None and exclusion_reason(item)
             if item is not None and not archived:

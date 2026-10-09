@@ -27,6 +27,7 @@
     "machine": "work",
     "workspace": "/home/siovush/DevOrchestrator-dev",
     "default_agent": "codex",
-    "description": "Isolated DevOrchestrator development worktree"
+    "description": "Isolated DevOrchestrator development worktree",
+    "long_lived_branch": "dev/self-development"
   }
 }

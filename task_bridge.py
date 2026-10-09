@@ -12,6 +12,7 @@ from pathlib import Path
 import notifications
 import bridge_effects
 import chief_review
+from bridge_timing import measure, record as record_timing
 from operational_state import exclusion_reason, lifecycle_state, next_action, notification_fingerprint
 from github_transport import GitHubTransport
 from lifecycle import WORK_QUEUE_LABEL, worker_guard
@@ -147,7 +148,8 @@ def notify(status, issue, item, report=None, blocker=None):
         # action and checks the durable semantic identity, never trusts text.
         item['notification_report'] = redact_data({k: (report or {}).get(k) for k in
             ('id', 'agent', 'model', 'reasoning_effort', 'session_id', 'git_baseline', 'created_at', 'updated_at')})
-        fingerprint = notification_fingerprint(item)
+        fingerprint = (item['chief_review']['identity']['bundle_id'] if status == 'CHIEF_REVIEW_REQUIRED'
+                       else notification_fingerprint(item))
         event = [status, fingerprint, blocker]
         key = bridge_effects.enqueue(state, number, "telegram", text, event)
         state['outbox'][key]['notification'] = dict(status=status, fingerprint=fingerprint,
@@ -616,6 +618,7 @@ def invalidate_quality_gates(item):
             "pr_url": item.get("pr_url"),
             "review_hold": item.get("review_hold"), "review_task_id": item.get("review_task_id"),
             "coding_turn": item.get("review_coding_turn"),
+            "post_merge_convergence": (item.get('post_merge_convergence') or {}).copy(),
         })
     chief_review.invalidate(item)
     item["autopilot_corrections"] = 0
@@ -637,6 +640,9 @@ def invalidate_quality_gates(item):
     item['last_report_signature'] = None
     item.pop("review_hold", None)
     item["publication_journal"] = {}
+    convergence = item.get('post_merge_convergence') or {}
+    if convergence.get('status') == 'NOT_MERGED' and not convergence.get('master_sha'):
+        item.pop('post_merge_convergence', None)
 
 
 def coding_report_successful(report, item):
@@ -950,6 +956,20 @@ def prepare_notification(entry, item, issue=None):
              'COMMITTED', 'PUSHED', 'PR_CREATED', 'MERGED'}
     if not notification and entry['payload'].split('\n', 1)[0] not in known:
         return True  # Existing independent transport/recovery diagnostics.
+    if notification and notification['status'] == 'CHIEF_REVIEW_REQUIRED':
+        record = item.get('chief_review') or {}
+        try:
+            identity = chief_review.validate_identity(record['identity'], item)
+        except (ValueError, KeyError, TypeError):
+            return False
+        if (exclusion_reason(item, issue) or not record.get('complete') or record.get('verdict') or
+                item.get('chief_status') != 'AWAITING_CHIEF_REVIEW' or
+                notification['fingerprint'] != identity.bundle_id):
+            return False
+        view = issue or notification['issue']
+        entry['payload'] = redact(notifications.terminal_text('CHIEF_REVIEW_REQUIRED', view, item,
+            current_action='OPEN_CHATGPT_FOR_CHIEF_REVIEW'))
+        return True
     if notification and notification['fingerprint'] != notification_fingerprint(item):
         return False
     action = next_action(item)
@@ -1015,12 +1035,43 @@ def add_comment(number, body):
     save_state(state)
 
 
-def flush_effects(state, reconciled=True):
+
+def restore_merged_state(item, state):
+    """Replay a persisted executor result without repeating any Git operation."""
+    journal = (item.get('publication_journal') or {}).get('MERGE') or {}
+    if (item.get('merged') is True and (journal.get('command') or {}).get('action') == 'MERGE' and
+            item.get('owner_state') != 'MERGED'):
+        item['owner_state'] = 'MERGED'
+        journal['done'] = True
+        save_state(state)
+
+
+def merge_complete(item):
+    from operational_state import merge_convergence_complete
+    return item.get('owner_state') == 'MERGED' and item.get('merged') and merge_convergence_complete(item)
+
+
+def project_merge(issue, item, state):
+    """Completion is a durable projection only, independent of Git history."""
+    if not merge_complete(item):
+        return
+    item.setdefault('completed_at', datetime.now(timezone.utc).isoformat())
+    item['desired_label'] = 'dev:done'
+    bridge_effects.enqueue(state, issue['number'], 'completion', {'number': issue['number']},
+                          ['merged', item.get('task_id'), item.get('commit_sha')])
+    save_state(state)
+
+
+def flush_effects(state, reconciled=True, control_fresh=None, telegram_dispatch=None, telegram_inflight=()):
     suppressed = False
     for entry in state.get('outbox', {}).values():
         item = state.get('issues', {}).get(str(entry['number']), {})
         if not isinstance(item, dict):
             item = {}
+        if entry['kind'] == 'completion' and merge_complete(item):
+            continue
+        if entry['kind'] == 'telegram' and entry['status'] == 'SENDING':
+            continue
         if entry['status'] not in ('DONE', 'UNCERTAIN', 'FAILED') and exclusion_reason(item):
             entry.update(status='DONE', diagnostic='Suppressed: archived task')
             suppressed = True
@@ -1061,11 +1112,33 @@ def flush_effects(state, reconciled=True):
             raise
     def eligible(entry):
         item = state.get('issues', {}).get(str(entry['number']), {})
+        if entry['kind'] == 'completion':
+            return bool(merge_complete(item))
+        if entry['kind'] == 'telegram' and telegram_dispatch is not None and len(telegram_inflight) >= 4:
+            return False
         if exclusion_reason(item):
             return False
         if entry['kind'] == 'transition' and item.get('desired_label', entry['payload']['target']) != entry['payload']['target']:
             entry.update(status='DONE', diagnostic='Superseded projection')
             save_state(state)
+            return False
+        if entry['kind'] == 'chief_comment':
+            record = item.get('chief_review') or {}
+            if not isinstance(record, dict) or chief_review.malformed_runtime(item):
+                return False
+            current_effect = any(state.get('outbox', {}).get(key) is entry and
+                chief_effect_valid(state, entry['number'], record, index)
+                for index, key in enumerate(record.get('effects', [])))
+            if not current_effect:
+                if entry['status'] == 'PENDING':
+                    entry.update(status='DONE', diagnostic='Chief evidence superseded before send')
+                    save_state(state)
+                return False
+        if control_fresh is not None and str(entry['number']) not in control_fresh and (
+                entry['kind'] == 'chief_comment' or
+                (entry['kind'] == 'telegram' and (entry.get('notification') or {}).get('status') in
+                    ('CHIEF_REVIEW_REQUIRED', 'REVIEW_PASSED / READY_FOR_OWNER')) or
+                (entry['kind'] == 'transition' and entry['payload']['target'] == 'dev:ready-for-review')):
             return False
         if entry['kind'] in ('telegram', 'comment', 'chief_comment'):
             # A fresh issue observation at the send boundary prevents a close
@@ -1080,6 +1153,26 @@ def flush_effects(state, reconciled=True):
                 return False
             if not current or archive_issue(current, item, state):
                 return False
+            if entry['kind'] == 'telegram' and (entry.get('notification') or {}).get('status') == 'CHIEF_REVIEW_REQUIRED':
+                # A verdict may arrive between polling and delivery. Suppress the
+                # wake-up without granting approval from this transport read.
+                identity = (item.get('chief_review') or {}).get('identity') or {}
+                if not chief_tree_current(item, state, str(entry['number'])):
+                    return False
+                try:
+                    for comment in issue_comments(entry['number']):
+                        if not authorized_comment(comment) or chief_review.is_evidence_comment(comment.get('body')):
+                            continue
+                        try:
+                            verdict = chief_review.parse_verdict(comment.get('body'))
+                        except ValueError:
+                            continue
+                        if verdict and verdict['bundle_id'] == identity.get('bundle_id'):
+                            entry.update(status='DONE', diagnostic='Chief verdict arrived before wake-up delivery')
+                            save_state(state)
+                            return False
+                except Exception:
+                    return False
             if entry['kind'] == 'telegram' and not prepare_notification(entry, item, current):
                 entry.update(status='DONE', diagnostic='Notification superseded before send')
                 item.setdefault('consistency_diagnostics', {})['notification'] = 'Superseded notification dropped'
@@ -1114,8 +1207,30 @@ def flush_effects(state, reconciled=True):
         else:
             raw_add_comment(number, body)
 
-    bridge_effects.flush(state, lambda: save_state(state), issue_comments,
-                        post, transition, send_telegram, eligible=eligible)
+    def complete(number):
+        item = state['issues'][str(number)]
+        if not merge_complete(item):
+            raise ValueError('Completion has no durable convergence proof')
+        current = fetch_issue(number)
+        marker = '<!-- DEVORCHESTRATOR_MERGE_COMPLETE ' + hashlib.sha256(
+            json.dumps([str(number), item.get('task_id'), item.get('commit_sha')]).encode()).hexdigest() + ' -->'
+        if not any(marker in (c.get('body') or '') and not chief_review.is_evidence_comment(c.get('body'))
+                   for c in issue_comments(number)):
+            raw_add_comment(number, 'Owner action MERGE: ALLOWED; state MERGED. Workflow completed.\n\n' + marker)
+        raw_transition_issue(current, 'dev:done')
+        if str(current.get('state', '')).upper() != 'CLOSED':
+            gh('issue', 'close', str(number), '-R', REPO)
+        observed = fetch_issue(number)
+        if str(observed.get('state', '')).upper() != 'CLOSED' or label_names(observed) & STATE_LABELS != {'dev:done'}:
+            raise ValueError('Completion projection not confirmed')
+        item['projection'] = {'health': 'SYNCED', 'target': 'dev:done', 'failures': 0}
+    def timed_send(text):
+        with measure(state, 'telegram_callback'):
+            return send_telegram(text)
+    with measure(state, 'outbox_flush'):
+        bridge_effects.flush(state, lambda: save_state(state), issue_comments,
+                            post, transition, timed_send, eligible=eligible, complete=complete,
+                            telegram_dispatch=telegram_dispatch, telegram_inflight=telegram_inflight)
     for number, item in state.get('issues', {}).items():
         if not isinstance(item, dict) or exclusion_reason(item):
             continue
@@ -1287,6 +1402,11 @@ async def mcp_call(name, arguments):
             save_state(state)
         return result
     state, number, item = WORK_CONTEXT
+    from operational_state import post_merge_repository_hold
+    if post_merge_repository_hold(item):
+        # Keep the original quality gates and merge journal intact for retry.
+        # No coding/review turn may start on a possibly half-updated workspace.
+        raise QueueWait()
     arguments = dict(arguments)
     operation = arguments.pop("_operation", "initial")
     kind = arguments.get("role", "coding")
@@ -1297,7 +1417,7 @@ async def mcp_call(name, arguments):
         observe_coding_turn(item, state, current)
         if not coding_report_successful(current, item) or item.get('review_coding_turn') != current.get('turns'):
             raise QueueWait()
-    machine, repo = project_identity(arguments.get("project") or item["project"])
+    machine, repo = await asyncio.to_thread(project_identity, arguments.get("project") or item["project"])
     key = hashlib.sha256(f"{REPO}:{number}:{name}:{operation}".encode()).hexdigest()
     scheduler = Scheduler(state)
     job = scheduler.enqueue(key, number, kind, machine, repo)
@@ -1340,6 +1460,9 @@ def fetch_issue(number):
 
 def issue_comments(number):
     adapter = github_task_transport()
+    if WORK_CONTEXT:
+        with measure(WORK_CONTEXT[0], 'github_command_read'):
+            return adapter.issue_comments(adapter.issue_ref(number))
     return adapter.issue_comments(adapter.issue_ref(number))
 
 
@@ -1625,7 +1748,14 @@ def chief_effect_valid(state, number, record, index):
             chief_effect_key(number, record['identity']['bundle_id'], index, entry['payload']) == key)
 
 
-async def process_chief_review(issue, item, state, report):
+def chief_backfill_pending(item):
+    """Unpublished independent PASS stays on the heavy path until evidence exists."""
+    return (not exclusion_reason(item) and item.get('review_status') == 'PASS' and
+            not item.get('chief_review') and not item.get('publication_journal') and
+            item.get('owner_state') not in OWNER_STATE_SEQUENCE[1:])
+
+
+async def process_chief_review(issue, item, state, report, *, allow_evidence=True, evidence=None):
     """Backfill pending independent PASS before the existing owner flow executes.
 
     Reuse its task/turn/round/tree; historical or interrupted publication is not
@@ -1636,6 +1766,13 @@ async def process_chief_review(issue, item, state, report):
     if item.get('owner_state') in OWNER_STATE_SEQUENCE[1:] or item.get('publication_journal'):
         return False
     if item.get('review_status') != 'PASS':
+        return False
+    if not allow_evidence and not item.get('chief_review'):
+        # Legacy independent approval cannot authorize publication during the
+        # evidence gap. Only the heavy reader can build the missing Chief record;
+        # there is no Chief ownership for the control caller to act on yet.
+        item['chief_required'] = True
+        save_state(state)
         return False
     current = await mcp_call('get_task_report', {'task_id': item['task_id']})
     observe_coding_turn(item, state, current)
@@ -1659,7 +1796,7 @@ async def process_chief_review(issue, item, state, report):
     from devctl import DATA_DIR
     with exclusive(DATA_DIR.parent / 'worker.lock', blocking=True):
         repository = Repository(item['project'], report)
-        snapshot = repository.snapshot()
+        snapshot = await asyncio.to_thread(repository.snapshot)
         if snapshot != item['reviewed_tree']:
             stale_chief(item, state, str(issue['number']), 'Repository changed after independent PASS; fresh review required.')
             return True
@@ -1680,11 +1817,13 @@ async def process_chief_review(issue, item, state, report):
                     data = None  # Durable PASS/tree evidence does not depend on log retention.
                 item['independent_review_summary'] = chief_review.sanitize(data['summary'])[:2000] if (
                     data and data['verdict'] == 'PASS') else 'Independent PASS recorded in durable bridge state; reviewer summary unavailable.'
-            evidence = repository.review_evidence(snapshot)
+            if evidence is None:
+                with measure(state, 'chief_evidence'):
+                    evidence = repository.review_evidence(snapshot)
             bodies = chief_review.evidence_comments(identity, item['project'],
                 repository.cfg.get('github_repo') or snapshot.get('origin') or '(local registered repository)',
                 item, report, evidence)
-            if repository.snapshot() != snapshot:
+            if await asyncio.to_thread(repository.snapshot) != snapshot:
                 stale_chief(item, state, str(issue['number']), 'Repository changed during Chief evidence extraction; fresh review required.')
                 return True
             keys = [bridge_effects.enqueue(state, issue['number'], 'chief_comment', body,
@@ -1770,6 +1909,7 @@ async def process_chief_review(issue, item, state, report):
     if not accepted:
         item['chief_status'] = 'AWAITING_CHIEF_REVIEW'
         transition_issue(issue, 'dev:awaiting-chief-review')
+        notify('CHIEF_REVIEW_REQUIRED', issue, item, report)
         return True
     if accepted['data']['verdict'] == 'PASS':
         item.update(chief_status='PASS', owner_state=OWNER_STATE_READY,
@@ -1814,7 +1954,10 @@ async def process_owner_actions(issue, item, state, report):
             'Historical review PASS lacks owner approval or reviewed-tree evidence. Send a trusted follow-up for a fresh independent review before publication.', report)
         return
     if item.get("owner_state") in OWNER_STATE_SEQUENCE[1:]:
-        notify(item["owner_state"], issue, item, report)
+        if item.get('merged') and not merge_complete(item):
+            notify('POST_MERGE_BLOCKED', issue, item, report, item.get('owner_blocker'))
+        else:
+            notify(item["owner_state"], issue, item, report)
     processed = set(item.get("processed_owner_actions") or [])
     for comment in issue_comments(issue["number"]):
         if chief_review.is_evidence_comment(comment.get('body')):
@@ -1830,6 +1973,8 @@ async def process_owner_actions(issue, item, state, report):
                 # Defer the answer to process_followup so it follows the coding resume path.
                 continue
             plan = owner_action_plan(item.get("owner_state"), command["action"])
+            if command['action'] == 'MERGE' and item.get('merged') and not merge_complete(item):
+                plan = {'status': 'ALLOWED', 'next_state': 'MERGED'}
             if plan["status"] == "REJECTED":
                 raise PublicationError(plan["reason"])
             if plan["status"] == "ALLOWED":
@@ -1848,7 +1993,7 @@ async def process_owner_actions(issue, item, state, report):
                         if not coding_report_successful(current_report, item) or not chief_review.approval_complete(item):
                             raise PublicationError('Coding turn changed before owner publication; fresh quality gates required')
                     repository = Repository(item["project"], report)
-                    tasks = await transport_call("list_tasks", {})
+                    tasks = await transport_call("list_tasks", {"control": True, "project": item["project"]})
                     for task in tasks:
                         if (task.get("status") not in ("RUNNING", "UNKNOWN", "STARTING") and
                                 task.get('cleanup_state') != 'AMBIGUOUS'):
@@ -1862,14 +2007,22 @@ async def process_owner_actions(issue, item, state, report):
                             raise PublicationError("Worker repository identity is uncertain")
                         if (active_machine, active_repo) == (machine, repo_key):
                             raise PublicationError("Registered workspace has active or uncertain worker work")
-                    publish(repository, item, report, command, lambda: save_state(state))
+                    with measure(state, 'publication_action'):
+                        if command['action'] == 'MERGE':
+                            Scheduler(state).hold_publication_repository(str(issue['number']), machine, repo_key)
+                            save_state(state)
+                        publish(repository, item, report, command, lambda: save_state(state))
                 item["owner_state"] = plan["next_state"]
                 if item["owner_state"] == "MERGED":
-                    item["completed_at"] = datetime.now(timezone.utc).isoformat()
+                    if merge_complete(item):
+                        project_merge(issue, item, state)
+                    else:
+                        item['owner_blocker'] = (item.get('post_merge_convergence') or {}).get('diagnostic') or 'PR merged; explicit post-merge convergence result unavailable'
+                        notify('POST_MERGE_BLOCKED', issue, item, report, item['owner_blocker'])
             processed.add(cid)
             item["processed_owner_actions"] = sorted(processed)
             save_state(state)
-            if plan["status"] == "ALLOWED":
+            if plan["status"] == "ALLOWED" and not (item.get("merged") and not merge_complete(item)):
                 notify(item["owner_state"], issue, item, report)
             add_comment(issue["number"], f"Owner action {command['action']}: {plan['status']}; state {item['owner_state']}")
         except (ValueError, PublicationError) as exc:
@@ -1886,6 +2039,11 @@ async def process_owner_actions(issue, item, state, report):
 
 async def process_followup(issue, item, state, report):
     if exclusion_reason(item, issue):
+        return report
+    from operational_state import post_merge_repository_hold
+    if post_merge_repository_hold(item):
+        # Defer without consuming comments or invalidating gates. Owner commands
+        # must still run to resolve an uncertain merge or retry convergence.
         return report
     if report.get("status") not in ("DONE", "FAILED") or item.get("review_status") == "RUNNING":
         return report
@@ -2227,7 +2385,7 @@ async def start_independent_review(
     item["owner_state"] = None
     item["owner_approved_at"] = None
     if not item.get("review_start_tree"):
-        item["review_start_tree"] = Repository(project, coding_report).snapshot()
+        item["review_start_tree"] = await asyncio.to_thread(Repository(project, coding_report).snapshot)
     item['review_coding_turn'] = coding_report['turns']
     save_state(state)
     result = await mcp_call(
@@ -2544,7 +2702,7 @@ Return the review again using the required machine-readable contract.
             if (not coding_report_successful(current, item) or item.get('review_task_id') != review_task_id or
                     item.get('review_coding_turn') != current.get('turns')):
                 return True
-            reviewed = Repository(item["project"], current).snapshot()
+            reviewed = await asyncio.to_thread(Repository(item["project"], current).snapshot)
             if reviewed != item.get("review_start_tree"):
                 await fail_review_loop(issue, item, state,
                                        "Repository changed during independent review; fresh review required", current)
@@ -2785,7 +2943,10 @@ def malformed_item(item):
     return chief_review.malformed_runtime(item)
 
 
-async def process_tracked(issue, item, state, runtime_reports=None):
+async def process_tracked(issue, item, state, runtime_reports=None, *, initial_report=None, chief_evidence=None):
+    restore_merged_state(item, state)
+    if merge_complete(item):
+        project_merge(issue, item, state)
     if archive_issue(issue, item, state):
         return
     global WORK_CONTEXT
@@ -2796,7 +2957,7 @@ async def process_tracked(issue, item, state, runtime_reports=None):
             return
         if item.get("reconciliation_retry", {}).get("next_attempt", 0) > time.time():
             return
-        report = await mcp_call("get_task_report", {"task_id": item["task_id"]})
+        report = initial_report or await mcp_call("get_task_report", {"task_id": item["task_id"]})
         if not reconcile_project(issue, item, state, report):
             return
         observe_coding_turn(item, state, report)
@@ -2831,6 +2992,9 @@ async def process_tracked(issue, item, state, runtime_reports=None):
             user_status, label = terminal_state(report, item)
             transition_issue(issue, label)
 
+        if item.get('merged'):
+            await process_owner_actions(issue, item, state, report)
+            return
         report = await process_followup(
             issue, item, state, report
         )
@@ -2838,7 +3002,7 @@ async def process_tracked(issue, item, state, runtime_reports=None):
         observe_coding_turn(item, state, report)
         if report.get("status") not in ('DONE', 'FAILED'):
             return
-        if await process_chief_review(issue, item, state, report):
+        if await process_chief_review(issue, item, state, report, evidence=chief_evidence):
             return
         await process_owner_actions(issue, item, state, report)
 
@@ -2957,8 +3121,9 @@ async def reconcile_tick(state):
         for issue in issues
     }
 
-    tasks = await mcp_call("list_tasks", {})
-    Scheduler(state).recover(tasks)
+    with measure(state, 'worker_reconciliation'):
+        tasks = await mcp_call("list_tasks", {})
+        Scheduler(state).recover(tasks)
     reports = {task['id']: task for task in tasks}
     save_state(state)
     # GitHub lists newest first; issue number provides stable oldest-first admission.
@@ -2988,6 +3153,9 @@ async def reconcile_tick(state):
             continue
         if not issue:
             continue
+        restore_merged_state(item, state)
+        if merge_complete(item):
+            project_merge(issue, item, state)
         if archive_issue(issue, item, state):
             continue
         if "legacy_value" in item or malformed_item(item):
@@ -3004,7 +3172,320 @@ async def reconcile_tick(state):
             if item.get("queue_status") != "FAILED" and issue.get("state", "OPEN").upper() == "OPEN":
                 await start_queued(issue, state)
         else:
-            await process_tracked(issue, item, state, reports)
+            with measure(state, 'tracked_issue'):
+                await process_tracked(issue, item, state, reports)
+
+
+def reject_unready_commands(issue, item, state, comments=None):
+    """Acknowledge publication requests while external quality gates are closed."""
+    if chief_review.approval_complete(item) and item.get('owner_state'):
+        return
+    processed = set(item.get('processed_owner_actions') or [])
+    for comment in comments if comments is not None else issue_comments(issue['number']):
+        if not authorized_comment(comment) or chief_review.is_evidence_comment(comment.get('body')):
+            continue
+        cid = comment_id(comment)
+        if comment_already_processed(comment, processed):
+            continue
+        try:
+            command = parse_owner_command(comment.get('body'))
+        except ValueError:
+            continue
+        if not command or command['action'] == 'ANSWER':
+            continue
+        processed.add(cid)
+        item['processed_owner_actions'] = sorted(processed)
+        add_comment(issue['number'], 'Owner action ' + command['action'] +
+                    ': REJECTED; current independent review and bound Chief PASS are required.')
+
+
+async def control_pass(state, *, telegram_dispatch=None, telegram_inflight=()):
+    """Only the caller mutates lifecycle state. No global recovery prerequisite."""
+    global WORK_CONTEXT
+    fresh = set()
+    with measure(state, 'control_total'):
+        for number, item in list(state['issues'].items()):
+            WORK_CONTEXT = None
+            if not str(number).isdigit() or not isinstance(item, dict):
+                continue
+            restore_merged_state(item, state)
+            if merge_complete(item):
+                project_merge({'number': int(number)}, item, state)
+                continue
+            if exclusion_reason(item) or malformed_item(item):
+                continue
+            try:
+                with measure(state, 'github_command_read'):
+                    issue = fetch_issue(number)
+                if not issue or archive_issue(issue, item, state):
+                    continue
+                reconcile_projection(issue, item, state)
+                WORK_CONTEXT = (state, number, item)
+                comments = issue_comments(issue['number'])
+                item.setdefault('consistency_diagnostics', {}).pop('control', None)
+                has_followup = False
+                for comment in comments:
+                    if not authorized_comment(comment) or chief_review.is_evidence_comment(comment.get('body')):
+                        continue
+                    if comment_already_processed(comment, set(item.get('processed_followups') or [])):
+                        continue
+                    try:
+                        command = parse_owner_command(comment.get('body'))
+                    except ValueError:
+                        command = None
+                    if FOLLOWUP_MARKER in (comment.get('body') or '') or (command and command['action'] == 'ANSWER'):
+                        has_followup = True
+                if not item.get('chief_review'):
+                    reject_unready_commands(issue, item, state, comments)
+                if not item.get('task_id') or not (item.get('chief_review') or item.get('owner_state') or has_followup):
+                    continue  # Running/recovery observations belong to the heavy reader.
+                with measure(state, 'targeted_control'):
+                    report = await mcp_call('get_task_report', {'task_id': item['task_id']})
+                    if not reconcile_project(issue, item, state, report):
+                        continue
+                    observe_coding_turn(item, state, report)
+                    if project_runtime_health(issue, item, state, report):
+                        continue
+                    if not item.get('merged'):
+                        report = await process_followup(issue, item, state, report)
+                        observe_coding_turn(item, state, report)
+                    if not coding_report_successful(report, item):
+                        reject_unready_commands(issue, item, state)
+                        continue
+                    fresh.add(number)
+                    if not item.get('merged') and await process_chief_review(
+                            issue, item, state, report, allow_evidence=False):
+                        reject_unready_commands(issue, item, state)
+                        continue
+                    reject_unready_commands(issue, item, state)
+                    await process_owner_actions(issue, item, state, report)
+            except Exception:
+                # No failed read supplies approval; a later control poll retries.
+                item.setdefault('consistency_diagnostics', {})['control'] = 'Targeted control observation unavailable'
+            else:
+                item.setdefault('consistency_diagnostics', {}).pop('control', None)
+        WORK_CONTEXT = None
+        # Targeted fresh checks authorize eligible effects even if discovery fails.
+        flush_effects(state, reconciled=True, control_fresh=fresh,
+                      telegram_dispatch=telegram_dispatch, telegram_inflight=telegram_inflight)
+    save_state(state)
+
+
+class ControlLoop:
+    """Single lifecycle writer with asynchronous read-only heavy observations.
+
+    Discovery and SSH/evidence reads receive NO state reference. Finished
+    observations are applied serially, after the control pass. Worker publication
+    safety is re-read at its boundary, never authorized by these observations.
+    A small heavy slice cannot accumulate the cost of all tracked issues.
+    """
+    def __init__(self, state):
+        self.state = state
+        self.discovery = None
+        self.observations = {}
+        self.pending = []
+        self.next_heavy = 0
+        self.telegram_tasks = {}
+
+    def dispatch_telegram(self, key, text):
+        def send():
+            started = time.monotonic()
+            try:
+                result = send_telegram(text)
+            except Exception:
+                result = None
+            return result, time.monotonic() - started
+        self.telegram_tasks[key] = asyncio.create_task(asyncio.to_thread(send))
+
+    def collect_telegram(self):
+        for key, task in list(self.telegram_tasks.items()):
+            if not task.done():
+                continue
+            del self.telegram_tasks[key]
+            result, duration = task.result()
+            record_timing(self.state, 'telegram_callback', duration)
+            entry = self.state['outbox'][key]
+            if result is True:
+                entry['status'] = 'DONE'
+            elif result is False:
+                entry['attempts'] += 1
+                entry.update(status='FAILED' if entry['attempts'] >= 5 else 'PENDING',
+                             next_attempt=time.time() + min(300, 2 ** min(entry['attempts'], 8)))
+            else:
+                entry.update(status='UNCERTAIN', diagnostic='Telegram acceptance uncertain; automatic resend suppressed')
+            save_state(self.state)
+
+    async def discover(self):
+        started = time.monotonic()
+        worker_started = None
+        try:
+            issues = await asyncio.to_thread(open_issues)
+            worker_started = time.monotonic()
+            tasks = await transport_call('list_tasks', {})
+            def resolve():
+                import devctl
+                registry = devctl.load_projects()
+                identities = {}
+                for task in tasks:
+                    if task.get('status') not in ('RUNNING', 'UNKNOWN', 'STARTING') and task.get('cleanup_state') != 'AMBIGUOUS':
+                        continue
+                    try:
+                        project = task.get('project')
+                        if not project or project == '-':
+                            project = registered_project(task)
+                        if project not in identities:
+                            identities[project] = (registry.get(project), project_identity(project))
+                    except Exception:
+                        continue  # Missing identity is held by Scheduler.recover.
+                return identities
+            identities = await asyncio.to_thread(resolve)
+        except Exception:
+            issues, tasks, identities = None, None, {}
+        return (issues, tasks, identities, time.monotonic() - started,
+                time.monotonic() - worker_started if worker_started is not None else 0)
+
+    async def observe(self, number, project, task_id, tree):
+        # Detached arguments only. This coroutine never writes bridge state.
+        started = time.monotonic()
+        report = await transport_call('get_task_report', {'task_id': task_id})
+        evidence, evidence_seconds = None, 0
+        if tree:
+            def extract():
+                repo = Repository(project, report)
+                before = repo.snapshot()
+                if before != tree:
+                    return None
+                result = repo.review_evidence(before)
+                return result if repo.snapshot() == before else None
+            evidence_started = time.monotonic()
+            evidence = await asyncio.to_thread(extract)
+            evidence_seconds = time.monotonic() - evidence_started
+        return report, evidence, time.monotonic() - started, evidence_seconds
+
+    async def step(self):
+        global WORK_CONTEXT
+        self.collect_telegram()
+        await control_pass(self.state, telegram_dispatch=self.dispatch_telegram,
+                           telegram_inflight=self.telegram_tasks)
+        now = time.monotonic()
+        if self.discovery and self.discovery.done():
+            try:
+                issues, tasks, identities, duration, worker_duration = self.discovery.result()
+                record_timing(self.state, 'heavy_total', duration)
+                record_timing(self.state, 'worker_reconciliation', worker_duration)
+                if issues is None:
+                    raise ValueError('Discovery unavailable')
+                self.state.pop('recovery_diagnostic', None)
+                with measure(self.state, 'heavy_total'):
+                    def resolved(project):
+                        import devctl
+                        config, identity = identities[project]
+                        if config != devctl.load_projects().get(project):
+                            raise ValueError('Registry changed since discovery')
+                        return identity
+                    Scheduler(self.state).recover(tasks, identity_resolver=resolved)
+                    for issue in issues:
+                        number = str(issue['number'])
+                        if QUEUE_LABEL in label_names(issue) and number not in self.state['issues']:
+                            self.state['issues'][number] = {'queue_status': 'QUEUED'}
+                    ordered = sorted(self.state['issues'], key=lambda n: (not n.isdigit(), int(n) if n.isdigit() else n))
+                    self.pending.extend(number for number in ordered if number not in self.pending)
+                save_state(self.state)
+            except Exception:
+                self.state['recovery_diagnostic'] = 'Heavy discovery unavailable; targeted controls retain fresh boundary checks'
+            self.discovery = None
+            self.next_heavy = now + 30
+        if self.discovery is None and now >= self.next_heavy:
+            self.discovery = asyncio.create_task(self.discover())
+        # One serial application per cycle. Expensive report/evidence observations
+        # remain in flight across cycles while control continues every ten seconds.
+        for number in list(self.pending):
+            item = self.state['issues'][number]
+            if not isinstance(item, dict):
+                item = self.state['issues'][number] = {'legacy_value': item}
+            if not number.isdigit():
+                item.update(compatibility_status='QUARANTINED', compatibility_diagnostic='Invalid tracked issue identity')
+                self.pending.remove(number)
+                save_state(self.state)
+                continue
+            if malformed_item(item) and not exclusion_reason(item):
+                try:
+                    issue = fetch_issue(number)
+                    if issue and not archive_issue(issue, item, self.state):
+                        quarantine_item(issue, item, self.state, 'Malformed tracked state held for local inspection.')
+                        Scheduler(self.state).release(number)
+                        save_state(self.state)
+                except Exception:
+                    defer_issue(item, self.state, number)
+            if exclusion_reason(item) or malformed_item(item) or item.get('compatibility_status') == 'QUARANTINED':
+                self.pending.remove(number)
+                self.discard_observation(number)
+                continue
+            if item.get('reconciliation_retry', {}).get('next_attempt', 0) > time.time():
+                self.pending.remove(number)
+                continue
+            if item.get('chief_review') or (item.get('owner_state') and not chief_backfill_pending(item)):
+                self.pending.remove(number)  # Control pass owns this phase.
+                self.discard_observation(number)
+                continue
+            if item.get('task_id') and number not in self.observations:
+                if len(self.observations) >= 2:
+                    continue  # Bound background traffic so control RPCs retain capacity.
+                from copy import deepcopy
+                tree = deepcopy(item.get('reviewed_tree')) if item.get('review_status') == 'PASS' else None
+                self.observations[number] = (item.get('coding_turn'), asyncio.create_task(
+                    self.observe(number, item.get('project'), item['task_id'], tree)))
+                continue
+            observation = self.observations.get(number)
+            if observation and not observation[1].done():
+                continue
+            self.pending.remove(number)
+            issue = None
+            try:
+                issue = fetch_issue(number)
+                if not issue or archive_issue(issue, item, self.state):
+                    continue
+                WORK_CONTEXT = (self.state, number, item)
+                with measure(self.state, 'tracked_issue'):
+                    if observation:
+                        turn, task = self.observations.pop(number)
+                        report, evidence, duration, evidence_duration = task.result()
+                        record_timing(self.state, 'chief_evidence', evidence_duration)
+                        if turn != item.get('coding_turn'):
+                            continue
+                        # Missing extraction is a fail-closed retry, not an empty bundle.
+                        if item.get('review_status') == 'PASS' and evidence is None:
+                            diagnostic = 'Repository changed during Chief evidence observation; fresh review required.'
+                            stale_chief(item, self.state, number, diagnostic)
+                            notify('FRESH_REVIEW_REQUIRED', issue, item, report, diagnostic)
+                            continue
+                        await asyncio.wait_for(process_tracked(issue, item, self.state,
+                            initial_report=report, chief_evidence=evidence), timeout=5)
+                    else:
+                        await asyncio.wait_for(start_queued(issue, self.state), timeout=5)
+            except Exception:
+                defer_issue(item, self.state, number)
+                if issue and not item.get('project') and item['reconciliation_retry']['attempts'] >= 3:
+                    quarantine_item(issue, item, self.state, 'Legacy task report unavailable after three bounded attempts; inspect local metadata/registry before recovery.')
+            finally:
+                WORK_CONTEXT = None
+            break
+        save_state(self.state)
+
+    def discard_observation(self, number):
+        observation = self.observations.pop(number, None)
+        if observation:
+            task = observation[1]
+            task.cancel()
+            task.add_done_callback(lambda result: result.exception() if not result.cancelled() else None)
+
+    async def close(self):
+        tasks = [task for _, task in self.observations.values()] + list(self.telegram_tasks.values())
+        if self.discovery:
+            tasks.append(self.discovery)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def main():
@@ -3016,13 +3497,20 @@ async def main():
         flush=True,
     )
 
-    while True:
-        try:
-            await tick(state)
-        except Exception as exc:
-            print(f"[bridge] loop error: {type(exc).__name__}; will retry", flush=True)
-
-        await asyncio.sleep(POLL_SECONDS)
+    loop = ControlLoop(state)
+    deadline = time.monotonic()
+    try:
+        while True:
+            try:
+                await loop.step()
+            except Exception as exc:
+                print(f"[bridge] loop error: {type(exc).__name__}; will retry", flush=True)
+            deadline += POLL_SECONDS
+            if deadline < time.monotonic():
+                deadline = time.monotonic()
+            await asyncio.sleep(max(0, deadline - time.monotonic()))
+    finally:
+        await loop.close()
 
 
 if __name__ == "__main__":
