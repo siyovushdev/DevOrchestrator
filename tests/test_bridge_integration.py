@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import json
 import io
 import os
+import shlex
 from contextlib import redirect_stdout
 from pathlib import Path
 import subprocess
@@ -13,6 +14,7 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 import devctl
+import execution_profiles
 import scheduler
 import task_bridge as b
 from github_transport import GitHubTransport
@@ -28,6 +30,27 @@ class QueueLabelTests(unittest.TestCase):
             b.raw_transition_issue({'number': 1, 'labels': ['work:queued', 'project:test']}, 'dev:running')
         gh.assert_called_once_with('issue', 'edit', '1', '-R', b.REPO,
                                    '--remove-label', 'work:queued', '--add-label', 'dev:running')
+
+
+class ReviewerPolicyTests(unittest.TestCase):
+    def test_missing_policy_keeps_opposite_agent(self):
+        for coding, reviewer in (('codex', 'cursor'), ('cursor', 'codex')):
+            with self.subTest(coding=coding):
+                self.assertEqual(b.reviewer_for(coding), reviewer)
+                self.assertEqual(b.reviewer_for(coding, {}), reviewer)
+
+    def test_explicit_policy_selects_either_agent_for_either_coder(self):
+        for coding in ('codex', 'cursor'):
+            for reviewer in ('codex', 'cursor'):
+                with self.subTest(coding=coding, reviewer=reviewer):
+                    self.assertEqual(b.reviewer_for(coding, {'review_agent': reviewer}), reviewer)
+
+    def test_invalid_policy_never_falls_back(self):
+        for value in ('auto', 'claude', 'Codex', '', None, False, 1, [], {}):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'review_agent.*projects.json'):
+                b.reviewer_for('codex', {'review_agent': value})
+        with self.assertRaisesRegex(ValueError, 'Unsupported coding agent'):
+            b.reviewer_for('unsupported', {})
 
 
 class Harness:
@@ -149,6 +172,143 @@ class BridgeIntegrationTests(unittest.IsolatedAsyncioTestCase):
                    patch.object(b, 'send_telegram', self.h.telegram)]
         for p in patches: p.start(); self.addCleanup(p.stop)
         self.addCleanup(lambda: setattr(b, 'WORK_CONTEXT', None))
+
+    async def test_codex_coding_and_review_use_bundled_profiles_and_fresh_sessions(self):
+        config = dict(machine='work', workspace=str(self.h.repo), default_agent='codex',
+                      review_agent='codex', execution_profile='codex-high')
+        commands = []
+        def spawn(directory, meta, command, log):
+            agent_args = shlex.split(shlex.split(command)[-1])
+            commands.append((meta['role'], agent_args[agent_args.index('codex'):]))
+            log.write((json.dumps({'type': 'thread.started', 'thread_id': 'session-' + meta['id']}) + '\n').encode())
+            log.close()
+            return Mock(pid=0)
+
+        async def transport(name, args):
+            if name == 'preflight_task':
+                return devctl.preflight_task(args['operation'], args['arguments'])
+            if name == 'start_task':
+                with redirect_stdout(io.StringIO()):
+                    devctl.run_project(args['project'], args['prompt'], agent_override=args.get('agent'),
+                                       request_id=args['request_id'], role=args.get('role', 'coding'))
+                result = await self.h.transport(name, args)
+                meta = devctl.load_meta(result['task_id'])
+                output = devctl.task_output(meta, devctl.task_dir(meta['id']))
+                identity = {key: meta[key] for key in ('execution', 'model', 'reasoning_effort')}
+                identity['session_id'] = output['session_id']
+                self.h.tasks[meta['id']].update(identity)
+                result.update(identity)
+                return result
+            return await self.h.transport(name, args)
+
+        with (patch.object(devctl, 'load_projects', return_value={'test': config}),
+              patch.dict(os.environ, {'DEVORCHESTRATOR_MODEL_CATALOG': str(execution_profiles.CATALOG_FILE)}),
+              patch.object(execution_profiles, 'discover', return_value={
+                  'version': 'fixture', 'help': '--model <model> --config <key=value>'}),
+              patch.object(devctl, 'spawn_runtime', side_effect=spawn),
+              patch.object(devctl, 'task_state', return_value=('DONE', 0)),
+              patch.object(devctl.worker_runtime, 'reconcile_task', return_value='ABSENT'),
+              patch.object(b, 'transport_call', transport)):
+            item = await self.running_review()
+            coder, reviewer = item['task_id'], item['review_task_id']
+            self.assertNotEqual(coder, reviewer)
+            self.assertNotEqual(self.h.tasks[coder]['session_id'], self.h.tasks[reviewer]['session_id'])
+            self.assertEqual(item['reviewer_agent'], 'codex')
+            for task, profile in ((coder, 'codex-high'), (reviewer, 'codex-review')):
+                report = self.h.tasks[task]
+                self.assertEqual((report['agent'], report['model'], report['reasoning_effort']),
+                                 ('codex', 'gpt-6.1-sol', 'high'))
+                self.assertEqual(report['execution']['execution_profile'], profile)
+                self.assertEqual(report['execution']['decision_sources']['options']['effort'], 'profile')
+            self.assertEqual([role for role, _ in commands], ['coding', 'review'])
+            for role, command in commands:
+                self.assertEqual(command[:2], ['codex', 'exec'])
+                self.assertNotIn('resume', command)
+                self.assertEqual(command[command.index('-m') + 1], 'gpt-6.1-sol')
+                self.assertIn('model_reasoning_effort="high"', command)
+                self.assertEqual(command[command.index('--sandbox') + 1],
+                                 'read-only' if role == 'review' else devctl.MACHINES['work']['codex_sandbox'])
+            self.assertFalse(self.h.continues)
+            self.h.restart(); await self.tick()
+            self.assertEqual(len(commands), 2)
+            self.h.finish(reviewer, review_result()); await self.tick()
+            self.assertEqual(self.h.state['issues']['1']['owner_state'], 'READY_FOR_OWNER')
+            self.assertEqual(self.h.state['issues']['1']['chief_status'], 'PASS')
+            self.assertFalse(self.h.state['issues']['1'].get('processed_owner_actions'))
+
+    async def test_explicit_cursor_review_uses_cursor_review_profile(self):
+        config = dict(machine='work', workspace=str(self.h.repo), review_agent='cursor',
+                      review_execution_profiles={'cursor': 'cursor-fast'})
+        self.h.issues[1]['body'] = self.h.issues[1]['body'].replace('"agent":"codex"', '"agent":"cursor"')
+        calls = []
+        async def transport(name, args):
+            if name == 'start_task':
+                calls.append(copy.deepcopy(args))
+                execution = execution_profiles.resolve(project=config, agent=args['agent'],
+                                                       role=args.get('role', 'coding'))
+                result = await self.h.transport(name, args)
+                self.h.tasks[result['task_id']]['execution'] = execution
+                return {**result, 'execution': execution}
+            return await self.h.transport(name, args)
+        with (patch.object(devctl, 'load_projects', return_value={'test': config}),
+              patch.dict(os.environ, {'DEVORCHESTRATOR_MODEL_CATALOG': str(execution_profiles.CATALOG_FILE)}),
+              patch.object(b, 'transport_call', transport)):
+            item = await self.running_review()
+        self.assertEqual([call['agent'] for call in calls], ['cursor', 'cursor'])
+        self.assertEqual(calls[1]['role'], 'review')
+        self.assertNotIn('model', calls[1]); self.assertNotIn('effort', calls[1])
+        self.assertNotEqual(item['task_id'], item['review_task_id'])
+        execution = self.h.tasks[item['review_task_id']]['execution']
+        self.assertEqual((execution['execution_profile'], execution['model'], execution['runtime_model']),
+                         ('cursor-fast', 'composer-2.5', 'composer-2.5-fast'))
+        self.assertEqual(execution['options'], {'fast': True})
+
+    async def test_pending_review_preserves_selected_agent_after_policy_edit(self):
+        config = dict(machine='work', workspace=str(self.h.repo), review_agent='codex')
+        with patch.object(devctl, 'load_projects', return_value={'test': config}):
+            await self.tick()
+            item = self.h.state['issues']['1']
+            self.h.finish(item['task_id'], coding_result())
+            self.h.fail_after_start = True
+            await self.tick()
+            self.assertEqual(item['pending_rpc']['arguments']['agent'], 'codex')
+            reviewer = self.h.starts[-1][1]
+            config['review_agent'] = 'invalid'
+            self.h.restart()
+            retry = self.h.state['issues']['1']['reconciliation_retry']['next_attempt'] + 1
+            with patch.object(b.time, 'time', return_value=retry):
+                await self.tick()
+            item = self.h.state['issues']['1']
+            self.assertEqual(item['review_task_id'], reviewer)
+            self.assertEqual(item['reviewer_agent'], 'codex')
+            self.assertEqual(item['review_status'], 'RUNNING')
+            self.assertFalse(item.get('pending_rpc'))
+            self.assertEqual(len(self.h.starts), 2)
+            self.assertTrue(self.h.state['repo_locks'])
+
+    async def test_invalid_review_agent_fails_before_launch_and_releases_repository(self):
+        await self.tick()
+        item = self.h.state['issues']['1']
+        self.h.finish(item['task_id'], coding_result())
+        config = dict(machine='work', workspace=str(self.h.repo), review_agent='auto')
+        with (patch.object(devctl, 'load_projects', return_value={'test': config}),
+              patch.object(b, 'transport_call', wraps=self.h.transport) as transport):
+            await self.tick(); self.h.restart(); await self.tick()
+        item = self.h.state['issues']['1']
+        self.assertEqual(item['review_status'], 'FAILED')
+        self.assertIn('review_agent', item['owner_blocker'])
+        self.assertIn('projects.json', item['owner_blocker'])
+        self.assertIn('project test', item['owner_blocker'])
+        self.assertFalse(any(c.args[0] in ('preflight_task', 'start_task', 'continue_task')
+                             for c in transport.call_args_list))
+        self.assertEqual(len(self.h.starts), 1)
+        self.assertFalse(item.get('pending_rpc')); self.assertFalse(item.get('review_task_id'))
+        self.assertFalse(item.get('reconciliation_retry')); self.assertFalse(self.h.state['repo_locks'])
+        self.assertIsNone(item.get('owner_state'))
+        self.assertTrue(any(item['owner_blocker'] in c['body'] for c in self.h.comments[1]))
+        self.h.issues[2] = self.h.issue(2); self.h.comments[2] = []
+        await self.tick()
+        self.assertEqual(self.h.state['issues']['2']['queue_status'], 'STARTED')
 
     async def test_execution_profile_request_and_identity_survive_bridge_restart(self):
         meta = dict(project='test', agent='cursor', model='composer-2.5', execution_profile='cursor-fast',
