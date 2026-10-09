@@ -423,7 +423,8 @@ class OwnedCleanupTests(unittest.TestCase):
             'print(json.dumps({"type":"thread.started","thread_id":"owned-session"})); '
             'print(json.dumps({"type":"item.completed","item":{"type":"agent_message","text":"done"}}))')
         command = shlex.join([sys.executable, '-c', source])
-        with redirect_stdout(io.StringIO()), patch.object(d, 'build_agent_command', return_value=command):
+        with redirect_stdout(io.StringIO()), patch.object(d, 'build_agent_command', return_value=command), \
+                patch.object(d.execution_profiles, 'discover', return_value={'version': 'dummy-codex', 'help': '--model --config'}):
             d.run_project('test', 'dummy', request_id='c' * 64)
         task_id = 'c' * 24
         meta = self.wait(task_id)

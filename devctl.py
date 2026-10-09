@@ -16,6 +16,7 @@ from health import DOCTOR_TIMEOUT, PROBE_TIMEOUT, SSH_CONNECT_TIMEOUT, health_re
 import worker_runtime
 import remote_worker
 import runtime_liveness
+import execution_profiles
 from redaction import redact, redact_data
 
 from collections import deque
@@ -110,6 +111,18 @@ def capture(machine, command, separate_stderr=False):
         timeout=60,
     )
 
+
+
+def capture_execution(machine, command, *, timeout=PROBE_TIMEOUT):
+    env = dict(MACHINES[machine].get('agent_env', {}))
+    if machine == 'firefly' and command.startswith('agent '):
+        env['NODE_USE_ENV_PROXY'] = '1'
+    if env:
+        prefix = ' '.join(f'{key}={shlex.quote(value)}' for key, value in env.items())
+        command = f'env {prefix} {command}'
+    return subprocess.run(machine_command(machine, command, connect_timeout=SSH_CONNECT_TIMEOUT),
+                          text=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          timeout=timeout)
 
 
 def capture_git(machine, workspace, *args):
@@ -391,6 +404,22 @@ def load_projects():
     return projects
 
 
+
+def execution_catalog(project=None, discover=False, agent=None):
+    cfg = load_projects()[project] if project else {}
+    catalog, identity = execution_profiles.load_catalog(cfg)
+    result = dict(catalog=catalog, identity=identity)
+    if discover:
+        if not project:
+            raise ValueError('--discover requires a registered --project')
+        result['runtime'] = {}
+        for selected in ([agent] if agent else execution_profiles.AGENTS):
+            capabilities = execution_profiles.discover(cfg['machine'], selected, capture_execution)
+            result['runtime'][selected] = {k: v for k, v in capabilities.items() if k != 'help'}
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    return 0
+
+
 def show_projects(as_json=False):
     projects = load_projects()
 
@@ -417,6 +446,8 @@ def run_project(
     effort=None,
     request_id=None,
     role="coding",
+    execution_profile=None,
+    execution_options=None,
 ):
     projects = load_projects()
 
@@ -430,28 +461,13 @@ def run_project(
 
     machine = cfg["machine"]
     workspace = cfg["workspace"]
-    agent = agent_override or cfg.get("default_agent", "codex")
-
     if machine not in MACHINES:
         raise SystemExit(f"Unknown machine in project {project}: {machine}")
 
-    if agent not in ("codex", "cursor"):
-        raise SystemExit(f"Unsupported agent in project {project}: {agent}")
-
-    if agent != "codex" and (model or effort):
-        raise SystemExit(
-            "--model/--effort are supported only for Codex"
-        )
-
     return run_agent(
-        machine,
-        agent,
-        workspace,
-        prompt,
-        model=model,
-        effort=effort,
-        request_id=request_id,
-        role=role,
+        machine, agent_override, workspace, prompt, model=model, effort=effort,
+        request_id=request_id, role=role, execution_profile=execution_profile,
+        execution_options=execution_options,
     )
 
 
@@ -605,6 +621,9 @@ def list_tasks(as_json=False, show_all=False, cached=False, control=False, contr
             "project": project_for_task(meta),
             "machine": meta.get("machine", "-"),
             "agent": meta.get("agent", "-"),
+            "execution": meta.get("execution"),
+            "model": meta.get("model"),
+            "execution_options": (meta.get("execution") or {}).get("options", {}),
             "status": state,
             "turns": meta.get("turns", 1),
             "session_id": meta.get("session_id"),
@@ -968,6 +987,7 @@ def build_agent_command(
     model=None,
     effort=None,
     role="coding",
+    execution=None,
 ):
     if agent == "codex":
         args = [
@@ -980,10 +1000,12 @@ def build_agent_command(
             ),
         ]
 
-        if model:
+        if execution:
+            args += execution_profiles.cli_options(execution)
+        elif model:
             args += ["-m", model]
 
-        if effort:
+        if effort and not execution:
             args += [
                 "-c",
                 f'model_reasoning_effort="{effort}"',
@@ -1016,6 +1038,12 @@ def build_agent_command(
             "--workspace", workspace,
             prompt,
         ]
+        if execution:
+            args[-1:-1] = execution_profiles.cli_options(execution)
+        elif effort:
+            raise ValueError("Cursor effort requires a validated execution profile")
+        elif model:
+            args[-1:-1] = ["--model", model]
         command = shlex.join(args)
 
         env = dict(MACHINES[machine].get("agent_env", {}))
@@ -1034,32 +1062,110 @@ def build_agent_command(
     raise ValueError(f"Unsupported agent: {agent}")
 
 
+
+def start_signature(project, machine, agent, workspace, prompt, model, effort, role,
+                    execution_profile, execution_options, request_id):
+    inputs = [machine, agent, workspace, prompt, model, effort, role, execution_profile, execution_options]
+    receipt = read_json(DATA_DIR.parent / 'requests' / (request_id + '.json')) if request_id else None
+    if receipt and receipt.get('signature_version') != 2:
+        # Historical receipts retain their original signatures. Execution-era
+        # provenance distinguishes omitted agent from an explicit default agent.
+        meta = load_meta(receipt['task_id'])
+        saved = meta.get('execution')
+        if saved and (saved['decision_sources']['agent'] == 'explicit') != (agent in execution_profiles.AGENTS):
+            raise ValueError('Request ID reused with different requested agent')
+        inputs = [machine, agent or project.get('default_agent', 'codex'), workspace, prompt, model, effort, role]
+        if execution_profile is not None or execution_options is not None:
+            inputs += [execution_profile, execution_options]
+    return hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
+
+
+def validated_execution(project, machine, capture=None, **arguments):
+    try:
+        return execution_profiles.launch_identity(project, machine, capture or capture_execution, **arguments)
+    except ValueError as exc:
+        raise execution_profiles.PreflightRejected(str(exc)) from exc
+
+
+def preflight_task(operation, arguments):
+    """Read-only validation, including runtime, on the same host as launches.
+
+    Existing durable requests are replayed without applying changed catalog
+    policy. An unavailable/corrupt receipt is not proof that a launch failed.
+    """
+    request_id = arguments.get('request_id')
+    worker_runtime.valid_request(request_id)
+    receipt = read_json(DATA_DIR.parent / 'requests' / (request_id + '.json')) if request_id else None
+    if receipt:
+        return {'status': 'REPLAY'}
+    if request_id and (task_dir(request_id[:24]) / 'meta.json').exists() and operation == 'start_task':
+        raise RuntimeError('Existing task metadata without request receipt; inspect worker ownership before retrying')
+    # Leave room for the response inside the control loop's five-second issue
+    # budget. Probe timeouts share a deadline, rather than multiplying per CLI.
+    deadline = time.monotonic() + 3
+    def capture(machine, command):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(command, 3)
+        return capture_execution(machine, command, timeout=min(PROBE_TIMEOUT, remaining))
+    try:
+        role = arguments.get('role', 'coding')
+        if role not in ('coding', 'review'):
+            raise ValueError('Execution role must be coding or review')
+        if operation == 'start_task':
+            project = load_projects().get(arguments.get('project'))
+            if not project or project.get('machine') not in MACHINES:
+                raise ValueError('Task requires a registered project on a known machine')
+            execution = validated_execution(project, project['machine'], capture=capture, role=role,
+                **{key: arguments.get(key) for key in ('agent', 'model', 'effort', 'execution_profile', 'execution_options')})
+        elif operation == 'continue_task':
+            meta = load_meta(arguments['task_id'])
+            if meta.get('role', 'coding') != role:
+                raise ValueError(f'Continuation role {role} does not match saved task role {meta.get("role", "coding")}')
+            execution = execution_profiles.resume_identity(meta, capture)
+        else:
+            raise ValueError('Preflight operation must be start_task or continue_task')
+        return {'status': 'READY', 'execution': execution}
+    except ValueError as exc:
+        return execution_profiles.rejection(exc)
+
+
 def run_agent(machine, agent, workspace, prompt, model=None, effort=None,
-              request_id=None, role="coding"):
+              request_id=None, role="coding", execution_profile=None, execution_options=None):
     worker_runtime.valid_request(request_id)
     task_id = request_id[:24] if request_id else uuid.uuid4().hex[:12]
     with exclusive(DATA_DIR.parent / "worker.lock", blocking=True):
         import scheduler
-        project = next((name for name, cfg in load_projects().items()
+        projects = load_projects()
+        project = next((name for name, cfg in projects.items()
                         if cfg["machine"] == machine and cfg["workspace"] == workspace), None)
         if not project:
             raise ValueError("Mutable tasks require a registered workspace")
         _, canonical = scheduler.project_identity(project)
-        signature = hashlib.sha256(json.dumps([machine, agent, workspace, prompt, model, effort, role]).encode()).hexdigest()
+        signature = start_signature(projects[project], machine, agent, workspace, prompt, model, effort,
+                                    role, execution_profile, execution_options, request_id)
         def prepare():
+            execution = validated_execution(
+                projects[project], machine, agent=agent, model=model, effort=effort,
+                execution_profile=execution_profile, execution_options=execution_options, role=role)
             worker_runtime.check_capacity(DATA_DIR, task_id, machine, role, task_state)
             worker_runtime.admit(DATA_DIR, machine, canonical, task_id, task_state)
             directory = task_dir(task_id)
             directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-            save_meta(directory, {"id": task_id, "machine": machine, "agent": agent,
+            save_meta(directory, {"id": task_id, "machine": machine, "agent": execution["agent"],
+                      "execution": execution, "model": execution["model"], "reasoning_effort": execution["options"].get("effort"),
                       "workspace": workspace, "pid": 0, "status": "STARTING", "role": role,
                       "created_at": now(), "git_baseline": None, "launch_prepared": True, "prepared_request": request_id})
         def start():
-            return _run_agent(machine, agent, workspace, prompt, model, effort, task_id, role)
-        result = worker_runtime.launch(DATA_DIR, request_id, task_id, start, prepare, signature)
+            prepared = load_meta(task_id)
+            return _run_agent(machine, prepared['agent'], workspace, prompt, model, effort, task_id, role,
+                              execution=prepared['execution'])
+        result = worker_runtime.launch(DATA_DIR, request_id, task_id, start, prepare, signature, signature_version=2)
         meta = load_meta(task_id)
         if meta.get("launch_prepared") and meta.get("prepared_request") == request_id:
-            _run_agent(machine, agent, workspace, prompt, model, effort, task_id, role)
+            execution_profiles.resume_identity(meta, capture_execution)
+            _run_agent(machine, meta['agent'], workspace, prompt, model, effort, task_id, role,
+                       execution=meta.get('execution'))
             meta = load_meta(task_id)
         if meta.get("remote_key"):
             remote_worker.start(machine, meta["remote_key"], meta["remote_command"], meta)
@@ -1076,6 +1182,7 @@ def _run_agent(
     effort=None,
     task_id=None,
     role="coding",
+    execution=None,
 ):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1105,6 +1212,7 @@ def _run_agent(
         model=model,
         effort=effort,
         role=role,
+        execution=execution,
     )
     actual_command = machine_command(machine, agent_command)
 
@@ -1120,6 +1228,10 @@ def _run_agent(
         "git_baseline": git_baseline,
     }
 
+    if execution:
+        meta['execution'] = execution
+        model = execution['model']
+        effort = execution['options'].get('effort')
     if model:
         meta["model"] = model
 
@@ -1203,6 +1315,8 @@ def status(task_id, as_json=False, issue=False):
             print(f"Issue #{view['issue']} | {view['project']} | {view['lifecycle']}")
             print(f"Coding: {view['coding_agent']} / {view['model']} / {view['effort']} | task {view['task']} | session {view['session']} | turn {view['coding_turn']}")
             print(f"Review: {view['reviewer']} | task {view['review_task']} | round {view['review_round']} | Chief: {view['chief_state']} / {view['chief_bundle']}")
+            if view.get("execution"):
+                print("Execution: " + json.dumps(view["execution"], sort_keys=True))
             print(f"Runtime: coding {health.get('state')} ({health.get('reason')}) | review {view['review_runtime'].get('state')} | cleanup {health.get('cleanup_state')} | queue {json.dumps(view['queue'])} | locks {len(view['locks'])}")
             print(f"Publication: {view['publication']} | next action: {view['next_action']} | projection: {view['projection'].get('health')}")
             timings = {row['stage']: row['seconds'] for row in view['timings'].get('samples', [])}
@@ -1214,6 +1328,8 @@ def status(task_id, as_json=False, issue=False):
             if any(diagnostics):
                 print('Diagnostics: ' + json.dumps([v for v in diagnostics if v], ensure_ascii=False))
         return 0
+    if as_json:
+        return task_report(task_id, as_json=True)
     directory = task_dir(task_id)
     meta = load_meta(task_id)
 
@@ -1225,6 +1341,7 @@ def status(task_id, as_json=False, issue=False):
     print(f"status:    {state}")
     print(f"machine:   {meta['machine']}")
     print(f"agent:     {meta['agent']}")
+    print(f"execution: {json.dumps(meta.get('execution'), sort_keys=True)}")
     print(f"workspace: {meta['workspace']}")
     print(f"pid:       {meta['pid']}")
     health = runtime_status(meta, directory, state)
@@ -1308,7 +1425,13 @@ def continue_task(task_id, prompt, request_id=None):
         import scheduler
         _, canonical = scheduler.project_identity(project)
         signature = hashlib.sha256(json.dumps([task_id, prompt]).encode()).hexdigest()
+        execution = None
         def prepare():
+            nonlocal execution
+            try:
+                execution = execution_profiles.resume_identity(meta, capture_execution)
+            except ValueError as exc:
+                raise execution_profiles.PreflightRejected(str(exc)) from exc
             state, code = task_state(meta, task_dir(task_id))
             if state not in ("DONE", "FAILED"):
                 raise RuntimeError("Task is active or uncertain; resume is blocked")
@@ -1330,7 +1453,7 @@ def continue_task(task_id, prompt, request_id=None):
             save_meta(task_dir(task_id), meta)
             (task_dir(task_id) / "exit_code").unlink(missing_ok=True)
         result = worker_runtime.launch(DATA_DIR, request_id, task_id,
-                                       lambda: _continue_task(task_id, prompt), prepare, signature)
+                                       lambda: _continue_task(task_id, prompt, execution), prepare, signature)
         meta = load_meta(task_id)
         if meta.get("resume_prepared") and meta.get("prepared_request") == request_id:
             _continue_task(task_id, prompt)
@@ -1341,7 +1464,7 @@ def continue_task(task_id, prompt, request_id=None):
 
 
 
-def _continue_task(task_id, prompt):
+def _continue_task(task_id, prompt, execution=None):
     directory = task_dir(task_id)
     meta = load_meta(task_id)
 
@@ -1353,6 +1476,8 @@ def _continue_task(task_id, prompt):
     agent = meta["agent"]
     machine = meta["machine"]
     workspace = meta["workspace"]
+    if execution is None:
+        execution = execution_profiles.resume_identity(meta, capture_execution)
 
     if agent == "codex":
         session_id = (
@@ -1377,13 +1502,13 @@ def _continue_task(task_id, prompt):
             "--json",
         ]
 
-        model = meta.get("model")
-        if model:
-            args += ["-m", model]
-
-        effort = meta.get("reasoning_effort")
-        if effort:
-            args += ["-c", f'model_reasoning_effort="{effort}"']
+        if execution:
+            args += execution_profiles.cli_options(execution)
+        else:
+            if meta.get('model'):
+                args += ['-m', meta['model']]
+            if meta.get('reasoning_effort'):
+                args += ['-c', 'model_reasoning_effort=' + json.dumps(meta['reasoning_effort'])]
 
         args += [
             session_id,
@@ -1412,6 +1537,10 @@ def _continue_task(task_id, prompt):
             "--resume", session_id,
             prompt,
         ]
+        if execution:
+            args[-1:-1] = execution_profiles.cli_options(execution)
+        elif meta.get('model') or meta.get('reasoning_effort'):
+            raise ValueError('Legacy Cursor task with options has no validated execution identity; adopt a new task')
 
     else:
         raise SystemExit(f"Unsupported agent: {agent}")
@@ -1621,8 +1750,11 @@ def task_report(task_id, as_json=False):
         "agent": meta["agent"],
         "workspace": meta["workspace"],
         "session_id": session_id,
-        "model": model,
+        "model": (meta.get("execution") or {}).get("model", model),
+        "observed_model": model,
         "reasoning_effort": reasoning_effort,
+        "execution": meta.get("execution"),
+        "execution_options": (meta.get("execution") or {}).get("options", {}),
         "turns": meta.get("turns", 1),
         "exit_code": exit_code,
         "result": redact(result) if result else result,
@@ -1652,6 +1784,8 @@ def task_report(task_id, as_json=False):
     if report["reasoning_effort"]:
         print(f"effort:    {report['reasoning_effort']}")
 
+    if report.get("execution"):
+        print("execution: " + json.dumps(report["execution"], sort_keys=True))
     print(f"turns:     {report['turns']}")
 
     if report["exit_code"] is not None:
@@ -1687,6 +1821,15 @@ def main():
     p_projects = sub.add_parser("projects")
     p_projects.add_argument("--json", action="store_true")
 
+    p_preflight = sub.add_parser('preflight-task', help='Read-only execution validation before admission')
+    p_preflight.add_argument('operation', choices=['start_task', 'continue_task'])
+    p_preflight.add_argument('arguments', type=json.loads)
+
+    p_models = sub.add_parser('execution-catalog', help='Validate and display model/profile configuration')
+    p_models.add_argument('--project')
+    p_models.add_argument('--discover', action='store_true', help='Read installed runtime version/models on the project host')
+    p_models.add_argument('--agent', choices=['cursor', 'codex'])
+
     p_tasks = sub.add_parser("tasks")
     p_tasks.add_argument("--json", action="store_true")
     p_tasks.add_argument("--all", dest="show_all", action="store_true")
@@ -1717,11 +1860,13 @@ def main():
     p_run_project.add_argument("prompt")
     p_run_project.add_argument(
         "--agent",
-        choices=["codex", "cursor"],
+        choices=["codex", "cursor", "auto"],
         default=None,
     )
     p_run_project.add_argument("--model", default=None)
     p_run_project.add_argument("--effort", default=None)
+    p_run_project.add_argument("--execution-profile", default=None)
+    p_run_project.add_argument("--execution-options", type=json.loads, default=None)
     p_run_project.add_argument("--request-id", default=None)
     p_run_project.add_argument("--role", choices=["coding", "review"], default="coding")
 
@@ -1731,11 +1876,13 @@ def main():
 
     p_run = sub.add_parser("run")
     p_run.add_argument("machine", choices=MACHINES.keys())
-    p_run.add_argument("agent", choices=["codex", "cursor"])
+    p_run.add_argument("agent", choices=["codex", "cursor", "auto"])
     p_run.add_argument("workspace")
     p_run.add_argument("prompt")
     p_run.add_argument("--model", default=None)
     p_run.add_argument("--effort", default=None)
+    p_run.add_argument("--execution-profile", default=None)
+    p_run.add_argument("--execution-options", type=json.loads, default=None)
 
     p_status = sub.add_parser("status")
     p_status.add_argument("task_id")
@@ -1762,6 +1909,13 @@ def main():
 
     if args.action == "projects":
         raise SystemExit(show_projects(args.json))
+
+    if args.action == 'preflight-task':
+        print(json.dumps(preflight_task(args.operation, args.arguments)))
+        raise SystemExit(0)
+
+    if args.action == 'execution-catalog':
+        raise SystemExit(execution_catalog(args.project, args.discover, args.agent))
 
     if args.action == "tasks":
         raise SystemExit(
@@ -1801,6 +1955,8 @@ def main():
                 args.effort,
                 args.request_id,
                 args.role,
+                **({'execution_profile': args.execution_profile, 'execution_options': args.execution_options}
+                   if args.execution_profile is not None or args.execution_options is not None else {}),
             )
         )
 
@@ -1816,6 +1972,8 @@ def main():
                 args.prompt,
                 model=args.model,
                 effort=args.effort,
+                execution_profile=args.execution_profile,
+                execution_options=args.execution_options,
             )
         )
 
@@ -1837,4 +1995,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except execution_profiles.PreflightRejected as exc:
+        # Only failures before preparation/receipt creation use this contract.
+        print(json.dumps(execution_profiles.rejection(exc)))
+        raise SystemExit(2)

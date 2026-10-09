@@ -42,3 +42,40 @@ class AdapterTests(unittest.TestCase):
         with patch.object(self.adapter, 'devctl', return_value='[]') as run:
             self.assertEqual(self.adapter.list_tasks(), [])
         run.assert_called_once_with('tasks', '--json', '--cached')
+
+
+    def test_cursor_execution_fields_forwarded_and_resolved_report_agent_wins(self):
+        execution = {'agent': 'cursor', 'model': 'compose', 'options': {'fast': True}}
+        report = {'id': 'task', 'agent': 'cursor', 'model': 'compose', 'execution': execution}
+        with patch.object(self.adapter, 'devctl', side_effect=['task', json.dumps(report)]) as run:
+            result = self.adapter.start_task('test', 'prompt', agent='auto', model='auto',
+                                             execution_profile='quick', execution_options={'fast': True})
+        args = run.call_args_list[0].args
+        self.assertEqual(args[args.index('--execution-profile') + 1], 'quick')
+        self.assertEqual(json.loads(args[args.index('--execution-options') + 1]), {'fast': True})
+        self.assertEqual(result['agent'], 'cursor')
+        self.assertEqual(result['execution'], execution)
+
+    def test_catalog_inventory_uses_read_only_command(self):
+        with patch.object(self.adapter, 'devctl', return_value='{"catalog": {}}') as run:
+            self.assertEqual(self.adapter.get_execution_catalog('test', True, 'cursor'), {'catalog': {}})
+        run.assert_called_once_with('execution-catalog', '--project', 'test', '--discover', '--agent', 'cursor')
+
+
+    def test_preflight_tool_returns_actionable_error_as_structured_result(self):
+        payload = {'status': 'REJECTED', 'launch_started': False, 'error': 'Cursor model unavailable'}
+        with patch.object(self.adapter, 'devctl', return_value=json.dumps(payload)) as run:
+            result = self.adapter.preflight_task('start_task', {'project': 'test', 'role': 'review'})
+        self.assertEqual(result, payload)
+        self.assertEqual(run.call_args.args[:2], ('preflight-task', 'start_task'))
+
+    def test_locked_worker_preflight_race_rejection_preserves_message(self):
+        from subprocess import CompletedProcess
+        payload = {'status': 'REJECTED', 'launch_started': False, 'error': 'Cursor model removed after preflight'}
+        with patch.object(self.adapter, 'devctl_result', return_value=CompletedProcess([], 2, json.dumps(payload))):
+            self.assertEqual(self.adapter.start_task('test', 'prompt'), payload)
+
+    def test_generic_worker_error_is_not_treated_as_no_launch(self):
+        from subprocess import CompletedProcess
+        with patch.object(self.adapter, 'devctl_result', return_value=CompletedProcess([], 1, 'unknown worker crash')):
+            with self.assertRaises(RuntimeError): self.adapter.start_task('test', 'prompt')

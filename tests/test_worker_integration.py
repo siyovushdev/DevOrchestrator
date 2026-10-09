@@ -25,7 +25,9 @@ class WorkerIntegrationTests(unittest.TestCase):
         subprocess.check_call(['git', '-C', str(self.repo), 'commit', '-m', 'baseline'], stdout=subprocess.DEVNULL)
         self.data = self.root / 'state/tasks'
         registry = {'test': {'machine': 'work', 'workspace': str(self.repo)}}
-        for p in (patch.object(d, 'DATA_DIR', self.data), patch.object(d, 'load_projects', return_value=registry)):
+        for p in (patch.object(d, 'DATA_DIR', self.data), patch.object(d, 'load_projects', return_value=registry),
+                  patch.object(d.execution_profiles, 'discover', return_value={
+                      'version': 'dummy-codex', 'help': '--model --config'})):
             p.start(); self.addCleanup(p.stop)
 
     def wait(self, task_id):

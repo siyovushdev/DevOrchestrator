@@ -127,7 +127,7 @@ def status_view(state, number, runtime=None):
     chief = item.get('chief_review') or {}
     return dict(issue=str(number), task=item.get('task_id'), project=item.get('project'),
         lifecycle=lifecycle_state(item), coding_agent=item.get('coding_agent'), model=item.get('model'),
-        effort=item.get('effort'), session=(runtime or {}).get('session_id') or item.get('coding_session_id'),
+        effort=item.get('effort'), execution=item.get('execution'), execution_options=item.get('execution_options', {}), session=(runtime or {}).get('session_id') or item.get('coding_session_id'),
         coding_turn=item.get('coding_turn'), reviewer=item.get('reviewer_agent'), review_task=item.get('review_task_id'),
         review_round=item.get('review_round'), chief_state=item.get('chief_status'),
         chief_bundle=(chief.get('identity') or {}).get('bundle_id'),

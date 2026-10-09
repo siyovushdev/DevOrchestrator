@@ -21,6 +21,7 @@ from durable import read_json, write_json_if_changed, exclusive
 from scheduler import Scheduler, QueueWait, project_identity, registered_project
 import hashlib
 from redaction import redact, redact_data
+from execution_profiles import PreflightRejected, check_preflight
 
 from publication import Repository, PublicationError, execute as publish
 
@@ -106,9 +107,6 @@ MAX_REVIEW_CORRECTIONS = 2
 MAX_REVIEW_FORMAT_CORRECTIONS = 1
 MAX_REVIEW_FORMAT_RESTARTS = 1
 
-REVIEWER_CODEX_MODEL = "gpt-6.1-sol"
-REVIEWER_CODEX_EFFORT = "high"
-
 
 def gh(*args):
     result = subprocess.run(
@@ -147,7 +145,7 @@ def notify(status, issue, item, report=None, blocker=None):
         # Keep only bounded, redacted display data. Delivery recomputes the
         # action and checks the durable semantic identity, never trusts text.
         item['notification_report'] = redact_data({k: (report or {}).get(k) for k in
-            ('id', 'agent', 'model', 'reasoning_effort', 'session_id', 'git_baseline', 'created_at', 'updated_at')})
+            ('id', 'agent', 'model', 'reasoning_effort', 'execution', 'execution_options', 'session_id', 'git_baseline', 'created_at', 'updated_at')})
         fingerprint = (item['chief_review']['identity']['bundle_id'] if status == 'CHIEF_REVIEW_REQUIRED'
                        else notification_fingerprint(item))
         event = [status, fingerprint, blocker]
@@ -639,6 +637,7 @@ def invalidate_quality_gates(item):
     item.pop('review_coding_turn', None)
     item['last_report_signature'] = None
     item.pop("review_hold", None)
+    item.pop("execution_failure", None)
     item["publication_journal"] = {}
     convergence = item.get('post_merge_convergence') or {}
     if convergence.get('status') == 'NOT_MERGED' and not convergence.get('master_sha'):
@@ -1268,7 +1267,7 @@ def parse_task(issue):
 
     if not isinstance(project, str) or not project:
         raise ValueError("Task metadata requires a registered project")
-    if mode not in ("manual", AUTOPILOT_MODE) or agent not in (None, "codex", "cursor"):
+    if mode not in ("manual", AUTOPILOT_MODE) or agent not in (None, "codex", "cursor", "auto"):
         raise ValueError("Unsupported task mode/agent")
     for name, value in (("model", model), ("effort", effort)):
         if value is not None and (not isinstance(value, str) or not value.strip()):
@@ -1276,12 +1275,26 @@ def parse_task(issue):
     if effort and not re.fullmatch(r"[a-z]+", effort):
         raise ValueError("Effort must be a simple reasoning-effort name")
 
+    task_execution_request(issue)
     prompt = TASK_RE.sub("", body, count=1).strip()
 
     if not prompt:
         raise ValueError("Task prompt is empty")
 
     return project, agent, mode, model, effort, prompt
+
+
+def task_execution_request(issue):
+    """New execution fields stay out of the legacy six-value parse contract."""
+    from execution_profiles import token, options
+    match = TASK_RE.search(issue.get('body') or '')
+    meta = json.loads(match.group(1)) if match else {}
+    extra = {}
+    if 'execution_profile' in meta:
+        extra['execution_profile'] = token(meta['execution_profile'], 'execution_profile')
+    if 'execution_options' in meta:
+        extra['execution_options'] = options(meta['execution_options'], 'execution_options')
+    return extra
 
 
 async def transport_call(name, arguments):
@@ -1300,7 +1313,7 @@ async def _transport_call(name, arguments):
 # it contains multiple projects; only list_tasks has collection-valued output.
 MCP_COLLECTION_TOOLS = frozenset({"list_tasks"})
 MCP_OBJECT_TOOLS = frozenset({"list_projects", "get_task_report", "start_task",
-                              "continue_task", "adopt_task", "orchestrator_health"})
+                              "continue_task", "adopt_task", "orchestrator_health", "get_execution_catalog", "preflight_task"})
 
 
 def decode_mcp_result(name, result):
@@ -1417,12 +1430,36 @@ async def mcp_call(name, arguments):
         observe_coding_turn(item, state, current)
         if not coding_report_successful(current, item) or item.get('review_coding_turn') != current.get('turns'):
             raise QueueWait()
+    pending = item.get('pending_rpc')
+    if pending and (pending.get('name') != name or pending.get('operation') != operation or
+                    {k: v for k, v in pending.get('arguments', {}).items() if k != 'request_id'} !=
+                    {k: v for k, v in arguments.items() if k != 'request_id'}):
+        raise RuntimeError('Pending launch intent differs from this RPC; existing ownership must be reconciled')
     machine, repo = await asyncio.to_thread(project_identity, arguments.get("project") or item["project"])
     key = hashlib.sha256(f"{REPO}:{number}:{name}:{operation}".encode()).hexdigest()
+    if pending and pending.get('arguments', {}).get('request_id', key) != key:
+        raise RuntimeError('Pending launch request ID changed; existing ownership must be reconciled')
     scheduler = Scheduler(state)
     job = scheduler.enqueue(key, number, kind, machine, repo)
+    if job['status'] == 'QUEUED' and not scheduler.available(job):
+        raise QueueWait()
+    def rejected(exc):
+        # Only a worker's confirmed no-launch result reaches this path. Generic
+        # MCP/network errors and ambiguous receipts retain their reservations.
+        job.update(status='FAILED', launch_pending=False, preflight_error=str(exc))
+        item.pop('pending_rpc', None)
+        scheduler.release(number)
+        save_state(state)
+        exc.role = kind
+    try:
+        preflight = await transport_call('preflight_task', {
+            'operation': name, 'arguments': {**arguments, 'request_id': key}})
+        check_preflight(preflight)
+    except PreflightRejected as exc:
+        rejected(exc)
+        raise
     if not item.get("pending_rpc"):
-        item["pending_rpc"] = {"name": name, "arguments": arguments, "operation": operation}
+        item["pending_rpc"] = {"name": name, "arguments": {**arguments, 'request_id': key}, "operation": operation}
         if kind == "coding" and name == "continue_task":
             invalidate_quality_gates(item)
             item['coding_status'] = 'STARTING'
@@ -1434,7 +1471,15 @@ async def mcp_call(name, arguments):
     job["launch_pending"] = True
     arguments["request_id"] = key
     save_state(state)
-    result = await transport_call(name, arguments)
+    try:
+        result = await transport_call(name, arguments)
+        if result.get('status') == 'REJECTED':
+            check_preflight(result)
+    except PreflightRejected as exc:
+        # Capability/catalog changes between preflight and the worker's locked
+        # preparation still report a definitive prelaunch failure.
+        rejected(exc)
+        raise
     scheduler.started(key, result.get("task_id") or arguments.get("task_id") or result["id"], result.get("status"))
     complete_rpc(item, operation, result)
     if kind == 'coding' and type(result.get('turns')) is int:
@@ -1513,6 +1558,8 @@ def format_report(report):
     if isinstance(health, dict):
         text.extend(runtime_evidence_lines(health))
 
+    if report.get('execution'):
+        text.append('- **Execution configuration:** `' + json.dumps(report['execution'], sort_keys=True) + '`')
     if report.get("model"):
         text.append(
             f"- **Model:** `{report['model']}`"
@@ -1616,12 +1663,20 @@ async def start_queued(issue, state):
             for name, value in (("agent", agent), ("model", model), ("effort", effort)):
                 if value:
                     args[name] = value
+            args.update(task_execution_request(issue))
             spec = {"arguments": args, "mode": mode}
         args = dict(spec["arguments"])
         project, mode = args["project"], spec["mode"]
         model, effort = args.get("model"), args.get("effort")
-        if project not in __import__("devctl").load_projects():
+        projects = __import__("devctl").load_projects()
+        if project not in projects:
             raise ValueError("Unknown registered project")
+        if not pending:
+            # Pure configuration validation before admission. An uncertain RPC
+            # must replay its original request and saved identity after config edits.
+            __import__('execution_profiles').resolve(
+                projects[project], agent=args.get('agent'), model=model, effort=effort,
+                execution_profile=args.get('execution_profile'), execution_options=args.get('execution_options'))
         queued["task_spec"] = spec
 
         result = await mcp_call("start_task", args)
@@ -1645,6 +1700,8 @@ async def start_queued(issue, state):
                 if mode == AUTOPILOT_MODE
                 else None
             ),
+            "execution": result.get("execution"),
+            "execution_options": result.get("execution_options", {}),
             "model": result.get('model') or model,
             "effort": result.get('reasoning_effort') or effort,
             "autopilot_corrections": 0,
@@ -1684,6 +1741,8 @@ async def start_queued(issue, state):
     except ValueError as exc:
         item = state["issues"][number]
         item["queue_status"] = "FAILED"
+        item["owner_blocker"] = str(exc)
+        Scheduler(state).release(number)
         transition_issue(issue, "dev:failed")
         notify("FAILED", issue, item, blocker=str(exc))
         save_state(state)
@@ -2143,7 +2202,7 @@ async def maybe_continue_autopilot(
 ):
     if exclusion_reason(item, issue):
         return report, False
-    if item.get("mode") != AUTOPILOT_MODE:
+    if item.get("mode") != AUTOPILOT_MODE or item.get("execution_failure"):
         return report, False
 
     if report.get("status") not in ('DONE', 'FAILED'):
@@ -2377,10 +2436,6 @@ async def start_independent_review(
         ),
     }
 
-    if reviewer == "codex":
-        args["model"] = REVIEWER_CODEX_MODEL
-        args["effort"] = REVIEWER_CODEX_EFFORT
-
     chief_review.invalidate(item)
     item["owner_state"] = None
     item["owner_approved_at"] = None
@@ -2483,6 +2538,8 @@ async def process_review_loop(
         return False
     if item.get("mode") != AUTOPILOT_MODE:
         return False
+    if item.get("execution_failure"):
+        return True
 
     observe_coding_turn(item, state, coding_report)
     if not coding_report_successful(coding_report, item):
@@ -3057,6 +3114,18 @@ async def process_tracked(issue, item, state, runtime_reports=None, *, initial_r
                 flush=True,
             )
 
+    except PreflightRejected as exc:
+        if getattr(exc, 'role', 'coding') == 'review':
+            await fail_review_loop(issue, item, state, str(exc), report)
+        else:
+            invalidate_quality_gates(item)
+            item['execution_failure'] = str(exc)
+            item['owner_blocker'] = str(exc)
+            transition_issue(issue, 'dev:failed')
+            add_comment(issue['number'], 'Execution validation failed before launch: ' + str(exc))
+            notify('FAILED', issue, item, report, str(exc))
+            save_state(state)
+        Scheduler(state).release(str(issue['number']))
     except QueueWait:
         pass
     except Exception:

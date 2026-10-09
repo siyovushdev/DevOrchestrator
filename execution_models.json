@@ -1,0 +1,315 @@
+{
+  "schema_version": 1,
+  "models": [
+    {
+      "agent": "codex",
+      "model_id": "gpt-6.1-sol",
+      "display_name": "gpt-6.1-sol",
+      "enabled": true,
+      "supported_options": {
+        "effort": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "defaults": {
+        "effort": "xhigh"
+      }
+    },
+    {
+      "agent": "codex",
+      "model_id": "gpt-6-astra",
+      "display_name": "gpt-6-astra",
+      "enabled": true,
+      "supported_options": {
+        "effort": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "defaults": {
+        "effort": "medium"
+      }
+    },
+    {
+      "agent": "codex",
+      "model_id": "gpt-6-sol",
+      "display_name": "gpt-6-sol",
+      "enabled": true,
+      "supported_options": {
+        "effort": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "defaults": {
+        "effort": "medium"
+      }
+    },
+    {
+      "agent": "codex",
+      "model_id": "gpt-6-luna",
+      "display_name": "gpt-6-luna",
+      "enabled": true,
+      "supported_options": {
+        "effort": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "defaults": {
+        "effort": "medium"
+      }
+    },
+    {
+      "agent": "codex",
+      "model_id": "gpt-5.6-sol",
+      "display_name": "gpt-5.6-sol",
+      "enabled": true,
+      "supported_options": {
+        "effort": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "defaults": {
+        "effort": "medium"
+      }
+    },
+    {
+      "agent": "codex",
+      "model_id": "gpt-5.6-terra",
+      "display_name": "gpt-5.6-terra",
+      "enabled": true,
+      "supported_options": {
+        "effort": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "defaults": {
+        "effort": "medium"
+      }
+    },
+    {
+      "agent": "codex",
+      "model_id": "gpt-5.6-luna",
+      "display_name": "gpt-5.6-luna",
+      "enabled": true,
+      "supported_options": {
+        "effort": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "defaults": {
+        "effort": "medium"
+      }
+    },
+    {
+      "agent": "codex",
+      "model_id": "gpt-5.5",
+      "display_name": "gpt-5.5",
+      "enabled": true,
+      "supported_options": {
+        "effort": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      "defaults": {
+        "effort": "medium"
+      }
+    },
+    {
+      "agent": "cursor",
+      "model_id": "cursor-auto",
+      "display_name": "Cursor runtime Auto",
+      "enabled": true,
+      "supported_options": {},
+      "defaults": {},
+      "variants": [
+        {
+          "options": {},
+          "runtime_model_id": "auto"
+        }
+      ]
+    },
+    {
+      "agent": "cursor",
+      "model_id": "composer-2.5",
+      "display_name": "Composer 2.5",
+      "enabled": true,
+      "supported_options": {
+        "fast": [
+          false,
+          true
+        ]
+      },
+      "defaults": {
+        "fast": false
+      },
+      "variants": [
+        {
+          "options": {
+            "fast": false
+          },
+          "runtime_model_id": "composer-2.5"
+        },
+        {
+          "options": {
+            "fast": true
+          },
+          "runtime_model_id": "composer-2.5-fast"
+        }
+      ]
+    },
+    {
+      "agent": "cursor",
+      "model_id": "gpt-5.4",
+      "display_name": "GPT-5.4",
+      "enabled": true,
+      "supported_options": {
+        "effort": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ],
+        "fast": [
+          false,
+          true
+        ]
+      },
+      "defaults": {
+        "effort": "medium",
+        "fast": false
+      },
+      "variants": [
+        {
+          "options": {
+            "effort": "low",
+            "fast": false
+          },
+          "runtime_model_id": "gpt-5.4-low"
+        },
+        {
+          "options": {
+            "effort": "medium",
+            "fast": false
+          },
+          "runtime_model_id": "gpt-5.4-medium"
+        },
+        {
+          "options": {
+            "effort": "medium",
+            "fast": true
+          },
+          "runtime_model_id": "gpt-5.4-medium-fast"
+        },
+        {
+          "options": {
+            "effort": "high",
+            "fast": false
+          },
+          "runtime_model_id": "gpt-5.4-high"
+        },
+        {
+          "options": {
+            "effort": "high",
+            "fast": true
+          },
+          "runtime_model_id": "gpt-5.4-high-fast"
+        },
+        {
+          "options": {
+            "effort": "xhigh",
+            "fast": false
+          },
+          "runtime_model_id": "gpt-5.4-xhigh"
+        },
+        {
+          "options": {
+            "effort": "xhigh",
+            "fast": true
+          },
+          "runtime_model_id": "gpt-5.4-xhigh-fast"
+        }
+      ],
+      "capabilities": {
+        "reasoning": true
+      }
+    }
+  ],
+  "profiles": {
+    "cursor-fast": {
+      "agent": "cursor",
+      "model": "composer-2.5",
+      "options": {
+        "fast": true
+      }
+    },
+    "codex-high": {
+      "agent": "codex",
+      "model": "gpt-6.1-sol",
+      "options": {
+        "effort": "high"
+      }
+    },
+    "codex-max": {
+      "agent": "codex",
+      "model": "gpt-6.1-sol",
+      "options": {
+        "effort": "max"
+      }
+    },
+    "codex-review": {
+      "agent": "codex",
+      "model": "gpt-6.1-sol",
+      "options": {
+        "effort": "high"
+      }
+    },
+    "cursor-deep": {
+      "agent": "cursor",
+      "model": "gpt-5.4",
+      "options": {
+        "effort": "xhigh",
+        "fast": false
+      }
+    }
+  },
+  "defaults": {
+    "agent": "codex",
+    "models": {
+      "codex": "gpt-6.1-sol",
+      "cursor": "cursor-auto"
+    },
+    "review_profiles": {
+      "codex": "codex-review"
+    }
+  }
+}

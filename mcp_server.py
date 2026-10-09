@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Literal
 from health import MCP_HEALTH_TIMEOUT, failed_health, validate_health
 from redaction import redact
+from execution_profiles import PreflightRejected, check_preflight, rejection
 
 from mcp.server import MCPServer
 
@@ -37,6 +38,13 @@ def devctl(*args: str, timeout: int = 30) -> str:
     result = devctl_result(*args, timeout=timeout)
     output = result.stdout.strip()
 
+    if result.returncode == 2:
+        try:
+            payload = json.loads(output)
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict) and payload.get('status') == 'REJECTED':
+            check_preflight(payload)
     if result.returncode != 0:
         raise RuntimeError(
             f"devctl failed with exit code {result.returncode}: {output}"
@@ -52,14 +60,36 @@ def list_projects() -> dict:
 
 
 @mcp.tool()
+def get_execution_catalog(project: str | None = None, discover: bool = False,
+                          agent: Literal['cursor', 'codex'] | None = None) -> dict:
+    """Validate/catalogue configuration; optionally probe the installed project runtime without launching."""
+    args = ['execution-catalog']
+    if project is not None:
+        args += ['--project', project]
+    if discover:
+        args += ['--discover']
+    if agent is not None:
+        args += ['--agent', agent]
+    return json.loads(devctl(*args))
+
+
+@mcp.tool()
+def preflight_task(operation: Literal['start_task', 'continue_task'], arguments: dict) -> dict:
+    """Read-only role, profile and runtime validation; never starts a worker."""
+    return json.loads(devctl('preflight-task', operation, json.dumps(arguments, sort_keys=True)))
+
+
+@mcp.tool()
 def start_task(
     project: str,
     prompt: str,
-    agent: Literal["codex", "cursor"] | None = None,
+    agent: Literal["codex", "cursor", "auto"] | None = None,
     model: str | None = None,
     effort: str | None = None,
     request_id: str | None = None,
     role: Literal["coding", "review"] = "coding",
+    execution_profile: str | None = None,
+    execution_options: dict | None = None,
 ) -> dict:
     """Start a task in a registered project.
 
@@ -76,35 +106,37 @@ def start_task(
     cfg = projects[project]
     selected_agent = agent or cfg.get("default_agent", "codex")
 
-    if selected_agent != "codex" and (model or effort):
-        raise ValueError(
-            "model/effort are supported only for Codex tasks"
-        )
-
     args = [
         "run-project",
         project,
         prompt,
     ]
 
-    if agent:
+    if agent is not None:
         args += ["--agent", agent]
 
-    if model:
+    if model is not None:
         args += ["--model", model]
 
-    if effort:
+    if effort is not None:
         args += ["--effort", effort]
 
+    if execution_profile is not None:
+        args += ['--execution-profile', execution_profile]
+    if execution_options is not None:
+        args += ['--execution-options', json.dumps(execution_options, sort_keys=True)]
     if request_id:
         args += ["--request-id", request_id]
     args += ["--role", role]
-    output = devctl(*args)
+    try:
+        output = devctl(*args)
+    except PreflightRejected as exc:
+        return rejection(exc)
     task_id = output.splitlines()[-1].strip()
 
     report = json.loads(devctl("report", task_id, "--json"))
     return {**report, "task_id": task_id, "project": project,
-            "machine": cfg["machine"], "agent": selected_agent, "role": role,
+            "machine": cfg["machine"], "agent": report.get("agent") or selected_agent, "role": role,
             "model": report.get("model") or model,
             "effort": report.get("reasoning_effort") or effort}
 
@@ -125,7 +157,10 @@ def continue_task(task_id: str, prompt: str, request_id: str | None = None,
     args = ["continue", task_id, prompt]
     if request_id:
         args += ["--request-id", request_id]
-    devctl(*args)
+    try:
+        devctl(*args)
+    except PreflightRejected as exc:
+        return rejection(exc)
 
     return json.loads(
         devctl("report", task_id, "--json")
