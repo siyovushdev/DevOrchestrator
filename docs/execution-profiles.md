@@ -20,6 +20,35 @@ Review uses its review profile separately from coding defaults. The bundled
 Codex review profile retains the previous `gpt-6.1-sol` / `high` policy. The
 bundled coding Codex default pins WORK's existing `gpt-6.1-sol` / `xhigh` settings;
 set a project catalog/profile to retain different host-specific defaults.
+
+A project can set `review_agent` to exactly `"codex"` or `"cursor"` to choose
+its independent reviewer. When the field is absent, review keeps the existing
+opposite-agent policy: Codex coding uses Cursor review, and Cursor coding uses
+Codex review. Other values (including `null` or `"auto"`) fail closed before
+review launch with a configuration error; the review loop fails and releases
+the repository reservation when existing safety holds permit.
+
+For example, the `devorchestrator` entry in `projects.example.json` selects
+Codex for both roles with the bundled profiles:
+
+```json
+{
+  "default_agent": "codex",
+  "review_agent": "codex",
+  "execution_profile": "codex-high",
+  "review_execution_profiles": {"codex": "codex-review"}
+}
+```
+
+Both profiles resolve to `gpt-6.1-sol` / `high` in the bundled catalog. The
+reviewer always starts a fresh task/session with the read-only review role,
+even when its agent, model, and effort match coding. `review_agent` chooses
+only the agent; review still resolves through `review_execution_profiles` or
+the catalog's default review profile map, independently of coding overrides.
+Policy edits apply to new reviews; running reviews and persisted launch intents
+keep their saved agent/execution identity. Apply production policy separately
+in `projects.json` after review and merge.
+
 Cursor's default catalog model `cursor-auto` maps to runtime `auto`, explicitly
 recorded as `runtime_model`. Select provider Auto explicitly with `--model cursor-auto`;
 `--model auto` selects the configured profile/default. Catalog `model_id: auto`

@@ -716,7 +716,18 @@ async def drain_stale_reviews(item, state):
     return not item.get('stale_review_task_ids')
 
 
-def reviewer_for(coding_agent):
+def reviewer_for(coding_agent, project=None):
+    """Resolve project review policy, preserving the legacy opposite-agent default."""
+    if project is not None and "review_agent" in project:
+        reviewer = project["review_agent"]
+        if reviewer not in ("codex", "cursor"):
+            raise ValueError(
+                f"Invalid project review_agent: {reviewer!r}; "
+                'set review_agent to "codex" or "cursor" in projects.json, '
+                "or remove the field to use the opposite coding agent"
+            )
+        return reviewer
+
     if coding_agent == "codex":
         return "cursor"
 
@@ -2422,7 +2433,13 @@ async def start_independent_review(
         or coding_report.get("agent")
     )
 
-    reviewer = reviewer_for(coding_agent)
+    project_config = __import__("devctl").load_projects()[project]
+    try:
+        reviewer = reviewer_for(coding_agent, project_config)
+    except ValueError as exc:
+        rejection = PreflightRejected(f"Review configuration for project {project}: {exc}")
+        rejection.role = "review"
+        raise rejection from exc
 
     round_number = int(item.get("review_round") or 0) + 1
     args = {
