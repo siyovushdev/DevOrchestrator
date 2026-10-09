@@ -245,6 +245,45 @@ def cleanup_group(directory, meta, state, *, grace_seconds=1):
         return 'AMBIGUOUS'
 
 
+
+def publication_safe(directory, meta):
+    """Read-only ownership proof for terminal tasks; never signal or reconcile."""
+    try:
+        if meta.get('launch_prepared') or meta.get('resume_prepared'):
+            return False
+        if meta.get('remote_key'):
+            return (meta.get('remote_cleanup_generation') == meta.get('runtime_generation') and
+                    meta.get('remote_cleanup_state') in ('ABSENT', 'CLEANED'))
+        if (meta.get('machine') == 'work' and meta.get('runtime_generation') and
+                meta.get('cleanup_generation') == meta['runtime_generation'] and
+                meta.get('cleanup_state') in ('ABSENT', 'CLEANED')):
+            return True  # Same generation-bound attestation as cleanup_group.
+        if meta.get('runtime_generation'):
+            import runtime_liveness
+            record = runtime_liveness.validate(runtime_liveness.read_record(directory), meta)
+            if (record.get('exit_code') is None or record.get('phase') != 'EXITED' or
+                    int((directory / 'exit_code').read_text().strip()) != record['exit_code']):
+                return False
+        receipt = read_json(directory / 'process_group.json')
+        if receipt is None:
+            if meta.get('runtime_generation'):
+                # Exited direct PIDs cannot rule out escaped historical children.
+                # Terminal runtimes require a group receipt or bound attestation.
+                return False
+            leader = process_details(meta.get('pid', 0)) if meta.get('pid', 0) else None
+            return not alive(meta) and not leader
+        for key, value in (('task_id', meta['id']), ('generation', meta.get('runtime_generation')),
+                           ('turn', meta.get('turns', 1)), ('role', meta.get('role', 'coding')),
+                           ('agent', meta['agent']), ('machine', meta['machine'])):
+            if receipt.get(key) != value:
+                return False
+        return (group_ownership(receipt) == 'ABSENT' and
+                all(group_ownership(receipt, group) == 'ABSENT' for group in receipt.get('groups', [])) and
+                not session_members(receipt['sid']))
+    except Exception:
+        return False  # Missing/corrupt ownership proof never frees a repository.
+
+
 def reconcile_task(directory, meta, state, code):
     """Called under worker.lock; preserve original receipts and audit history."""
     if state not in ('DONE', 'FAILED'):

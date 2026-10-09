@@ -65,6 +65,32 @@ class OwnerFlowTests(unittest.IsolatedAsyncioTestCase):
             await b.process_followup(issue, item, {}, {'status': 'DONE'})
             self.assertEqual(call.await_count, 1)
 
+    async def test_merge_hold_defers_fresh_answers_without_consuming_or_mutating_question(self):
+        for status in ('PENDING', 'BLOCKED'):
+            with self.subTest(status=status):
+                item = dict(task_id='same-session', mode='autopilot', owner_blocker='Choose database',
+                    owner_question_at='2026-01-01T00:00:00+00:00', review_status='NEEDS_OWNER',
+                    owner_state='PR_CREATED', post_merge_convergence={'status': status})
+                issue = {'number': 1}
+                comment = dict(id='answer', author={'login': 'siyovushdev'},
+                    createdAt='2026-01-02T00:00:00Z', body=
+                    '<!-- DEVORCHESTRATOR_OWNER_V1 {"action":"ANSWER","message":"Use SQLite"} -->')
+                report = dict(status='DONE', result=coding_result('NEEDS_OWNER', 'Choose database'))
+                before = json.loads(json.dumps(item))
+                with patch.object(b, 'mcp_call', new_callable=AsyncMock) as rpc, \
+                     patch.object(b, 'issue_comments', return_value=[comment]), \
+                     patch.object(b, 'save_state'), patch.object(b, 'transition_issue'), patch.object(b, 'add_comment'):
+                    self.assertIs(await b.process_followup(issue, item, {'issues': {'1': item}}, report), report)
+                    rpc.assert_not_awaited()
+                    self.assertEqual(item, before)
+                    # The same comment remains eligible after a proven non-merge.
+                    if status == 'PENDING':
+                        item['post_merge_convergence']['status'] = 'NOT_MERGED'
+                        rpc.return_value = {'status': 'RUNNING'}
+                        await b.process_followup(issue, item, {'issues': {'1': item}}, report)
+                        rpc.assert_awaited_once()
+                        self.assertIn('answer', item['processed_followups'])
+
     def test_coding_needs_owner_contract(self):
         report = {'status': 'DONE', 'result': coding_result('NEEDS_OWNER', 'Which database?')}
         self.assertEqual(b.terminal_state(report, {'mode': 'autopilot', 'autopilot_policy_version': 2})[1], 'dev:needs-owner')

@@ -71,6 +71,46 @@ class CleanupAttestationTests(unittest.TestCase):
         with patch.object(worker, 'read_json', side_effect=ValueError('No ownership proof')):
             self.assertEqual(worker.cleanup_group(self.directory, meta, 'DONE'), 'AMBIGUOUS')
 
+    def test_control_reader_requires_group_proof_or_current_local_attestation(self):
+        from contextlib import redirect_stdout
+        # Gone direct PIDs (including zero PIDs) never prove descendant cleanup.
+        for zero_pids in (False, True):
+            record = dict(self.record)
+            if zero_pids:
+                record.update(worker_pid=0, agent_pid=0, worker_identity=None, agent_identity=None)
+            write_json(self.directory / 'liveness.json', record)
+            for generation in (None, 'older-generation'):
+                with self.subTest(zero_pids=zero_pids, generation=generation):
+                    meta = dict(self.meta, cleanup_generation=generation, cleanup_state='ABSENT')
+                    write_json(self.directory / 'meta.json', meta)
+                    with patch.object(worker.os, 'killpg') as kill, \
+                         patch.object(devctl, 'reconcile_workers') as sweep, \
+                         redirect_stdout(io.StringIO()) as output:
+                        self.assertFalse(worker.publication_safe(self.directory, meta))
+                        devctl.list_tasks(as_json=True, cached=True, control=True)
+                    kill.assert_not_called()
+                    sweep.assert_not_called()
+                    self.assertEqual(json.loads(output.getvalue())[0]['status'], 'UNKNOWN')
+
+        write_json(self.directory / 'meta.json', self.meta)
+        certified = self.certify()
+        with patch.object(worker, 'read_json') as read, patch.object(worker, 'process_details') as details, \
+             patch.object(worker, 'session_members') as sessions, patch.object(worker.os, 'killpg') as kill:
+            self.assertTrue(worker.publication_safe(self.directory, certified))
+        for probe in (read, details, sessions, kill):
+            probe.assert_not_called()
+        with patch.object(devctl, 'reconcile_workers') as sweep, redirect_stdout(io.StringIO()) as output:
+            devctl.list_tasks(as_json=True, cached=True, control=True)
+        sweep.assert_not_called()
+        self.assertEqual(json.loads(output.getvalue())[0]['status'], 'DONE')
+
+        for flag in ('launch_prepared', 'resume_prepared'):
+            self.assertFalse(worker.publication_safe(self.directory, dict(certified, **{flag: True})))
+        remote = dict(certified, machine='firefly', remote_key='remote-turn')
+        self.assertFalse(worker.publication_safe(self.directory, remote))
+        new_turn = dict(certified, runtime_generation='new-generation')
+        self.assertFalse(worker.publication_safe(self.directory, new_turn))
+
     def test_active_and_prepared_tasks_cannot_use_matching_certification(self):
         meta = dict(self.meta, cleanup_generation=self.meta['runtime_generation'], cleanup_state='ABSENT')
         for state, flag in (('RUNNING', None), ('UNKNOWN', None), ('STARTING', None),

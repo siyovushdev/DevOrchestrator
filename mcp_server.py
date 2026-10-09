@@ -133,11 +133,14 @@ def continue_task(task_id: str, prompt: str, request_id: str | None = None,
 
 
 @mcp.tool()
-def list_tasks() -> list:
-    """List durable status without network probes; get_task_report refreshes individual SSH work."""
-    return json.loads(
-        devctl("tasks", "--json", "--cached")
-    )
+def list_tasks(control: bool = False, project: str | None = None) -> list:
+    """Control reads target worker ownership without running recovery sweeps."""
+    args = ["tasks", "--json", "--cached"]
+    if control:
+        args += ["--control"]
+        if project:
+            args += ["--control-project", project]
+    return json.loads(devctl(*args))
 
 
 @mcp.tool()

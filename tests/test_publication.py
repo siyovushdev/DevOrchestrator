@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 from pathlib import Path
@@ -84,6 +85,97 @@ class PublicationTests(unittest.TestCase):
         b.invalidate_quality_gates(self.item)
         self.assertIsNone(self.item['owner_state'])
         self.assertIsNone(self.item['reviewed_tree'])
+
+    def test_invalidation_drops_only_resolved_non_merge_assessment(self):
+        for status, master, retained in (('NOT_MERGED', None, False),
+                ('NOT_MERGED', 'master-sha', True), ('PENDING', None, True), ('BLOCKED', None, True)):
+            with self.subTest(status=status, master=master):
+                assessment = dict(status=status, expected_head='old-commit', master_sha=master)
+                item = dict(owner_state='PR_CREATED', publication_journal={'MERGE': {'outcome': status}},
+                            post_merge_convergence=assessment.copy())
+                b.invalidate_quality_gates(item)
+                self.assertEqual('post_merge_convergence' in item, retained)
+                if retained:
+                    self.assertEqual(item['post_merge_convergence'], assessment)
+                self.assertEqual(item['publication_journal'], {})
+
+    def prepare_non_merge_correction(self, turn=1):
+        self.item.update(owner_approved_at='2026-10-08T09:00:00Z',
+                         coding_turn=turn, review_coding_turn=turn)
+        self.commit()
+        sha = self.item['commit_sha']
+        self.item.update(owner_state='PR_CREATED', post_merge_convergence=dict(
+            status='NOT_MERGED', expected_head=sha))
+        self.item['publication_journal']['MERGE'] = {'outcome': 'NOT_MERGED'}
+        b.invalidate_quality_gates(self.item)
+        (self.root / 'file').write_text(f'correction {turn}')
+        self.item.update(owner_state=b.OWNER_STATE_READY, coding_turn=turn + 1,
+                         review_coding_turn=turn + 1, reviewed_tree=self.repo.snapshot())
+        return sha
+
+    def test_multiple_non_merge_corrections_preserve_original_baseline(self):
+        baseline = copy.deepcopy(self.report['git_baseline'])
+        first = self.prepare_non_merge_correction()
+        second = self.prepare_non_merge_correction(turn=2)
+        self.commit()
+        self.assertNotEqual(first, second)
+        self.assertEqual(self.git('rev-parse', 'HEAD^'), second)
+        self.assertEqual(self.report['git_baseline'], baseline)
+
+    def test_non_merge_correction_requires_bound_owned_commit_history(self):
+        sha = self.prepare_non_merge_correction()
+        original = copy.deepcopy(self.item)
+        corruptions = [
+            (('post_merge_convergence', 'status'), 'PENDING'),
+            (('post_merge_convergence', 'master_sha'), 'merged'),
+            (('post_merge_convergence', 'expected_head'), 'other'),
+            (('journal', 'MERGE', 'outcome'), 'PENDING'),
+            (('journal', 'COMMIT', 'done'), False),
+            (('journal', 'COMMIT', 'command', 'action'), 'PUSH'),
+            (('journal', 'COMMIT', 'candidate'), 'other'),
+            (('journal', 'COMMIT', 'before', 'head'), 'other'),
+            (('journal', 'COMMIT', 'before', 'origin'), 'other'),
+            (('journal', 'COMMIT', 'before', 'branch'), 'other'),
+            (('journal', 'COMMIT', 'before', 'root'), 'other'),
+            (('journal', 'COMMIT', 'before', 'push_urls'), ['other']),
+            (('reviewed_tree', 'fingerprint'), 'other'),
+            (('approved_at',), None),
+            (('owner_state',), 'MERGED'),
+            (('coding_turn',), 2),
+            (('commit_sha',), 'other'),
+        ]
+        for path, value in corruptions:
+            with self.subTest(path=path):
+                self.item = copy.deepcopy(original)
+                target = self.item['publication_history'][0]
+                for key in path[:-1]:
+                    target = target[key]
+                target[path[-1]] = value
+                with self.assertRaises(p.PublicationError):
+                    self.commit()
+                self.assertEqual(self.git('rev-parse', 'HEAD'), sha)
+                self.assertEqual(self.item['publication_journal'], {})
+        self.item = copy.deepcopy(original)
+        self.item['publication_history'] = []
+        with self.assertRaises(p.PublicationError):
+            self.commit()
+
+    def test_non_merge_correction_keeps_baseline_and_current_tree_checks(self):
+        sha = self.prepare_non_merge_correction()
+        for report in ({}, {'adopted': True, **self.report},
+                       {'git_baseline': {**self.report['git_baseline'], 'clean': False}}):
+            with self.subTest(report=report), self.assertRaises(p.PublicationError):
+                p.execute(self.repo, self.item, report, {'action': 'COMMIT'}, lambda: None)
+        (self.root / 'file').write_text('unreviewed change')
+        with self.assertRaises(p.PublicationError):
+            self.commit()
+        self.assertEqual(self.git('rev-parse', 'HEAD'), sha)
+        self.git('commit', '--allow-empty', '-m', 'unrelated movement')
+        moved = self.git('rev-parse', 'HEAD')
+        self.item['reviewed_tree'] = self.repo.snapshot()
+        with self.assertRaises(p.PublicationError):
+            self.commit()
+        self.assertEqual(self.git('rev-parse', 'HEAD'), moved)
 
     def test_contract_and_origin_validation(self):
         self.assertEqual(b.parse_owner_command('<!-- DEVORCHESTRATOR_OWNER_V1 {"action":"commit"} -->')['action'], 'COMMIT')
