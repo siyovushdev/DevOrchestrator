@@ -95,6 +95,8 @@ class Harness:
             'author': {'login': 'bridge'}, 'body': body})
 
     async def transport(self, name, args):
+        if name == 'preflight_task':
+            return {'status': 'REPLAY' if args['arguments'].get('request_id') in self.requests else 'READY'}
         if name == 'list_tasks':
             return [dict(t, project='test') for t in self.tasks.values()]
         if name == 'get_task_report':
@@ -147,6 +149,135 @@ class BridgeIntegrationTests(unittest.IsolatedAsyncioTestCase):
                    patch.object(b, 'send_telegram', self.h.telegram)]
         for p in patches: p.start(); self.addCleanup(p.stop)
         self.addCleanup(lambda: setattr(b, 'WORK_CONTEXT', None))
+
+    async def test_execution_profile_request_and_identity_survive_bridge_restart(self):
+        meta = dict(project='test', agent='cursor', model='composer-2.5', execution_profile='cursor-fast',
+                    execution_options={'fast': False}, mode='autopilot')
+        self.h.issues[1]['body'] = '<!-- DEVORCHESTRATOR_TASK_V1 ' + json.dumps(meta) + ' -->\nImplement task'
+        seen = []
+        execution = dict(agent='cursor', model='composer-2.5', options={'fast': False},
+                         decision_sources={'model': 'explicit'})
+        async def transport(name, args):
+            if name == 'start_task': seen.append(copy.deepcopy(args))
+            result = await self.h.transport(name, args)
+            if name == 'start_task':
+                result.update(execution=execution, execution_options={'fast': False}, model='composer-2.5')
+                self.h.tasks[result['task_id']].update(execution=execution, execution_options={'fast': False})
+            return result
+        with patch.object(b, 'transport_call', transport):
+            await self.tick(); self.h.restart(); await self.tick()
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0]['execution_profile'], 'cursor-fast')
+        self.assertEqual(seen[0]['execution_options'], {'fast': False})
+        item = self.h.state['issues']['1']
+        self.assertEqual(item['execution'], execution)
+        self.assertEqual(item['task_spec']['arguments']['execution_profile'], 'cursor-fast')
+        from operational_state import status_view
+        self.assertEqual(status_view(self.h.state, '1')['execution_options'], {'fast': False})
+
+    async def test_unsupported_execution_option_fails_before_bridge_rpc(self):
+        meta = dict(project='test', agent='cursor', execution_options={'invented': True})
+        self.h.issues[1]['body'] = '<!-- DEVORCHESTRATOR_TASK_V1 ' + json.dumps(meta) + ' -->\nImplement task'
+        await self.tick()
+        self.assertFalse(self.h.starts)
+        self.assertEqual(self.h.state['issues']['1']['queue_status'], 'FAILED')
+        self.assertFalse(self.h.state['issues']['1'].get('pending_rpc'))
+
+    async def test_cursor_preflight_rejection_fails_queue_and_releases_repository(self):
+        message = 'Cursor fixture does not advertise compose-fast; update the catalog'
+        calls = []
+        async def transport(name, args):
+            calls.append(name)
+            if name == 'preflight_task':
+                self.assertFalse(self.h.state['issues']['1'].get('pending_rpc'))
+                self.assertFalse(any(j['status'] == 'RESERVED' for j in self.h.state.get('work_queue', {}).values()))
+                return {'status': 'REJECTED', 'launch_started': False, 'error': message}
+            return await self.h.transport(name, args)
+        with patch.object(b, 'transport_call', transport):
+            await self.tick(); self.h.restart(); await self.tick()
+        self.assertEqual(calls.count('preflight_task'), 1)
+        self.assertNotIn('start_task', calls)
+        item = self.h.state['issues']['1']
+        self.assertEqual(item['queue_status'], 'FAILED')
+        self.assertEqual(item['owner_blocker'], message)
+        self.assertFalse(item.get('pending_rpc')); self.assertFalse(self.h.state['repo_locks'])
+        self.assertTrue(all(j['status'] == 'FAILED' and not j.get('launch_pending') for j in self.h.state['work_queue'].values()))
+
+    async def test_review_preflight_role_and_runtime_rejection_is_terminal_and_unlocks(self):
+        await self.tick(); item = self.h.state['issues']['1']; coder = item['task_id']
+        self.h.finish(coder, coding_result())
+        message = 'Review profile cursor-fast is for cursor, but review_execution_profiles maps it to codex'
+        calls = []
+        async def transport(name, args):
+            if name == 'preflight_task':
+                calls.append(args)
+                self.assertEqual(args['arguments']['role'], 'review')
+                return {'status': 'REJECTED', 'launch_started': False, 'error': message}
+            return await self.h.transport(name, args)
+        with patch.object(b, 'transport_call', transport):
+            await self.tick(); self.h.restart(); await self.tick()
+        item = self.h.state['issues']['1']
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(item['review_status'], 'FAILED')
+        self.assertEqual(item['owner_blocker'], message)
+        self.assertFalse(item.get('pending_rpc')); self.assertFalse(self.h.state['repo_locks'])
+        self.assertEqual(len(self.h.starts), 1)
+        self.assertIsNone(item.get('owner_state'))
+        self.assertTrue(any(message in c['body'] for c in self.h.comments[1]))
+
+    async def test_worker_rejection_after_successful_preflight_is_not_an_ambiguous_launch(self):
+        message = 'Cursor runtime variant disappeared before locked preparation'
+        async def transport(name, args):
+            if name == 'start_task':
+                return {'status': 'REJECTED', 'launch_started': False, 'error': message}
+            return await self.h.transport(name, args)
+        with patch.object(b, 'transport_call', transport):
+            await self.tick(); self.h.restart(); await self.tick()
+        item = self.h.state['issues']['1']
+        self.assertEqual(item['queue_status'], 'FAILED'); self.assertEqual(item['owner_blocker'], message)
+        self.assertFalse(item.get('pending_rpc')); self.assertFalse(self.h.state['repo_locks'])
+        self.assertFalse(self.h.starts)
+
+    async def test_uncertain_worker_response_keeps_reservation_and_replays_saved_request(self):
+        self.h.fail_after_start = True
+        await self.tick()
+        item = self.h.state['issues']['1']
+        self.assertTrue(item.get('pending_rpc')); self.assertTrue(self.h.state['repo_locks'])
+        self.assertTrue(any(j['status'] == 'RESERVED' and j.get('launch_pending') for j in self.h.state['work_queue'].values()))
+        self.h.restart()
+        retry = self.h.state['issues']['1']['reconciliation_retry']['next_attempt'] + 1
+        with patch.object(b.time, 'time', return_value=retry): await self.tick()
+        self.assertEqual(len(self.h.starts), 1)
+        self.assertFalse(self.h.state['issues']['1'].get('pending_rpc'))
+
+    async def test_old_reserved_request_without_worker_receipt_can_fail_preflight(self):
+        async def old_failure(name, args):
+            if name == 'start_task': raise RuntimeError('Old adapter hid prelaunch validation error')
+            return await self.h.transport(name, args)
+        with patch.object(b, 'transport_call', old_failure): await self.tick()
+        self.assertTrue(self.h.state['repo_locks']); self.assertFalse(self.h.requests)
+        self.h.restart()
+        message = 'Cursor runtime discovery failed; check authentication/connectivity'
+        async def transport(name, args):
+            if name == 'preflight_task':
+                return {'status': 'REJECTED', 'launch_started': False, 'error': message}
+            return await self.h.transport(name, args)
+        retry = self.h.state['issues']['1']['reconciliation_retry']['next_attempt'] + 1
+        with patch.object(b, 'transport_call', transport), patch.object(b.time, 'time', return_value=retry):
+            await self.tick(); self.h.restart(); await self.tick()
+        self.assertEqual(self.h.state['issues']['1']['queue_status'], 'FAILED')
+        self.assertEqual(self.h.state['issues']['1']['owner_blocker'], message)
+        self.assertFalse(self.h.state['repo_locks']); self.assertFalse(self.h.starts)
+
+    async def test_malformed_rejection_preserves_uncertain_reservation(self):
+        async def transport(name, args):
+            if name == 'start_task':
+                return {'status': 'REJECTED', 'error': 'Missing no-launch proof'}
+            return await self.h.transport(name, args)
+        with patch.object(b, 'transport_call', transport): await self.tick()
+        self.assertTrue(self.h.state['repo_locks'])
+        self.assertTrue(self.h.state['issues']['1'].get('pending_rpc'))
+        self.assertTrue(any(j['status'] == 'RESERVED' for j in self.h.state['work_queue'].values()))
 
     async def tick(self):
         # These downstream owner/recovery tests explicitly drive both quality

@@ -920,7 +920,8 @@ class ControlWorkerTests(unittest.TestCase):
         source = ('import json; print(json.dumps({"type":"thread.started","thread_id":"session"})); '
                   'print(json.dumps({"type":"item.completed","item":{"type":"agent_message","text":"done"}}))')
         command = shlex.join([sys.executable, '-c', source])
-        with redirect_stdout(io.StringIO()), patch.object(devctl, 'build_agent_command', return_value=command):
+        with redirect_stdout(io.StringIO()), patch.object(devctl, 'build_agent_command', return_value=command), \
+                patch.object(devctl.execution_profiles, 'discover', return_value={'version': 'dummy-codex', 'help': '--model --config'}):
             devctl.run_project('test', 'dummy', request_id='a' * 64)
         meta = self.wait('a' * 24)
         # The real cleanup/recovery tests cover survivors; this proves that the

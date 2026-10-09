@@ -390,7 +390,7 @@ def admit(data_dir, machine, canonical, task_id, task_state):
     write_json(path, leases)
 
 
-def launch(data_dir, request_id, task_id, callback, prepare=None, signature=None):
+def launch(data_dir, request_id, task_id, callback, prepare=None, signature=None, signature_version=None):
     """Receipt is durable before launching. A crash can leave UNKNOWN, never a duplicate."""
     valid_request(request_id)
     if not request_id:
@@ -407,7 +407,11 @@ def launch(data_dir, request_id, task_id, callback, prepare=None, signature=None
             return 0
         if prepare:
             prepare()
-        write_json(path, {'task_id': task_id, 'status': 'PENDING', 'signature': signature})
+        record = {'task_id': task_id, 'status': 'PENDING', 'signature': signature}
+        if signature_version is not None:
+            record['signature_version'] = signature_version
+        write_json(path, record)
         result = callback()
-        write_json(path, {'task_id': task_id, 'status': 'STARTED', 'signature': signature})
+        record['status'] = 'STARTED'
+        write_json(path, record)
         return result
