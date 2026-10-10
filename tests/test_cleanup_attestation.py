@@ -71,7 +71,9 @@ class CleanupAttestationTests(unittest.TestCase):
         with patch.object(worker, 'read_json', side_effect=ValueError('No ownership proof')):
             self.assertEqual(worker.cleanup_group(self.directory, meta, 'DONE'), 'AMBIGUOUS')
 
-    def test_control_reader_requires_group_proof_or_current_local_attestation(self):
+    @patch.object(devctl, 'load_projects', return_value={
+        'test': {'machine': 'work', 'workspace': '/registered'}})
+    def test_control_reader_requires_group_proof_or_current_local_attestation(self, _registry):
         from contextlib import redirect_stdout
         # Gone direct PIDs (including zero PIDs) never prove descendant cleanup.
         for zero_pids in (False, True):

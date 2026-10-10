@@ -55,10 +55,13 @@ class MergeRefused(PublicationError):
 
 class Repository:
     def __init__(self, project, report=None):
+        from copy import deepcopy
+        self.project = project
+        self.report = deepcopy(report)
         registry = devctl.load_projects()
         if project not in registry:
             raise PublicationError('Unknown registered project')
-        self.cfg = registry[project]
+        self.cfg = deepcopy(registry[project])
         self.machine = self.cfg['machine']
         self.workspace = self.cfg['workspace']
         if report and (report.get('machine') != self.machine or
@@ -139,44 +142,44 @@ with tempfile.TemporaryDirectory() as hooks:
 '''
 
 
-def converge_merge(repo, item, entry, persist):
+def _converge_merge_steps(repo, item, entry, persist):
     """Resume only our expected old/target refs; never reset, rebase or force."""
     branch, old, base = item['publication_branch'], item['commit_sha'], entry['base']
     result = item['post_merge_convergence']
     target = result['master_sha']
     try:
-        current = repo.snapshot()
+        current = (yield ('snapshot', ()))
         if (current['branch'] != branch or current['head'] not in (old, target) or current['status'] or
                 current['origin'] != item['publication_origin']):
             raise PublicationError('Registered development branch moved or worktree is dirty')
         def remote(name):
-            refs = repo.git('ls-remote', 'origin', 'refs/heads/' + name).split()
+            refs = (yield ('git', ('ls-remote', 'origin', 'refs/heads/' + name))).split()
             if len(refs) != 2 or refs[1] != 'refs/heads/' + name:
                 raise PublicationError('Cannot prove remote branch identity')
             return refs[0]
-        if remote(base) != target:
+        if (yield from remote(base)) != target:
             raise PublicationError('Master moved after authorized merge')
-        if remote(branch) not in (old, target):
+        if (yield from remote(branch)) not in (old, target):
             raise PublicationError('Remote development branch moved concurrently')
-        repo.git('fetch', '--no-tags', 'origin', 'refs/heads/' + base + ':refs/remotes/origin/' + base)
-        if repo.git('rev-parse', 'FETCH_HEAD') != target:
+        (yield ('git', ('fetch', '--no-tags', 'origin', 'refs/heads/' + base + ':refs/remotes/origin/' + base)))
+        if (yield ('git', ('rev-parse', 'FETCH_HEAD'))) != target:
             raise PublicationError('Fetched master differs from authorized merge')
         # merge-base must succeed BEFORE either branch is updated.
-        repo.git('merge-base', '--is-ancestor', old, target)
+        (yield ('git', ('merge-base', '--is-ancestor', old, target)))
         if current['head'] == old:
             # CAS the checked-out branch, then safely update its index/worktree.
             # If read-tree fails, the next snapshot is dirty and recovery stops.
-            repo.git('update-ref', 'refs/heads/' + branch, target, old)
+            (yield ('git', ('update-ref', 'refs/heads/' + branch, target, old)))
             persist()
-            observed = repo.snapshot()
+            observed = (yield ('snapshot', ()))
             if observed['branch'] != branch or observed['head'] != target:
                 raise PublicationError('Local branch changed after expected-head update')
-            repo.git('read-tree', '-u', '-m', old, target)
-        if remote(branch) == old:
-            repo.run('python3', '-c', CAS_PUSH_SCRIPT, repo.workspace, branch, old, target)
-        final = repo.snapshot()
+            (yield ('git', ('read-tree', '-u', '-m', old, target)))
+        if (yield from remote(branch)) == old:
+            (yield ('run', ('python3', '-c', CAS_PUSH_SCRIPT, repo.workspace, branch, old, target)))
+        final = (yield ('snapshot', ()))
         if (final['head'] != target or final['branch'] != branch or final['status'] or
-                remote(branch) != target or remote(base) != target):
+                (yield from remote(branch)) != target or (yield from remote(base)) != target):
             raise PublicationError('Final development/master convergence could not be proven')
         result.update(status='DONE', diagnostic=None, local_head=target, remote_dev=target)
     except Exception:
@@ -241,7 +244,7 @@ def validate_baseline(item, report, snapshot):
         raise PublicationError('Current repository does not match independently reviewed state')
 
 
-def prove_non_merge(repo, item, persist, *, allow_open=False):
+def _prove_non_merge_steps(repo, item, persist, *, allow_open=False):
     """Resolve only a bound, definitive non-merge; unavailable reads retain the hold."""
     result = item.get('post_merge_convergence')
     if (item.get('merged') or item.get('owner_state') == 'MERGED' or
@@ -260,8 +263,7 @@ def prove_non_merge(repo, item, persist, *, allow_open=False):
                 item.get('pr_url') != f'https://github.com/{remote}/pull/{number}' or
                 (result is not None and result.get('expected_head') != sha)):
             return False
-        view = json.loads(repo.run('gh', 'pr', 'view', str(number), '--repo', 'github.com/' + remote,
-            '--json', 'number,url,state,headRefOid,isCrossRepository,mergedAt,mergeCommit'))
+        view = json.loads((yield ('run', ('gh', 'pr', 'view', str(number), '--repo', 'github.com/' + remote, '--json', 'number,url,state,headRefOid,isCrossRepository,mergedAt,mergeCommit'))))
         if (view.get('number') != number or view.get('url') != item['pr_url'] or
                 view.get('headRefOid') != sha or view.get('isCrossRepository') is not False or
                 view.get('mergedAt') or (view.get('mergeCommit') or {}).get('oid') or
@@ -283,27 +285,29 @@ def prove_non_merge(repo, item, persist, *, allow_open=False):
     return True
 
 
-def execute(repo, item, report, command, persist):
+def _execute_steps(repo, item, report, command, persist, *, reconcile_only=False):
     """Failed preconditions cannot erase an uncertain earlier external effect."""
     try:
-        return _execute(repo, item, report, command, persist)
+        return (yield from __execute_steps(repo, item, report, command, persist, reconcile_only=reconcile_only))
     except PublicationError:
         if command.get('action') == 'MERGE' and (
                 item.get('post_merge_convergence') or {}).get('status') != 'NOT_MERGED':
             # Also inspect after early permanent errors (dirty tree, stale Chief,
             # moved refs). A CLOSED observation can settle a previous uncertainty
             # without authorizing a publication or changing any Git history.
-            prove_non_merge(repo, item, persist)
+            (yield from _prove_non_merge_steps(repo, item, persist))
         raise
 
 
-def _execute(repo, item, report, command, persist):
+def __execute_steps(repo, item, report, command, persist, *, reconcile_only=False):
     """Journal before mutations. Recover uncertain results by inspecting Git/GitHub."""
     from chief_review import approval_complete
-    if not approval_complete(item):
+    if not reconcile_only and not approval_complete(item):
         raise PublicationError('Current Chief PASS is required for publication')
     action = command['action']
-    current = repo.snapshot()
+    if reconcile_only and not (item.get('publication_journal') or {}).get(action):
+        raise PublicationError('Archived recovery requires an existing publication journal')
+    current = (yield ('snapshot', ()))
     journal = item.setdefault('publication_journal', {})
     entry = journal.get(action)
     if entry and entry.get('command') != command:
@@ -311,13 +315,13 @@ def _execute(repo, item, report, command, persist):
     if action == 'COMMIT':
         if not entry:
             validate_baseline(item, report, current)
-            if current['head'] and repo.git('rev-parse', current['head'] + '^{tree}') == current['tree']:
+            if current['head'] and (yield ('git', ('rev-parse', current['head'] + '^{tree}'))) == current['tree']:
                 raise PublicationError('Reviewed tree contains no commit changes')
             message = command.get('message') or f"DevOrchestrator: task {item['task_id']}"
             args = ['commit-tree', current['tree']]
             if current['head']:
                 args += ['-p', current['head']]
-            candidate = repo.git(*args, '-m', message)
+            candidate = (yield ('git', (*args, '-m', message)))
             entry = {'command': command, 'before': current, 'candidate': candidate}
             journal[action] = entry
             persist()
@@ -329,15 +333,14 @@ def _execute(repo, item, report, command, persist):
         if current['head'] == before['head']:
             if current['fingerprint'] != before['fingerprint']:
                 raise PublicationError('Reviewed index/state changed during COMMIT')
-            repo.git('update-ref', 'refs/heads/' + before['branch'], candidate,
-                     before['head'] or '0' * len(candidate))
+            (yield ('git', ('update-ref', 'refs/heads/' + before['branch'], candidate, before['head'] or '0' * len(candidate))))
         elif current['head'] != candidate:
             raise PublicationError('Unexpected HEAD during COMMIT recovery')
         elif current['index'] != before['index'] and current['status']:
             raise PublicationError('Index changed during interrupted COMMIT; preserving user index')
         # No working files are rewritten. This is also safe after an interrupted update-ref.
-        repo.git('read-tree', candidate)
-        after = repo.snapshot()
+        (yield ('git', ('read-tree', candidate)))
+        after = (yield ('snapshot', ()))
         if after['head'] != candidate or after['tree'] != before['tree'] or after['status']:
             raise PublicationError('Repository changed while completing COMMIT')
         item['commit_sha'] = candidate
@@ -352,42 +355,40 @@ def _execute(repo, item, report, command, persist):
         if current['origin'] != item.get('publication_origin'):
             raise PublicationError('origin changed after COMMIT')
         remote = github_repo(current['origin'])
-        push_urls = repo.git('remote', 'get-url', '--push', '--all', 'origin').splitlines()
-        fetch_urls = repo.git('remote', 'get-url', '--all', 'origin').splitlines()
+        push_urls = (yield ('git', ('remote', 'get-url', '--push', '--all', 'origin'))).splitlines()
+        fetch_urls = (yield ('git', ('remote', 'get-url', '--all', 'origin'))).splitlines()
         if fetch_urls != [current['origin']] or len(push_urls) != 1 or github_repo(push_urls[0]) != remote:
             raise PublicationError('origin fetch/push URLs do not identify the same single GitHub repository')
         expected = repo.cfg.get('github_repo')
         if expected and remote != expected:
             raise PublicationError('origin does not match registered github_repo')
         gh_repo = 'github.com/' + remote
-        default = json.loads(repo.run('gh', 'repo', 'view', gh_repo, '--json', 'defaultBranchRef,nameWithOwner,url'))
+        default = json.loads((yield ('run', ('gh', 'repo', 'view', gh_repo, '--json', 'defaultBranchRef,nameWithOwner,url'))))
         if default.get('nameWithOwner', '').lower() != remote.lower() or default.get('url', '').lower() != ('https://github.com/' + remote).lower():
             raise PublicationError('GitHub repository identity changed or redirected')
         base = default['defaultBranchRef']['name']
         if branch == base:
             raise PublicationError('Publication requires a non-default branch')
         if not entry:
-            entry = {'command': command, 'base': base, 'repo': remote}
+            entry = {'command': command, 'base': base, 'repo': remote, 'request_protocol': 2}
             journal[action] = entry
             persist()
         if entry['repo'] != remote or entry['base'] != base:
             raise PublicationError('GitHub repository/base changed')
         if action == 'PUSH':
-            refs = repo.git('ls-remote', 'origin', 'refs/heads/' + branch).split()
+            refs = (yield ('git', ('ls-remote', 'origin', 'refs/heads/' + branch))).split()
             if not refs or refs[0] != sha:
                 # Local hooks and followTags config cannot expand owner authorization.
-                repo.git('push', '--no-verify', '--no-follow-tags', 'origin', sha + ':refs/heads/' + branch)
-            refs = repo.git('ls-remote', 'origin', 'refs/heads/' + branch).split()
+                (yield ('git', ('push', '--no-verify', '--no-follow-tags', 'origin', sha + ':refs/heads/' + branch)))
+            refs = (yield ('git', ('ls-remote', 'origin', 'refs/heads/' + branch))).split()
             if not refs or refs[0] != sha:
                 raise PublicationError('Remote branch does not match authorized commit')
             item['pushed_branch'] = branch
         else:
-            refs = repo.git('ls-remote', 'origin', 'refs/heads/' + branch).split()
+            refs = (yield ('git', ('ls-remote', 'origin', 'refs/heads/' + branch))).split()
             if not refs or refs[0] not in (sha, resume_target):
                 raise PublicationError('Remote branch changed after PUSH')
-            prs = json.loads(repo.run('gh', 'pr', 'list', '--repo', gh_repo,
-                             '--head', branch, '--base', base, '--state', 'all',
-                             '--json', 'number,url,state,headRefOid,headRefName,baseRefName,headRepositoryOwner,isCrossRepository'))
+            prs = json.loads((yield ('run', ('gh', 'pr', 'list', '--repo', gh_repo, '--head', branch, '--base', base, '--state', 'all', '--json', 'number,url,state,headRefOid,headRefName,baseRefName,headRepositoryOwner,isCrossRepository'))))
             if any(pr.get('headRefOid') != sha or pr.get('isCrossRepository') for pr in prs if pr.get('state') == 'OPEN'):
                 raise PublicationError('Existing open PR does not match authorized repository/commit')
             prs = [pr for pr in prs if not pr.get('isCrossRepository') and (
@@ -398,11 +399,14 @@ def _execute(repo, item, report, command, persist):
                 if prs and prs[0]['state'] != 'OPEN':
                     raise PublicationError('Existing PR is closed or merged')
                 if not prs:
-                    repo.run('gh', 'pr', 'create', '--repo', gh_repo, '--head', branch,
-                             '--base', base, '--title', command.get('title') or f"Task {item['task_id']}",
-                             '--body', command.get('body') or 'Independently reviewed DevOrchestrator task.')
-                    prs = json.loads(repo.run('gh', 'pr', 'list', '--repo', gh_repo, '--head', branch,
-                                     '--base', base, '--state', 'open', '--json', 'number,url,headRefOid,isCrossRepository'))
+                    if entry.get('create_status') or entry.get('request_protocol') != 2:
+                        raise PublicationError('PR creation acceptance uncertain; retain journal and reconcile the exact PR before retrying')
+                    entry['create_status'] = 'SENDING'
+                    persist()
+                    (yield ('run', ('gh', 'pr', 'create', '--repo', gh_repo, '--head', branch, '--base', base, '--title', command.get('title') or f"Task {item['task_id']}", '--body', command.get('body') or 'Independently reviewed DevOrchestrator task.')))
+                    entry['create_status'] = 'SENT'
+                    persist()
+                    prs = json.loads((yield ('run', ('gh', 'pr', 'list', '--repo', gh_repo, '--head', branch, '--base', base, '--state', 'open', '--json', 'number,url,headRefOid,isCrossRepository'))))
                     prs = [pr for pr in prs if pr.get('headRefOid') == sha and not pr.get('isCrossRepository')]
                 if len(prs) != 1:
                     raise PublicationError('Cannot confirm created PR')
@@ -447,36 +451,32 @@ def _execute(repo, item, report, command, persist):
                     entry['outcome'] = 'PENDING'
                     persist()
                     try:
-                        merged = json.loads(repo.run('gh', 'api', '--hostname', 'github.com', '--method', 'PUT',
-                            f"repos/{remote}/pulls/{pr['number']}/merge",
-                            '--raw-field', 'sha=' + sha, '--raw-field', 'merge_method=' + method))
+                        merged = json.loads((yield ('run', ('gh', 'api', '--hostname', 'github.com', '--method', 'PUT', f"repos/{remote}/pulls/{pr['number']}/merge", '--raw-field', 'sha=' + sha, '--raw-field', 'merge_method=' + method))))
                     except MergeRefused as exc:
                         item['post_merge_convergence']['refusal_http_status'] = exc.status
                         persist()
                         if not uncertain_retry:
-                            prove_non_merge(repo, item, persist, allow_open=True)
+                            (yield from _prove_non_merge_steps(repo, item, persist, allow_open=True))
                         raise
                     if merged.get('merged') is not True:
                         if merged.get('merged') is False and not uncertain_retry:
                             # An explicit rejection resolves this fresh attempt,
                             # but not a possibly in-flight older uncertain call.
-                            prove_non_merge(repo, item, persist, allow_open=True)
+                            (yield from _prove_non_merge_steps(repo, item, persist, allow_open=True))
                         raise PublicationError('GitHub refused the authorized merge')
                     item['merged'] = True
                     entry['outcome'] = 'MERGED'
                     persist()  # A later failed/stale read cannot undo a successful merge.
                 convergence = item.get('post_merge_convergence')
                 if convergence is not None and not convergence_required:
-                    view = json.loads(repo.run('gh', 'pr', 'view', str(pr['number']), '--repo', gh_repo,
-                                               '--json', 'state,headRefOid'))
+                    view = json.loads((yield ('run', ('gh', 'pr', 'view', str(pr['number']), '--repo', gh_repo, '--json', 'state,headRefOid'))))
                     if view['state'] != 'MERGED' or view['headRefOid'] != sha:
                         raise PublicationError('Merge has not completed')
                     convergence.update(status='NOT_REQUIRED', required=False, diagnostic=None)
                 persist()  # GitHub merge is real even if convergence later fails.
                 if convergence_required and convergence is not None:
                     try:
-                        view = json.loads(repo.run('gh', 'pr', 'view', str(pr['number']), '--repo', gh_repo,
-                            '--json', 'number,url,state,headRefOid,headRefName,baseRefName,mergeCommit,isCrossRepository'))
+                        view = json.loads((yield ('run', ('gh', 'pr', 'view', str(pr['number']), '--repo', gh_repo, '--json', 'number,url,state,headRefOid,headRefName,baseRefName,mergeCommit,isCrossRepository'))))
                     except Exception:
                         view = {}
                     target = (view.get('mergeCommit') or {}).get('oid')
@@ -495,5 +495,80 @@ def _execute(repo, item, report, command, persist):
                             persist()
                         else:
                             persist()
-                            converge_merge(repo, item, entry, persist)
+                            (yield from _converge_merge_steps(repo, item, entry, persist))
     entry['done'] = True
+
+
+
+def _drive_sync(repo, steps):
+    """Compatibility adapter; the generator remains the only publication logic."""
+    value, error = None, None
+    while True:
+        try:
+            operation, arguments = steps.throw(error) if error is not None else steps.send(value)
+        except StopIteration as result:
+            return result.value
+        try:
+            value, error = getattr(repo, operation)(*arguments), None
+        except Exception as exc:
+            value, error = None, exc
+
+
+def new_publication_mutation(operation, arguments, action):
+    """Convergence after proven acceptance is separate from a new publication."""
+    if operation == 'git':
+        return bool(arguments and (arguments[0] in ('commit-tree', 'push') or
+                    (action == 'COMMIT' and arguments[0] == 'update-ref')))
+    return operation == 'run' and (arguments[:3] == ('gh', 'pr', 'create') or
+                                  arguments[:6] == ('gh', 'api', '--hostname', 'github.com', '--method', 'PUT'))
+
+
+async def _drive_async(repo, steps, *, action=None, before_mutation=None, authorization=None,
+                       record_dispatch=None):
+    from transition_io import call
+    value, error = None, None
+    while True:
+        try:
+            operation, arguments = steps.throw(error) if error is not None else steps.send(value)
+        except StopIteration as result:
+            return result.value
+        try:
+            guarded = new_publication_mutation(operation, arguments, action)
+            if guarded and before_mutation is not None:
+                await before_mutation()
+            primary = guarded and not (operation == 'git' and arguments[0] == 'commit-tree')
+            if primary and record_dispatch is not None:
+                record_dispatch('SENDING')
+            value = await call('repository', dict(project=repo.project, report=repo.report,
+                configuration=repo.cfg, method=operation, args=arguments), lane='effect',
+                authorization=authorization if guarded else None)
+            error = None
+        except Exception as exc:
+            value, error = None, exc
+
+
+def converge_merge(repo, item, entry, persist):
+    return _drive_sync(repo, _converge_merge_steps(repo, item, entry, persist))
+
+
+def prove_non_merge(repo, item, persist, *, allow_open=False):
+    return _drive_sync(repo, _prove_non_merge_steps(repo, item, persist, allow_open=allow_open))
+
+
+def execute(repo, item, report, command, persist):
+    return _drive_sync(repo, _execute_steps(repo, item, report, command, persist))
+
+
+async def execute_async(repo, item, report, command, persist, *, before_mutation=None,
+                        authorization=None, reconcile_only=False):
+    """Advance journal mutations on the caller; detach only copied repository I/O."""
+    def record_dispatch(status):
+        if command['action'] not in ('COMMIT', 'PUSH'):
+            return  # PR and MERGE already have durable send/uncertainty receipts.
+        entry = item['publication_journal'][command['action']]
+        if entry.get('dispatch_state') != status:
+            entry['dispatch_state'] = status
+            persist()
+    return await _drive_async(repo, _execute_steps(repo, item, report, command, persist,
+        reconcile_only=reconcile_only), action=command['action'], before_mutation=before_mutation,
+        authorization=authorization, record_dispatch=record_dispatch)

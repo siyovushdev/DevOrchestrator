@@ -81,10 +81,19 @@ class Scheduler:
     def repository_busy(self, owner, machine, repo):
         # An unresolved workspace may alias any repository on its registered machine.
         # If even that machine is unknown, hold all new admissions until reconciliation.
-        from operational_state import post_merge_repository_hold
+        from operational_state import post_merge_repository_hold, publication_repository_hold
+        from review_transitions import holds_repository
+        for number, item in self.state.get('issues', {}).items():
+            if str(number) == str(owner) or not (holds_repository(item) or publication_repository_hold(item)):
+                continue
+            owned = [job for job in self.jobs.values() if str(job.get('owner')) == str(number)]
+            if not owned or any(not job.get('repo') for job in owned):
+                return True  # Missing ownership evidence cannot imply a free repository.
         return (self.locks.get(repo, {}).get('owner', owner) != owner or
                 any(j.get('repo') == repo and j['owner'] != owner and
-                    post_merge_repository_hold(self.state.get('issues', {}).get(str(j['owner']), {}))
+                    (post_merge_repository_hold(self.state.get('issues', {}).get(str(j['owner']), {})) or
+                     publication_repository_hold(self.state.get('issues', {}).get(str(j['owner']), {})) or
+                     holds_repository(self.state.get('issues', {}).get(str(j['owner']), {})))
                     for j in self.jobs.values()) or
                 any(j['status'] in ('RESERVED', 'RUNNING', 'UNKNOWN') and
                     ((j.get('identity_pending') and j.get('machine') in (None, machine)) or
@@ -102,8 +111,9 @@ class Scheduler:
         self.locks[repo] = {'owner': owner, 'key': key}
 
     def available(self, job):
-        from operational_state import post_merge_repository_hold
-        if post_merge_repository_hold(self.state.get('issues', {}).get(str(job['owner']), {})):
+        from operational_state import post_merge_repository_hold, publication_repository_hold
+        if (post_merge_repository_hold(self.state.get('issues', {}).get(str(job['owner']), {})) or
+                publication_repository_hold(self.state.get('issues', {}).get(str(job['owner']), {}))):
             return False
         active = [j for j in self.jobs.values() if j['status'] in ('RESERVED', 'RUNNING', 'UNKNOWN')]
         limit = self.limits.coding if job['kind'] == 'coding' else self.limits.review
@@ -150,9 +160,12 @@ class Scheduler:
                 job['status'] = 'UNKNOWN'
 
     def release(self, owner):
-        from operational_state import chief_repository_hold, post_merge_repository_hold
+        from operational_state import chief_repository_hold, post_merge_repository_hold, publication_repository_hold
         item = self.state.get('issues', {}).get(str(owner))
-        if item is not None and (post_merge_repository_hold(item) or chief_repository_hold(item)):
+        from review_transitions import holds_repository
+        if item is not None and holds_repository(item):
+            return False
+        if item is not None and (post_merge_repository_hold(item) or chief_repository_hold(item) or publication_repository_hold(item)):
             # Both recovery and process_tracked's finally block use this path.
             # Review/merge milestones alone cannot release an unproven workspace.
             return False
@@ -201,12 +214,13 @@ class Scheduler:
                 if job['status'] in ('DONE', 'FAILED'):
                     self.release(job['owner'])
         diagnostics = self.state.setdefault('scheduler_diagnostics', {})
-        from operational_state import post_merge_repository_hold
+        from operational_state import post_merge_repository_hold, publication_repository_hold
+        from review_transitions import holds_repository
         # Repair a previously released lock from durable queue ownership. The
         # admission predicate also honors this hold before recovery can run.
         for key, job in self.jobs.items():
-            if job.get('repo') and post_merge_repository_hold(
-                    self.state.get('issues', {}).get(str(job['owner']), {})):
+            item = self.state.get('issues', {}).get(str(job['owner']), {})
+            if job.get('repo') and (post_merge_repository_hold(item) or holds_repository(item) or publication_repository_hold(item)):
                 self.locks.setdefault(job['repo'], {'owner': job['owner'], 'key': key})
         for repo, lock in list(self.locks.items()):
             jobs = [j for j in self.jobs.values() if j.get('repo') == repo and j.get('owner') == lock.get('owner')]
@@ -216,6 +230,14 @@ class Scheduler:
             if diagnostics.get(repo) == 'Lock retained: missing queue ownership proof':
                 diagnostics.pop(repo)
             item = self.state.get('issues', {}).get(str(lock.get('owner')))
+            from review_transitions import holds_repository
+            if item is not None and holds_repository(item):
+                continue
+            if item is not None and publication_repository_hold(item):
+                diagnostics[repo] = 'Lock retained: publication outcome is unproven'
+                continue
+            if diagnostics.get(repo) == 'Lock retained: publication outcome is unproven':
+                diagnostics.pop(repo)
             if item is not None and post_merge_repository_hold(item):
                 diagnostics[repo] = 'Lock retained: post-merge convergence is unproven'
                 continue
@@ -237,6 +259,7 @@ class Scheduler:
             # An archival cancellation proves no launch only while its original
             # unreserved queue identity has no task or uncertain launch receipt.
             if (all((j['status'] in ('DONE', 'FAILED') or
+                     (j['status'] == 'CANCELLED' and j.get('no_launch_proof') == 'FENCED') or
                      (archived and j['status'] == 'CANCELLED' and j.get('cancelled') == 'archived_issue' and
                       not j.get('task_id'))) and not j.get('launch_pending') for j in jobs) and
                     self.release(lock['owner'])):

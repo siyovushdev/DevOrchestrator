@@ -1,48 +1,75 @@
-# Operational control loop (V2-M2I)
+# Operational control loop (resumable transitions)
 
-`task_bridge_state.json` remains the only lifecycle authority, protected by the
-existing bridge process lock. The production `ControlLoop` runs a serial control
-pass on a monotonic ten-second deadline, rather than sleeping ten seconds after
-an entire global recovery tick. Read-only worker discovery, registered repository
-identity resolution, report collection and Chief evidence extraction run in
-background observations with detached arguments. Only the loop applies their
-results to the existing scheduler, lifecycle and outbox. There is no second
-journal or concurrent lifecycle writer.
+`task_bridge_state.json` remains the lifecycle authority, protected by the existing
+bridge process lock. `ControlLoop.step()` performs short serial state application
+and schedules copied I/O commands; it does not await an issue transition or its
+cancellation. Control reads have separate capacity from reconciliation, targeted
+owner/Chief RPCs, publication and Telegram sends. Completion wakes the loop without
+waiting for the next ten-second polling interval.
 
-Each control pass handles authorized Chief verdicts, owner publication commands,
-same-session follow-ups/answers, current labels, launch receipts and actionable
-outbox effects. Publication commands submitted before the quality gates are open
-receive a durable rejection receipt. Heavy discovery failures do not stop these
-controls. Background recovery results cannot authorize publication: the boundary
-still rechecks coding turn, Chief identity, reviewed content, registered repository,
-scheduler ownership and fresh worker metadata while holding the worker lock.
-`list_tasks(control=True, project=...)` reads ownership for the registered machine
-without historical cleanup sweeps; uncertain process receipts, missing leases,
-unknown metadata and surviving terminal children block publication.
-Terminal runtimes missing process-group receipts remain uncertain unless a local
-cleanup attestation matches the current generation. Control reads honor that
-attestation without probing or signalling; a new generation cannot reuse it.
+Only the loop advances lifecycle continuations. Suspended frames, live items,
+Scheduler instances, persistence callbacks and WORK_CONTEXT never run as detached
+Tasks or in threads. Executor operations accept frozen JSON commands. Unknown
+await boundaries fail closed. Blocking worker-lock acquisition is replaced by
+nonblocking acquisition and retry in driven lifecycle code. Shutdown waits for
+submitted I/O before releasing writer-held publication locks; it is deliberately
+not a force-cancellation mechanism.
 
-Legacy independent PASS with `READY_FOR_OWNER` but no Chief record stays enrolled
-for heavy evidence backfill. The control pass closes the Chief approval gate and
-acknowledges premature publication commands without claiming Chief ownership.
-Only a built, bound Chief record transfers this phase to the control path.
+Independent reviewer starts use versioned PREPARE, LAUNCH, VERIFY and DRAIN records.
+The launch envelope, reservation and repository ownership are saved atomically
+before dispatch. Restart inspects the worker request receipt before replay; a
+current request reuses its exact ID and arguments. Stale requests are fenced or
+drained, never replayed to resume stale preparation. New review bindings verify
+coding generation/turn, repository, execution policy and tree under worker.lock.
+See [resumable-transitions.md](resumable-transitions.md) for schema, migration,
+recovery boundaries, test coverage and limits.
 
-Recovery retains a fair issue queue across discovery sweeps, bounds background
-issue observations to two, and applies one issue slice per cycle with a five-second async RPC budget;
-interrupted launches retain the existing durable request/pending-operation identity.
-Expensive report/evidence reads remain in flight across cycles. Normal local/GitHub
-operation should process a visible verdict or owner command within one control
-cadence plus targeted reads (normally within twenty seconds). This is a service
-objective, not a promise during provider/SSH failure or slow publication operations.
-The compatibility `tick` entry point remains a deterministic full recovery pass for
-tests and explicit single-pass tooling; production `main` uses `ControlLoop`.
+Initial coding, continuations, review-format recovery and Chief checks yield at
+explicit RPC/repository boundaries. Publication and outbox reducers yield I/O while
+the writer retains their existing journals and gate checks. Independent review,
+bound Chief PASS and authorized owner commands are still required for publication.
+Fresh coding turn, repository identity, reviewed tree, worker ownership and cleanup
+proof are checked at the existing publication boundary. `list_tasks(control=True,
+project=...)` reads ownership without historical cleanup sweeps. Uncertain runtimes
+and missing/incorrect cleanup attestations continue to block publication.
 
-Telegram sends also run as detached transport calls. The outbox durably records
-`SENDING` before dispatch; the single lifecycle writer later applies acceptance.
-A restart with no in-process acceptance result converts `SENDING` to `UNCERTAIN`
-and suppresses automatic resend. Known rejection retains bounded retry semantics.
-Slow Telegram callbacks therefore cannot hold the control loop behind a send.
+Command polling continues during long operations. One suspended lifecycle frame
+owns an issue until its next safe completion. Observed closure is applied immediately
+by the same writer and revokes new mutation dispatches. Other commands remain in the
+provider and are checked against fresh gates when applied. Resumable reviewer
+launches additionally accept archive/follow-up invalidation while I/O is outstanding.
+Other issues can progress independently, subject to repository locks and capacity.
+This establishes responsiveness to slow provider calls, not a hard real-time bound
+on local CPU, filesystem fsync or arbitrary deployment conditions.
+
+Publication fetches the issue before each new COMMIT/PUSH/CREATE_PR/MERGE mutation
+and rechecks current approval at dispatch, including capacity waits. These reads
+use publication capacity, leaving polling slots available. Closing does not cancel
+already dispatched I/O or erase journals. Closed recovery can adopt bound accepted
+outcomes and complete their index/convergence cleanup; it cannot issue a new primary
+publication or replay a closed coding/reviewer launch. Uncertain publication intents
+retain repository ownership. GitHub issue reads and mutations are not one atomic
+transaction, so an already dispatched action may still be accepted after closure.
+
+The compatibility `tick` entry point is still a serial full pass for tests and
+explicit single-pass tools; production `main` uses the resumable ControlLoop.
+Reconciliation stages remain attempt-local ContextVar observations. Only actual
+failures persist bounded diagnostics: known stage, exception class, limited local
+source locations and retry action; never arbitrary exception payloads.
+Authoritative saves exclude timing samples and heartbeat-only fields. Pending
+requests, receipts, gates, transition records and scheduler ownership remain
+verbatim. Tests measure actual atomic-file writes during unchanged polling; this
+narrow projection shares the integrated #47 semantic writer and optional telemetry.
+These isolated tests do not prove the original production exception.
+
+Telegram SENDING is durable before detached delivery. The writer applies its
+outcome; restart suppresses an uncertain resend. GitHub comments also record the
+send boundary and require an exact receipt after uncertain acceptance. Legacy
+unproven pending comments are reconciled without issuing another POST. GitHub PR
+creation similarly retains uncertain intent and does not re-POST solely because a
+query is empty. Operator inspection may be required when acceptance cannot be
+proven. Completion comments have their own durable send receipt before label/close
+reconciliation.
 
 ## Chief wake-up
 
@@ -128,9 +155,11 @@ because a historical PR is already merged.
 
 ## Timing diagnostics
 
-`devctl.py status <issue> --issue` (or `--json`) exposes timings and convergence
-without writing state. The bridge retains at most 64 fixed-schema numeric samples
-using monotonic durations: control total, GitHub command reads, targeted controls,
-heavy reconciliation, worker discovery/reconciliation, tracked issue processing,
-Chief evidence extraction, outbox flush, Telegram callback and publication action.
-Timings never store exception text, prompts, tokens, URLs or provider payloads.
+Fixed-schema monotonic timings are bounded to 64 samples in process memory and
+an optional sidecar. Authoritative saves exclude those timings and the six named
+volatile runtime-health fields. `devctl status --issue` reads bounded telemetry
+without writing and derives heartbeat age/lease state at read time. Runtime samples
+must match the task identity and complete semantic health digest. Recovery never
+reads the sidecar; runtime classification, generation, terminal/cleanup evidence,
+retry state and actual errors remain durable. See
+[semantic-durability.md](semantic-durability.md) for schema and measurements.

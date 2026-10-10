@@ -112,8 +112,75 @@ class ExecutionProfileTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'does not advertise'): e.validate_runtime(execution, capabilities)
         capabilities['help'] = '--print'
         with self.assertRaises(ValueError): e.validate_runtime(execution, capabilities)
-        with self.assertRaisesRegex(ValueError, 'Cannot validate'):
+        with self.assertRaisesRegex(e.RuntimeUnavailable, 'Cannot validate'):
             e.discover('work', 'cursor', lambda *args: subprocess.CompletedProcess([], 1, stdout='failed'))
+
+    def test_failed_or_unreadable_discovery_is_unavailable_and_same_request_recovers(self):
+        data = self.root / 'state/tasks'
+        cfg = {'machine': 'work', 'workspace': str(self.root)}
+        args = {'project': 'test', 'agent': 'cursor', 'model': 'compose', 'request_id': 'a' * 64}
+        good = {'agent --version': 'fixture', 'agent --help': '--model <model>',
+                'agent models': 'compose - Compose\nother - Other'}
+        for command in good:
+            for code, output in ((1, 'private prompt ghp_' + 'A' * 40), (0, ''), (0, 'unparsed output')):
+                if command != 'agent models' and output == 'unparsed output':
+                    continue
+                with self.subTest(command=command, code=code, output=output):
+                    def failed(machine, requested, **kwargs):
+                        return subprocess.CompletedProcess([], code if requested == command else 0,
+                            stdout=output if requested == command else good[requested])
+                    with (patch.object(d, 'DATA_DIR', data),
+                          patch.object(d, 'load_projects', return_value={'test': cfg}),
+                          patch.object(d, 'capture_execution', side_effect=failed)):
+                        result = d.preflight_task('start_task', args)
+                    self.assertEqual(result, {'status': 'UNAVAILABLE', 'launch_started': False})
+                    with self.assertRaises(e.RuntimeUnavailable):
+                        e.check_preflight(result)
+                    self.assertFalse(data.parent.exists())
+                    with (patch.object(d, 'DATA_DIR', data),
+                          patch.object(d, 'load_projects', return_value={'test': cfg}),
+                          patch.object(d, 'capture_execution', side_effect=lambda machine, command, **kw:
+                              subprocess.CompletedProcess([], 0, stdout=good[command]))):
+                        self.assertEqual(d.preflight_task('start_task', args)['status'], 'READY')
+                    self.assertFalse(data.parent.exists())
+
+    def test_successful_inventory_excluding_requested_model_is_rejected(self):
+        data = self.root / 'state/tasks'
+        cfg = {'machine': 'work', 'workspace': str(self.root)}
+        outputs = {'agent --version': 'fixture', 'agent --help': '--model <model>',
+                   'agent models': 'other - Other'}
+        with (patch.object(d, 'DATA_DIR', data),
+              patch.object(d, 'load_projects', return_value={'test': cfg}),
+              patch.object(d, 'capture_execution', side_effect=lambda machine, command, **kw:
+                  subprocess.CompletedProcess([], 0, stdout=outputs[command]))):
+            result = d.preflight_task('start_task', {'project': 'test', 'agent': 'cursor', 'model': 'compose'})
+        self.assertEqual(result['status'], 'REJECTED')
+        self.assertIs(result['launch_started'], False)
+        with self.assertRaises(e.PreflightRejected):
+            e.check_preflight(result)
+        self.assertFalse(data.parent.exists())
+
+    def test_locked_execution_validation_preserves_transient_classification(self):
+        def failed(machine, command):
+            return subprocess.CompletedProcess([], int(command == 'agent models'),
+                stdout='--model <model>' if command == 'agent --help' else 'fixture')
+        with self.assertRaises(e.RuntimeUnavailable):
+            d.validated_execution({}, 'work', capture=failed, agent='cursor', model='compose')
+        meta = {'execution': self.resolved(agent='cursor'), 'agent': 'cursor',
+                'model': 'compose', 'reasoning_effort': None, 'machine': 'work'}
+        with self.assertRaises(e.RuntimeUnavailable):
+            e.resume_identity(meta, failed)
+
+    def test_unavailability_requires_no_launch_proof(self):
+        for result in ({'status': 'UNAVAILABLE'}, {'status': 'UNAVAILABLE', 'launch_started': True}):
+            with self.subTest(result=result), self.assertRaises(RuntimeError) as caught:
+                e.check_preflight(result)
+            self.assertNotIsInstance(caught.exception, e.RuntimeUnavailable)
+
+    def test_rejection_diagnostic_is_redacted_and_bounded(self):
+        result = e.rejection('ghp_' + 'A' * 40 + 'x' * 1000)
+        self.assertLessEqual(len(result['error']), 512)
+        self.assertNotIn('ghp_', result['error'])
 
     def test_discovery_uses_execution_host_and_ignores_headers(self):
         calls = []
@@ -252,7 +319,7 @@ class ExecutionProfileTests(unittest.TestCase):
         self.assertEqual(e.cli_options(execution), ['--model', 'auto'])
 
     def test_probe_timeout_and_automatic_option_without_default_fail_closed(self):
-        with self.assertRaisesRegex(ValueError, 'timed out'):
+        with self.assertRaisesRegex(e.RuntimeUnavailable, 'timed out'):
             e.discover('work', 'cursor', lambda *args: (_ for _ in ()).throw(subprocess.TimeoutExpired('agent', 5)))
         self.catalog['models'][0]['defaults'] = {}
         self.catalog['profiles'] = {'review': self.catalog['profiles']['review']}
@@ -456,8 +523,9 @@ class ExecutionProfileTests(unittest.TestCase):
               patch.object(d.time, 'monotonic', side_effect=[0, 1, 2, 4]),
               patch.object(d, 'capture_execution', side_effect=capture) as probe):
             result = d.preflight_task('start_task', {'project': 'test', 'agent': 'cursor'})
-        self.assertEqual(result['status'], 'REJECTED')
-        self.assertIn('timed out', result['error'])
+        self.assertEqual(result, {'status': 'UNAVAILABLE', 'launch_started': False})
+        with self.assertRaises(e.RuntimeUnavailable):
+            e.check_preflight(result)
         self.assertEqual([c.kwargs['timeout'] for c in probe.call_args_list], [2, 1])
 
     def test_preflight_does_not_claim_no_launch_for_orphaned_metadata(self):

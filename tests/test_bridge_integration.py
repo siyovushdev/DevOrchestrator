@@ -65,6 +65,7 @@ class Harness:
         self.comments = {1: []}
         self.tasks = {}
         self.requests = {}
+        self.fenced = set()
         self.starts = []
         self.continues = []
         self.fail_after_start = False
@@ -118,6 +119,19 @@ class Harness:
             'author': {'login': 'bridge'}, 'body': body})
 
     async def transport(self, name, args):
+        if name == 'get_transition_capabilities':
+            return dict(schema_version=1, review_binding=1, start_request_reconciliation=1)
+        if name == 'inspect_start_request':
+            key = args['request_id']
+            task_id = self.requests.get(key)
+            if not task_id:
+                if args.get('fence'):
+                    self.fenced.add(key)
+                if key in self.fenced:
+                    return dict(schema_version=1, request_id=key, task_id=key[:24], state='FENCED', launch_started=False)
+                return dict(schema_version=1, request_id=key, task_id=key[:24], state='ABSENT')
+            return dict(schema_version=1, request_id=key, task_id=task_id, state='STARTED',
+                        signature_version=3, metadata=copy.deepcopy(self.tasks[task_id]))
         if name == 'preflight_task':
             return {'status': 'REPLAY' if args['arguments'].get('request_id') in self.requests else 'READY'}
         if name == 'list_tasks':
@@ -125,6 +139,8 @@ class Harness:
         if name == 'get_task_report':
             return copy.deepcopy(self.tasks[args['task_id']])
         key = args['request_id']
+        if key in self.fenced:
+            return {'status': 'FENCED', 'launch_started': False}
         if key in self.requests:
             task_id = self.requests[key]
             return {**copy.deepcopy(self.tasks[task_id]), 'task_id': task_id}
@@ -135,6 +151,8 @@ class Harness:
             self.tasks[task_id] = dict(id=task_id, status='RUNNING', role=role, machine='work',
                 workspace=str(self.repo), agent=args.get('agent', 'codex'), turns=1, exit_code=None,
                 git_baseline=baseline, created_at='2026-01-01T00:00:00+00:00', result=None)
+            self.tasks[task_id].update(runtime_generation='generation-' + key, launch_request_id=key,
+                                       review_binding=copy.deepcopy(args.get('review_binding')))
             if role == 'coding': self.last_coding_prompt = args['prompt']
             if role == 'coding': (self.repo / 'file').write_text('implemented')
             self.starts.append((role, task_id))
@@ -142,6 +160,7 @@ class Harness:
             task_id = args['task_id']
             self.tasks[task_id].update(status='RUNNING', turns=self.tasks[task_id]['turns'] + 1,
                                        exit_code=None, result=None)
+            self.tasks[task_id]['runtime_generation'] = 'generation-' + key
             self.continues.append((task_id, args['prompt']))
         else:
             raise AssertionError(name)
@@ -153,6 +172,8 @@ class Harness:
 
     def finish(self, task_id, result, status='DONE'):
         self.tasks[task_id].update(status=status, exit_code=0 if status == 'DONE' else 1, result=result)
+        self.tasks[task_id].update(cleanup_state='CLEANED',
+                                   cleanup_generation=self.tasks[task_id]['runtime_generation'])
 
     def restart(self):
         self.state = b.load_state()
@@ -476,6 +497,8 @@ class BridgeIntegrationTests(unittest.IsolatedAsyncioTestCase):
         directory = devctl.task_dir(task_id)
         directory.mkdir(parents=True)
         meta = dict(self.h.tasks[task_id], pid=os.getpid(), process_identity=process_identity(os.getpid()))
+        for field in ('runtime_generation', 'cleanup_state', 'cleanup_generation'):
+            meta.pop(field, None)  # This fixture deliberately represents pre-heartbeat metadata.
         write_json(directory / 'meta.json', meta)
         with redirect_stdout(io.StringIO()) as output:
             devctl.task_report(task_id, as_json=True)
@@ -648,7 +671,7 @@ class BridgeIntegrationTests(unittest.IsolatedAsyncioTestCase):
             return result
         with patch.object(b, 'gh', side_effect=accepted_then_error) as io:
             b.flush_effects(self.h.state)
-        self.assertEqual(self.h.state['outbox'][key]['status'], 'PENDING')
+        self.assertEqual(self.h.state['outbox'][key]['status'], 'UNCERTAIN')
         self.assertEqual(sum(c.args[:2] == ('issue', 'comment') for c in io.call_args_list), 1)
         self.assertEqual(sum(c.args[:2] == ('issue', 'edit') for c in io.call_args_list), 1)
         self.assertEqual(self.h.comments[1][0]['body'], 'Result\nExact V1 text\n\n<!-- DEVORCHESTRATOR_EFFECT_V1 ' + key + ' -->')

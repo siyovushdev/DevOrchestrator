@@ -5,18 +5,29 @@ from pathlib import Path
 import sys
 import types
 import unittest
+import asyncio
+import threading
+import worker_runtime  # Keep exception identity stable across the isolated SDK import.
 from unittest.mock import patch
 
 
 class AdapterTests(unittest.TestCase):
     def setUp(self):
+        handlers = {}
         class Server:
             def __init__(self, name): pass
-            def tool(self): return lambda fn: fn
+            def tool(self):
+                def register(fn):
+                    handlers[fn.__name__] = fn
+                    return fn
+                return register
         package = types.ModuleType('mcp'); server = types.ModuleType('mcp.server'); server.MCPServer = Server
         spec = importlib.util.spec_from_file_location('isolated_mcp_adapter', Path(__file__).resolve().parents[1] / 'mcp_server.py')
         self.adapter = importlib.util.module_from_spec(spec)
         with patch.dict(sys.modules, {'mcp': package, 'mcp.server': server}): spec.loader.exec_module(self.adapter)
+        self.handlers = handlers
+        for pool in self.adapter.TOOL_POOLS.values():
+            self.addCleanup(pool.shutdown)
         self.registry = patch.object(self.adapter, 'load_projects', return_value={'test': {'machine': 'work', 'default_agent': 'codex'}})
         self.registry.start(); self.addCleanup(self.registry.stop)
 
@@ -79,3 +90,49 @@ class AdapterTests(unittest.TestCase):
         from subprocess import CompletedProcess
         with patch.object(self.adapter, 'devctl_result', return_value=CompletedProcess([], 1, 'unknown worker crash')):
             with self.assertRaises(RuntimeError): self.adapter.start_task('test', 'prompt')
+
+    def test_registered_async_handlers_keep_control_capacity_during_two_slow_launches(self):
+        entered, release = threading.Event(), threading.Event()
+        started = []
+        def devctl(*args, **kwargs):
+            if args[0] == 'run-project':
+                started.append(args)
+                if len(started) == 2:
+                    entered.set()
+                release.wait(5)
+                return 'task'
+            return '{"id":"task","status":"RUNNING"}'
+        async def check():
+            with patch.object(self.adapter, 'devctl', side_effect=devctl):
+                launches = [asyncio.create_task(self.handlers['start_task']('test', 'prompt', request_id=str(i) * 64))
+                            for i in (1, 2)]
+                try:
+                    await asyncio.wait_for(asyncio.to_thread(entered.wait, 3), 4)
+                    self.assertTrue(entered.is_set())
+                    result = await asyncio.wait_for(self.handlers['get_task_report']('task'), 1)
+                    self.assertEqual(result['id'], 'task')
+                    self.assertTrue(all(not task.done() for task in launches))
+                finally:
+                    release.set()
+                    await asyncio.gather(*launches)
+        asyncio.run(check())
+
+    def test_transition_capabilities_and_request_reconciliation_contract(self):
+        self.assertEqual(self.adapter.get_transition_capabilities(),
+                         {'schema_version': 1, 'review_binding': 1, 'start_request_reconciliation': 1})
+        with patch.object(self.adapter, 'devctl', return_value='{"state":"BUSY"}') as run:
+            self.assertEqual(self.adapter.inspect_start_request('a' * 64, fence=True), {'state': 'BUSY'})
+        run.assert_called_once_with('inspect-start-request', 'a' * 64, '--fence')
+
+    def test_review_binding_forwarded_and_no_launch_proofs_remain_distinct(self):
+        from subprocess import CompletedProcess
+        binding = {'schema_version': 1}
+        with patch.object(self.adapter, 'devctl', side_effect=['task', '{"id":"task"}']) as run:
+            self.adapter.start_task('test', 'prompt', request_id='a' * 64, role='review', review_binding=binding)
+        args = run.call_args_list[0].args
+        self.assertEqual(json.loads(args[args.index('--review-binding') + 1]), binding)
+        for status in ('STALE_INPUT', 'FENCED'):
+            payload = {'status': status, 'launch_started': False}
+            with self.subTest(status=status), patch.object(self.adapter, 'devctl_result',
+                    return_value=CompletedProcess([], 3, json.dumps(payload))):
+                self.assertEqual(self.adapter.start_task('test', 'prompt'), payload)

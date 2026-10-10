@@ -129,7 +129,7 @@ class RecoveryTests(unittest.TestCase):
     def test_github_comment_accepted_before_crash_is_not_repeated(self):
         state = {}
         key = effects.enqueue(state, 1, 'comment', 'review passed')
-        comments = Mock(return_value=[{'body': '<!-- DEVORCHESTRATOR_EFFECT_V1 ' + key + ' -->'}])
+        comments = Mock(return_value=[{'body': 'review passed\n\n<!-- DEVORCHESTRATOR_EFFECT_V1 ' + key + ' -->'}])
         post = Mock()
         effects.flush(state, Mock(), comments, post, Mock(), Mock(), now=0)
         post.assert_not_called()
@@ -139,12 +139,43 @@ class RecoveryTests(unittest.TestCase):
         state = {}
         effects.enqueue(state, 1, 'comment', 'report')
         effects.enqueue(state, 1, 'telegram', 'needs owner')
-        post = Mock(side_effect=[OSError(), None]); telegram = Mock(side_effect=[False, True])
-        effects.flush(state, Mock(), lambda n: [], post, Mock(), telegram, now=0)
-        effects.flush(state, Mock(), lambda n: [], post, Mock(), telegram, now=1)
+        post = Mock(); telegram = Mock(side_effect=[False, True])
+        comments = Mock(side_effect=[OSError('read unavailable before any POST'), []])
+        effects.flush(state, Mock(), comments, post, Mock(), telegram, now=0)
+        effects.flush(state, Mock(), comments, post, Mock(), telegram, now=1)
+        self.assertEqual(post.call_count, 0)
+        effects.flush(state, Mock(), comments, post, Mock(), telegram, now=3)
         self.assertEqual(post.call_count, 1)
-        effects.flush(state, Mock(), lambda n: [], post, Mock(), telegram, now=3)
         self.assertTrue(all(v['status'] == 'DONE' for v in state['outbox'].values()))
+
+    def test_delayed_comment_post_never_resends_on_absence_after_restart(self):
+        state = {}
+        key = effects.enqueue(state, 1, 'comment', 'result')
+        checkpoints = []
+        def persist():
+            checkpoints.append(json.loads(json.dumps(state)))
+        post = Mock(side_effect=KeyboardInterrupt('process stops after transmission'))
+        with self.assertRaises(KeyboardInterrupt):
+            effects.flush(state, persist, lambda number: [], post, Mock(), Mock(), now=0)
+        state = checkpoints[-1]
+        self.assertEqual(state['outbox'][key]['status'], 'SENDING')
+        for now in (1, 10, 100):
+            effects.flush(state, Mock(), lambda number: [], post, Mock(), Mock(), now=now)
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(state['outbox'][key]['status'], 'UNCERTAIN')
+        comments = [{'body': 'result\n\n<!-- DEVORCHESTRATOR_EFFECT_V1 ' + key + ' -->'}]
+        effects.flush(state, Mock(), lambda number: comments, post, Mock(), Mock(), now=200)
+        self.assertEqual(state['outbox'][key]['status'], 'DONE')
+        self.assertEqual(post.call_count, 1)
+
+    def test_legacy_pending_comment_is_queried_but_not_reposted_without_receipt(self):
+        state = {}
+        key = effects.enqueue(state, 1, 'comment', 'legacy')
+        state['outbox'][key].pop('delivery_version')
+        post = Mock()
+        effects.flush(state, Mock(), lambda number: [], post, Mock(), Mock(), now=0)
+        self.assertEqual(state['outbox'][key]['status'], 'UNCERTAIN')
+        post.assert_not_called()
 
     def test_alive_lease_cannot_be_stolen_failure_can_release(self):
         with tempfile.TemporaryDirectory() as root:

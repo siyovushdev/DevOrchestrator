@@ -9,6 +9,10 @@ import time
 from durable import exclusive, read_json, write_json
 
 
+class RequestFenced(RuntimeError):
+    """A durable tombstone forbids this request from ever launching."""
+
+
 def valid_request(request_id):
     if request_id and not re.fullmatch(r'[a-f0-9]{64}', request_id):
         raise ValueError('Invalid request ID')
@@ -390,6 +394,61 @@ def admit(data_dir, machine, canonical, task_id, task_state):
     write_json(path, leases)
 
 
+def inspect_start_request(data_dir, request_id, *, fence=False):
+    """Inspect/fence a deterministic start ID without starting or cleaning work.
+
+    Lock ordering matches devctl start: worker admission, then request. A busy
+    lock and missing/corrupt metadata are uncertainty, never no-launch proof.
+    Only a tombstone, not an ABSENT observation, fences a delayed launch RPC.
+    """
+    valid_request(request_id)
+    if not request_id or type(fence) is not bool:
+        raise ValueError('A start request ID and boolean fence flag are required')
+    task_id = request_id[:24]
+    result = dict(schema_version=1, request_id=request_id, task_id=task_id, state='UNKNOWN')
+    path = data_dir.parent / 'requests' / (request_id + '.json')
+    try:
+        with exclusive(data_dir.parent / 'worker.lock'):
+            with exclusive(path.with_suffix('.lock')):
+                receipt = read_json(path)
+                directories = [data_dir / task_id, data_dir / 'archives' / task_id]
+                present = [directory for directory in directories if directory.exists()]
+                if len(present) > 1:
+                    return result
+                meta = read_json(present[0] / 'meta.json') if present else None
+                if receipt is None:
+                    leases = read_json(data_dir.parent / 'worker_leases.json', {})
+                    if (present or not isinstance(leases, dict) or
+                            any(not isinstance(lease, dict) or lease.get('task_id') == task_id
+                                for lease in leases.values())):
+                        return result
+                    if not fence:
+                        return dict(result, state='ABSENT')
+                    write_json(path, dict(task_id=task_id, status='FENCED', schema_version=1))
+                    return dict(result, state='FENCED', launch_started=False)
+                if not isinstance(receipt, dict) or receipt.get('task_id') != task_id:
+                    return result
+                if receipt.get('status') == 'FENCED':
+                    if present or receipt.get('schema_version') != 1:
+                        return result
+                    return dict(result, state='FENCED', launch_started=False)
+                if (receipt.get('status') not in ('PENDING', 'STARTED') or
+                        not isinstance(meta, dict) or meta.get('id') != task_id):
+                    return result
+                result.update(state=receipt['status'], signature=receipt.get('signature'),
+                              signature_version=receipt.get('signature_version', 1),
+                              metadata={key: meta.get(key) for key in (
+                                  'id', 'role', 'machine', 'workspace', 'status', 'turns',
+                                  'runtime_generation', 'launch_request_id', 'review_binding',
+                                  'launch_prepared', 'resume_prepared', 'prepared_request',
+                                  'cleanup_state', 'cleanup_generation')})
+                return result
+    except BlockingIOError:
+        return dict(result, state='BUSY')
+    except (OSError, ValueError, TypeError, KeyError):
+        return dict(result, state='UNKNOWN')
+
+
 def launch(data_dir, request_id, task_id, callback, prepare=None, signature=None, signature_version=None):
     """Receipt is durable before launching. A crash can leave UNKNOWN, never a duplicate."""
     valid_request(request_id)
@@ -401,10 +460,17 @@ def launch(data_dir, request_id, task_id, callback, prepare=None, signature=None
     with exclusive(path.with_suffix('.lock'), blocking=True):
         receipt = read_json(path)
         if receipt:
+            if receipt.get('status') == 'FENCED':
+                raise RequestFenced('Request was durably fenced before launch')
+            if receipt.get('status') not in ('PENDING', 'STARTED'):
+                raise RuntimeError('Unknown worker request receipt state')
             if receipt['task_id'] != task_id or receipt.get('signature') != signature:
                 raise ValueError('Request ID reused with different task arguments')
             print(task_id)
             return 0
+        if signature_version in (3, 4) and ((data_dir / task_id).exists() or
+                                       (data_dir / 'archives' / task_id).exists()):
+            raise RuntimeError('Bound task metadata exists without a request receipt')
         if prepare:
             prepare()
         record = {'task_id': task_id, 'status': 'PENDING', 'signature': signature}

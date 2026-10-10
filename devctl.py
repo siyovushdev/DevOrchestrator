@@ -448,6 +448,7 @@ def run_project(
     role="coding",
     execution_profile=None,
     execution_options=None,
+    review_binding=None, repository_binding=None,
 ):
     projects = load_projects()
 
@@ -467,7 +468,7 @@ def run_project(
     return run_agent(
         machine, agent_override, workspace, prompt, model=model, effort=effort,
         request_id=request_id, role=role, execution_profile=execution_profile,
-        execution_options=execution_options,
+        execution_options=execution_options, review_binding=review_binding, repository_binding=repository_binding,
     )
 
 
@@ -1064,10 +1065,24 @@ def build_agent_command(
 
 
 def start_signature(project, machine, agent, workspace, prompt, model, effort, role,
-                    execution_profile, execution_options, request_id):
+                    execution_profile, execution_options, request_id, review_binding=None, repository_binding=None):
     inputs = [machine, agent, workspace, prompt, model, effort, role, execution_profile, execution_options]
     receipt = read_json(DATA_DIR.parent / 'requests' / (request_id + '.json')) if request_id else None
-    if receipt and receipt.get('signature_version') != 2:
+    if receipt and receipt.get('status') == 'FENCED':
+        raise worker_runtime.RequestFenced('Request was durably fenced before launch')
+    if repository_binding is not None:
+        if review_binding is not None or (receipt and receipt.get('signature_version') != 4):
+            raise RuntimeError('Cannot retrofit repository binding into an existing request')
+        inputs.append({'repository_binding': repository_binding})
+    elif receipt and receipt.get('signature_version') == 4:
+        raise RuntimeError('Bound start requires its original repository binding')
+    if review_binding is not None:
+        if receipt and receipt.get('signature_version') != 3:
+            raise RuntimeError('Cannot retrofit review binding into an existing request')
+        inputs.append(review_binding)
+    elif receipt and receipt.get('signature_version') == 3:
+        raise RuntimeError('Bound review request requires its original source binding')
+    if receipt and receipt.get('signature_version') not in (2, 3, 4):
         # Historical receipts retain their original signatures. Execution-era
         # provenance distinguishes omitted agent from an explicit default agent.
         meta = load_meta(receipt['task_id'])
@@ -1087,6 +1102,35 @@ def validated_execution(project, machine, capture=None, **arguments):
         raise execution_profiles.PreflightRejected(str(exc)) from exc
 
 
+def validate_review_source(project, machine, workspace, binding):
+    """Called under worker.lock; no bridge state or owner authorization involved."""
+    import review_transitions
+    import scheduler
+    from publication import Repository
+    review_transitions.validate_launch_binding(binding)
+    cfg = load_projects().get(project)
+    if (not cfg or cfg.get('machine') != machine or cfg.get('workspace') != workspace or
+            binding['machine'] != machine or
+            review_transitions.digest(cfg) != binding['registry_digest'] or
+            execution_profiles.load_catalog(cfg)[1]['sha256'] != binding['catalog_digest'] or
+            scheduler.project_identity(project) != (machine, binding['repository'])):
+        raise review_transitions.SourceChanged('Review repository or execution policy changed')
+    meta = load_meta(binding['source_task_id'])
+    if (meta.get('machine') != machine or meta.get('workspace') != workspace or
+            meta.get('role', 'coding') != 'coding' or
+            type(meta.get('turns', 1)) is not int or
+            meta.get('turns', 1) != binding['source_turn'] or
+            meta.get('runtime_generation') != binding['source_generation']):
+        raise review_transitions.SourceChanged('Review coding source identity changed')
+    state, code = task_state(meta, task_dir(meta['id']))
+    if state == 'UNKNOWN':
+        raise execution_profiles.RuntimeUnavailable('Review coding source is uncertain')
+    if state != 'DONE' or type(code) is not int or code != 0:
+        raise review_transitions.SourceChanged('Review coding source is no longer successful')
+    if Repository(project).snapshot() != binding['snapshot']:
+        raise review_transitions.SourceChanged('Review source tree changed')
+
+
 def preflight_task(operation, arguments):
     """Read-only validation, including runtime, on the same host as launches.
 
@@ -1097,11 +1141,13 @@ def preflight_task(operation, arguments):
     worker_runtime.valid_request(request_id)
     receipt = read_json(DATA_DIR.parent / 'requests' / (request_id + '.json')) if request_id else None
     if receipt:
+        if receipt.get('status') == 'FENCED':
+            return {'status': 'FENCED', 'launch_started': False}
         return {'status': 'REPLAY'}
     if request_id and (task_dir(request_id[:24]) / 'meta.json').exists() and operation == 'start_task':
         raise RuntimeError('Existing task metadata without request receipt; inspect worker ownership before retrying')
-    # Leave room for the response inside the control loop's five-second issue
-    # budget. Probe timeouts share a deadline, rather than multiplying per CLI.
+    # Bound read-only discovery independently from the full issue transition.
+    # Probe timeouts share a deadline, rather than multiplying per CLI.
     deadline = time.monotonic() + 3
     def capture(machine, command):
         remaining = deadline - time.monotonic()
@@ -1126,12 +1172,17 @@ def preflight_task(operation, arguments):
         else:
             raise ValueError('Preflight operation must be start_task or continue_task')
         return {'status': 'READY', 'execution': execution}
+    except execution_profiles.RuntimeUnavailable:
+        # Transient discovery is not a confirmed invalid model/policy. No launch
+        # occurs here; the bridge retains queue ownership and retries visibly.
+        return {'status': 'UNAVAILABLE', 'launch_started': False}
     except ValueError as exc:
         return execution_profiles.rejection(exc)
 
 
 def run_agent(machine, agent, workspace, prompt, model=None, effort=None,
-              request_id=None, role="coding", execution_profile=None, execution_options=None):
+              request_id=None, role="coding", execution_profile=None, execution_options=None,
+              review_binding=None, repository_binding=None):
     worker_runtime.valid_request(request_id)
     task_id = request_id[:24] if request_id else uuid.uuid4().hex[:12]
     with exclusive(DATA_DIR.parent / "worker.lock", blocking=True):
@@ -1141,13 +1192,32 @@ def run_agent(machine, agent, workspace, prompt, model=None, effort=None,
                         if cfg["machine"] == machine and cfg["workspace"] == workspace), None)
         if not project:
             raise ValueError("Mutable tasks require a registered workspace")
+        if review_binding is not None and (role != 'review' or not request_id):
+            raise ValueError('A bound review requires the review role and a request ID')
+        if repository_binding is not None and (role != 'coding' or not request_id):
+            raise ValueError('A repository-bound start requires the coding role and request ID')
         _, canonical = scheduler.project_identity(project)
         signature = start_signature(projects[project], machine, agent, workspace, prompt, model, effort,
-                                    role, execution_profile, execution_options, request_id)
+                                    role, execution_profile, execution_options, request_id, review_binding, repository_binding)
+        def validate_repository():
+            from review_transitions import digest
+            expected = dict(machine=machine, repository=canonical, registry_digest=digest(projects[project]))
+            if repository_binding != expected:
+                raise execution_profiles.StaleReviewInput('Registered repository changed before launch')
         def prepare():
+            if repository_binding is not None:
+                validate_repository()
             execution = validated_execution(
                 projects[project], machine, agent=agent, model=model, effort=effort,
                 execution_profile=execution_profile, execution_options=execution_options, role=role)
+            if review_binding is not None:
+                from review_transitions import SourceChanged
+                try:
+                    validate_review_source(project, machine, workspace, review_binding)
+                except SourceChanged as exc:
+                    # prepare has not admitted capacity, created metadata, or
+                    # crossed the worker receipt boundary at this point.
+                    raise execution_profiles.StaleReviewInput('Review source changed before launch') from exc
             worker_runtime.check_capacity(DATA_DIR, task_id, machine, role, task_state)
             worker_runtime.admit(DATA_DIR, machine, canonical, task_id, task_state)
             directory = task_dir(task_id)
@@ -1155,14 +1225,28 @@ def run_agent(machine, agent, workspace, prompt, model=None, effort=None,
             save_meta(directory, {"id": task_id, "machine": machine, "agent": execution["agent"],
                       "execution": execution, "model": execution["model"], "reasoning_effort": execution["options"].get("effort"),
                       "workspace": workspace, "pid": 0, "status": "STARTING", "role": role,
-                      "created_at": now(), "git_baseline": None, "launch_prepared": True, "prepared_request": request_id})
+                      "created_at": now(), "git_baseline": None, "launch_prepared": True, "prepared_request": request_id,
+                      **({'review_binding': review_binding, 'launch_request_id': request_id}
+                         if review_binding is not None else {}),
+                      **({'repository_binding': repository_binding, 'launch_request_id': request_id}
+                         if repository_binding is not None else {})})
         def start():
             prepared = load_meta(task_id)
             return _run_agent(machine, prepared['agent'], workspace, prompt, model, effort, task_id, role,
                               execution=prepared['execution'])
-        result = worker_runtime.launch(DATA_DIR, request_id, task_id, start, prepare, signature, signature_version=2)
+        result = worker_runtime.launch(DATA_DIR, request_id, task_id, start, prepare, signature,
+                                       signature_version=4 if repository_binding is not None else 3 if review_binding is not None else 2)
         meta = load_meta(task_id)
         if meta.get("launch_prepared") and meta.get("prepared_request") == request_id:
+            if repository_binding is not None:
+                try:
+                    validate_repository()
+                except execution_profiles.StaleReviewInput as exc:
+                    raise RuntimeError('Prepared repository binding changed; original request retained') from exc
+            if review_binding is not None:
+                # This is an existing prepared request: failure is uncertain,
+                # never the definitive prelaunch StaleReviewInput contract.
+                validate_review_source(project, machine, workspace, review_binding)
             execution_profiles.resume_identity(meta, capture_execution)
             _run_agent(machine, meta['agent'], workspace, prompt, model, effort, task_id, role,
                        execution=meta.get('execution'))
@@ -1189,6 +1273,7 @@ def _run_agent(
     task_id = task_id or uuid.uuid4().hex[:12]
     directory = task_dir(task_id)
     directory.mkdir(mode=0o700, exist_ok=True)
+    prepared = read_json(directory / 'meta.json', {})
 
     log_path = directory / "events.jsonl"
     exit_path = directory / "exit_code"
@@ -1226,6 +1311,10 @@ def _run_agent(
         "pid": 0,
         "role": role,
         "git_baseline": git_baseline,
+        **({key: prepared[key] for key in ('review_binding', 'launch_request_id')}
+           if prepared.get('review_binding') is not None else {}),
+        **({key: prepared[key] for key in ('repository_binding', 'launch_request_id')}
+           if prepared.get('repository_binding') is not None else {}),
     }
 
     if execution:
@@ -1299,11 +1388,13 @@ def readonly_runtime(task_id):
 def status(task_id, as_json=False, issue=False):
     if issue:
         from operational_state import status_view
-        bridge = read_json(DATA_DIR.parent / 'task_bridge_state.json', {'issues': {}})
+        import bridge_telemetry
+        bridge_file = DATA_DIR.parent / 'task_bridge_state.json'
+        bridge = read_json(bridge_file, {'issues': {}})
         item = bridge.get('issues', {}).get(str(task_id), {})
         # Never probe SSH, write observations or clean processes.
         runtime = readonly_runtime(item['task_id']) if item.get('task_id') else None
-        view = status_view(bridge, task_id, runtime)
+        view = status_view(bridge, task_id, runtime, bridge_telemetry.load(bridge_file))
         if item.get('review_task_id'):
             view['review_runtime'] = readonly_runtime(item['review_task_id']) or view['review_runtime']
         diagnostics = read_json(DATA_DIR.parent / 'worker_consistency.json', {})
@@ -1741,6 +1832,10 @@ def task_report(task_id, as_json=False):
 
     report = {
         "id": task_id,
+        "role": meta.get('role', 'coding'),
+        "runtime_generation": meta.get('runtime_generation'),
+        "launch_request_id": meta.get('launch_request_id'),
+        "review_binding": meta.get('review_binding'),
         "git_baseline": redact_data(meta.get("git_baseline")),
         "adopted": bool(meta.get("adopted")),
         "created_at": meta.get("created_at"),
@@ -1761,6 +1856,8 @@ def task_report(task_id, as_json=False):
         "error": redact(last_error) if last_error else last_error,
         "liveness": health,
         "cleanup_state": meta.get('cleanup_state'),
+        "cleanup_generation": (meta.get('remote_cleanup_generation') if meta.get('remote_key') else
+                               meta.get('cleanup_generation')),
         "consistency_diagnostic": meta.get('consistency_diagnostic'),
     }
 
@@ -1825,6 +1922,10 @@ def main():
     p_preflight.add_argument('operation', choices=['start_task', 'continue_task'])
     p_preflight.add_argument('arguments', type=json.loads)
 
+    p_request = sub.add_parser('inspect-start-request', help='Reconcile or fence a deterministic start request')
+    p_request.add_argument('request_id')
+    p_request.add_argument('--fence', action='store_true')
+
     p_models = sub.add_parser('execution-catalog', help='Validate and display model/profile configuration')
     p_models.add_argument('--project')
     p_models.add_argument('--discover', action='store_true', help='Read installed runtime version/models on the project host')
@@ -1869,6 +1970,8 @@ def main():
     p_run_project.add_argument("--execution-options", type=json.loads, default=None)
     p_run_project.add_argument("--request-id", default=None)
     p_run_project.add_argument("--role", choices=["coding", "review"], default="coding")
+    p_run_project.add_argument('--review-binding', type=json.loads, default=None)
+    p_run_project.add_argument('--repository-binding', type=json.loads, default=None)
 
     p_exec = sub.add_parser("exec")
     p_exec.add_argument("machine", choices=MACHINES.keys())
@@ -1914,6 +2017,10 @@ def main():
         print(json.dumps(preflight_task(args.operation, args.arguments)))
         raise SystemExit(0)
 
+    if args.action == 'inspect-start-request':
+        print(json.dumps(worker_runtime.inspect_start_request(DATA_DIR, args.request_id, fence=args.fence)))
+        raise SystemExit(0)
+
     if args.action == 'execution-catalog':
         raise SystemExit(execution_catalog(args.project, args.discover, args.agent))
 
@@ -1957,6 +2064,8 @@ def main():
                 args.role,
                 **({'execution_profile': args.execution_profile, 'execution_options': args.execution_options}
                    if args.execution_profile is not None or args.execution_options is not None else {}),
+                **({'review_binding': args.review_binding} if args.review_binding is not None else {}),
+                **({'repository_binding': args.repository_binding} if args.repository_binding is not None else {}),
             )
         )
 
@@ -2001,3 +2110,9 @@ if __name__ == "__main__":
         # Only failures before preparation/receipt creation use this contract.
         print(json.dumps(execution_profiles.rejection(exc)))
         raise SystemExit(2)
+    except execution_profiles.StaleReviewInput:
+        print(json.dumps({'status': 'STALE_INPUT', 'launch_started': False}))
+        raise SystemExit(3)
+    except worker_runtime.RequestFenced:
+        print(json.dumps({'status': 'FENCED', 'launch_started': False}))
+        raise SystemExit(3)

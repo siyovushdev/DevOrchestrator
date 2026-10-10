@@ -1,0 +1,21 @@
+{
+  "mode": "fixed",
+  "deferred_notification": false,
+  "elapsed_seconds": 60.029,
+  "writer_steps": 17,
+  "interval_seconds": 10,
+  "state_bytes": 2281718,
+  "writes": {
+    "authoritative": 0,
+    "authoritative_bytes": 0,
+    "telemetry": 10,
+    "telemetry_bytes": 7037
+  },
+  "mtime_unchanged": true,
+  "inode_unchanged": true,
+  "authoritative_bytes_unchanged": true,
+  "process_write_bytes": 40960,
+  "process_write_syscalls": 10,
+  "discovery_reads": 1,
+  "report_reads": 5
+}
