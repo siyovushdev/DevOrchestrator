@@ -1,0 +1,23 @@
+{
+  "mode": "review-baseline",
+  "deferred_notification": true,
+  "elapsed_seconds": 60.022,
+  "writer_steps": 17,
+  "interval_seconds": 10,
+  "state_bytes": 2283593,
+  "writes": {
+    "authoritative": 5,
+    "authoritative_bytes": 11417965,
+    "telemetry": 16,
+    "telemetry_bytes": 16433
+  },
+  "mtime_unchanged": false,
+  "inode_unchanged": false,
+  "authoritative_bytes_unchanged": false,
+  "process_write_bytes": 11493376,
+  "process_write_syscalls": 31,
+  "discovery_reads": 1,
+  "report_reads": 5,
+  "notification_status": "PENDING",
+  "notification_payload_unchanged": false
+}

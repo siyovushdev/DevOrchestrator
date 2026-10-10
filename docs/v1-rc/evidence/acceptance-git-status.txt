@@ -1,0 +1,37 @@
+ M .gitignore
+ M bridge_effects.py
+ M control_loop.py
+ M devctl.py
+ M mcp_server.py
+ M mcp_smoke.py
+ M notifications.py
+ M operational_state.py
+ M publication.py
+ M remote_worker.py
+ M runtime_liveness.py
+ M scheduler.py
+ M task_bridge.py
+ M telegram_setup.py
+ M transition_executor.py
+ M worker_runtime.py
+?? docs/acceptance/ACCEPTANCE_REPORT.md
+?? docs/acceptance/PLAN.md
+?? docs/acceptance/PROGRESS.md
+?? docs/acceptance/ROLLOUT_PLAN.md
+?? docs/acceptance/capability_probe.py
+?? docs/acceptance/evidence/measurement-baseline.json
+?? docs/acceptance/evidence/measurement-deferred-baseline.json
+?? docs/acceptance/evidence/measurement-deferred-fixed.json
+?? docs/acceptance/evidence/measurement-fixed.json
+?? docs/acceptance/evidence/migration-diff.json
+?? docs/acceptance/evidence/migration-summary.json
+?? docs/acceptance/migration_probe.py
+?? docs/acceptance/source_manifest.py
+?? external_effects.py
+?? tests/test_acceptance_archived_merge.py
+?? tests/test_acceptance_effect_gate.py
+?? tests/test_acceptance_effect_latch.py
+?? tests/test_acceptance_fsync.py
+?? tests/test_acceptance_migration_probe.py
+?? tests/test_acceptance_report_latch.py
+?? tests/test_safety_latch_final.py

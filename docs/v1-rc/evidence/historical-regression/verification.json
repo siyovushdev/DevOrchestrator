@@ -1,0 +1,35 @@
+{
+  "workspace": "/home/siovush/DevOrchestrator-acceptance",
+  "recommendation": "PASS",
+  "scope": "Safety Latch remediation; independent review and owner authorization pending",
+  "new_regression_cases": 20,
+  "runs": {
+    "targeted": {
+      "tests": 55,
+      "seconds": 9.773,
+      "status": "PASS",
+      "failures": 0,
+      "errors": 0,
+      "skips": 0,
+      "log_sha256": "6bd77d61a0ec221d3bc5340092ba40b8faca2da2d9e5b56dc60670252383c943"
+    },
+    "full": {
+      "tests": 737,
+      "seconds": 320.331,
+      "status": "PASS",
+      "failures": 0,
+      "errors": 0,
+      "skips": 0,
+      "log_sha256": "f1072599b44bb8ac9caa4d7138e7768061aaa0035e872f8db28668a044ff03a8"
+    }
+  },
+  "source_manifest_count": 17,
+  "checks": {
+    "py_compile": "PASS",
+    "git_diff_check": "PASS"
+  },
+  "production_actions": false,
+  "real_github_telegram_publication": false,
+  "real_remote_cleanup": false,
+  "committed": false
+}

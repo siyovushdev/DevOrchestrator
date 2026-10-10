@@ -484,7 +484,20 @@ class OwnedCleanupTests(unittest.TestCase):
                                  ('pgid', receipt['pgid'] + 1), ('sid', receipt['sid'] + 1),
                                  ('generation', 'another-turn'), ('turn', 100), ('task_id', 'other')):
                 write_json(directory / 'process_group.json', dict(receipt, **{field: value}))
-                self.assertEqual(w.cleanup_group(directory, meta, 'DONE'), 'AMBIGUOUS')
+                if field == 'wrapper_identity':
+                    # Identity disagreement is observable while the leader is
+                    # present. After exit, an exact surviving child anchor still
+                    # proves group ownership. Pin this case's leader premise.
+                    actual_details = w.process_details
+                    leader = dict(pid=receipt['wrapper_pid'], state='S',
+                                  pgid=receipt['pgid'], sid=receipt['sid'],
+                                  identity=receipt['wrapper_identity'])
+                    def observed(pid):
+                        return leader if pid == receipt['wrapper_pid'] else actual_details(pid)
+                    with patch.object(w, 'process_details', side_effect=observed):
+                        self.assertEqual(w.cleanup_group(directory, meta, 'DONE'), 'AMBIGUOUS')
+                else:
+                    self.assertEqual(w.cleanup_group(directory, meta, 'DONE'), 'AMBIGUOUS')
             kill.assert_not_called()
         d.reconcile_workers()
         self.assertTrue(read_json(self.data.parent / 'worker_leases.json'))
@@ -512,7 +525,13 @@ class OwnedCleanupTests(unittest.TestCase):
 
     def test_unrecorded_survivors_fail_closed(self):
         task_id, meta, receipt = self.launch_orphan()
+        # The exit marker precedes supervisor exit. This case needs genuinely
+        # unrecorded survivors, without a live wrapper acting as a valid anchor.
+        wrapper = next((p for p in d._CHILDREN if p.pid == receipt['wrapper_pid']), None)
+        if wrapper is not None:  # task_state may already have reaped it.
+            wrapper.wait(timeout=3)
         d.reap_processes()
+        self.assertIsNone(w.process_details(receipt['wrapper_pid']))
         receipt['members'] = []
         write_json(d.task_dir(task_id) / 'process_group.json', receipt)
         with patch.object(w.os, 'killpg') as kill:

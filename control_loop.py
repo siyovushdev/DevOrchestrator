@@ -60,6 +60,8 @@ class ControlLoop:
 
     def _observe_control(self, number, observation):
         import task_bridge as bridge
+        if bridge.observation_barrier(self.state, number):
+            return
         issue = observation['issue']
         if not issue:
             return
@@ -118,6 +120,8 @@ class ControlLoop:
             if bridge.QUEUE_LABEL in bridge.label_names(issue) and number not in self.state['issues']:
                 self.state['issues'][number] = {'queue_status': 'QUEUED'}
             if number in self.state['issues']:
+                if bridge.bridge_effects.observation_held(self.state, number):
+                    continue
                 self.issues[number] = issue
                 if number not in self.pending:
                     self.pending.append(number)
@@ -126,6 +130,24 @@ class ControlLoop:
 
     def _completion(self, key, command, value, error):
         import task_bridge as bridge
+        from external_effects import read_only_observation
+        # Delayed detached results cannot revive a writer held during smoke.
+        if key in self.reviews.operations:
+            number = self.reviews.operations[key][0]
+        elif key in self.legacy_reviews.operations:
+            number = self.legacy_reviews.operations[key]
+        elif key.startswith(('control:', 'writer:')):
+            number = key.split(':', 1)[1]
+        else:
+            number = None
+        if read_only_observation(value):
+            targets = [number] if number is not None else [
+                n for n, item in self.state['issues'].items() if isinstance(item, dict) and item.get('task_id')]
+            for target in targets:
+                bridge.observation_barrier(self.state, target, {'observation_confidence': 'READ_ONLY'})
+            return
+        if number is not None and bridge.observation_barrier(self.state, number):
+            return
         if key == 'discovery':
             self.next_heavy = time.monotonic() + 30
             if error is None:
@@ -174,7 +196,9 @@ class ControlLoop:
         try:
             command = writer.advance(value, error)
         except (Exception, asyncio.CancelledError) as exc:
-            bridge.defer_issue(self.state['issues'][number], self.state, number, exc)
+            from external_effects import ExternalEffectBlocked
+            if not isinstance(exc, ExternalEffectBlocked):
+                bridge.defer_issue(self.state['issues'][number], self.state, number, exc)
             command = None
         if writer.done:
             del self.continuations[number]
@@ -186,6 +210,10 @@ class ControlLoop:
         """No provider await here. All state application happens in this call."""
         import task_bridge as bridge
         if self.closing:
+            return
+        from external_effects import blocked
+        if blocked():
+            await bridge.observe_latched_poll(self.state)
             return
         # Control/discovery reducers are lifecycle writers too. A failed save
         # must escape the generic retry handler before any further dispatch.
@@ -227,6 +255,8 @@ class ControlLoop:
                 self.poll_cursor += 1
             for number, item in list(self.state['issues'].items()):
                 if not isinstance(item, dict) or not number.isdigit():
+                    continue
+                if bridge.bridge_effects.observation_held(self.state, number):
                     continue
                 if item.get('review_migration') is not None:
                     try:
@@ -275,6 +305,8 @@ class ControlLoop:
                 ready_numbers = ready_numbers[offset:] + ready_numbers[:offset]
                 self.writer_cursor += 1
             for number in ready_numbers:
+                if bridge.bridge_effects.observation_held(self.state, number):
+                    continue
                 if number not in self.waiting or number in self.ready:
                     self._advance(number)
                 command = self.waiting.get(number)

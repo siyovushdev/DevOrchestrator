@@ -1,0 +1,18 @@
+{
+  "root": "/home/siovush/DevOrchestrator-acceptance",
+  "command": [
+    "/home/siovush/DevOrchestrator-acceptance/.venv/bin/python",
+    "-m",
+    "unittest",
+    "discover",
+    "-s",
+    "tests",
+    "-p",
+    "test_chief*.py",
+    "-v"
+  ],
+  "exit_code": 0,
+  "elapsed_seconds": 60.535,
+  "log": "/tmp/devorchestrator-independent-chief-a1q0hwc2/acceptance-chief.log",
+  "log_sha256": "7da0dc55d6766373920c51a2c57b6631169e920b4438696bdf28529545adfd09"
+}

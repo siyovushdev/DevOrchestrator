@@ -1,0 +1,14 @@
+test_registered_report_with_mocked_killpg_does_not_signal_or_write (test_acceptance_report_latch.ReportLatchTests.test_registered_report_with_mocked_killpg_does_not_signal_or_write) ... ok
+test_real_mcp_subprocess_inherits_latch_and_does_not_signal (test_acceptance_report_latch.ReportLatchTests.test_real_mcp_subprocess_inherits_latch_and_does_not_signal) ... ok
+test_remote_report_does_not_ssh_or_signal (test_acceptance_report_latch.ReportLatchTests.test_remote_report_does_not_ssh_or_signal) ... ok
+test_other_read_tools_do_not_probe (test_acceptance_report_latch.ReportLatchTests.test_other_read_tools_do_not_probe) ... ok
+test_stale_terminal_and_remote_cached_metadata_are_unverified (test_safety_latch_final.FinalReportTests.test_stale_terminal_and_remote_cached_metadata_are_unverified) ... ok
+test_missing_health_receipt_through_registered_running_report (test_safety_latch_final.FinalReportTests.test_missing_health_receipt_through_registered_running_report) ... ok
+test_cli_exec_and_direct_runtime_launch_are_blocked (test_safety_latch_final.FinalReportTests.test_cli_exec_and_direct_runtime_launch_are_blocked) ... ok
+test_direct_remote_script_is_read_only_and_start_is_blocked (test_safety_latch_final.FinalReportTests.test_direct_remote_script_is_read_only_and_start_is_blocked) ... ok
+test_registered_poll_and_durable_quarantine (__main__.build_suite.<locals>.LatchedBridgeSmoke.test_registered_poll_and_durable_quarantine) ... ok
+
+----------------------------------------------------------------------
+Ran 9 tests in 0.945s
+
+OK

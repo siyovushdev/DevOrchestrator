@@ -32,6 +32,10 @@ dist/
 # Machine-local project registry
 projects.json
 
+# Acceptance lab: private state copies and raw test logs
+.acceptance-lab/
+.rc-lab/
+
 # Temporary/bootstrap helpers
 mcp_b4_continue.py
 mcp_b4_resume.py

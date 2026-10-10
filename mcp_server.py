@@ -2,6 +2,7 @@
 
 import json
 import asyncio
+import os
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial, wraps
 import subprocess
@@ -32,7 +33,16 @@ def io_tool(function):
     lane = 'work' if function.__name__ in ('start_task', 'continue_task', 'adopt_task', 'preflight_task') else 'control'
     @wraps(function)
     async def handler(*args, **kwargs):
-        return await asyncio.get_running_loop().run_in_executor(TOOL_POOLS[lane], partial(function, *args, **kwargs))
+        from external_effects import blocked
+        latched = blocked()
+        result = await asyncio.get_running_loop().run_in_executor(TOOL_POOLS[lane], partial(function, *args, **kwargs))
+        if function.__name__ in ('get_task_report', 'list_tasks', 'get_task_observation', 'list_task_observations') and (latched or blocked() or kwargs.get('read_only')):
+            # Retain dispatch provenance across environment changes in flight.
+            if isinstance(result, list):
+                result = [dict(row, observation_confidence='READ_ONLY') for row in result]
+            else:
+                result = dict(result, observation_confidence='READ_ONLY')
+        return result
     mcp.tool()(handler)
     return function  # Preserve the direct, synchronous CLI-adapter test contract.
 
@@ -41,7 +51,8 @@ def load_projects() -> dict:
     return json.loads(PROJECTS_FILE.read_text())
 
 
-def devctl_result(*args: str, timeout: int = 30):
+def devctl_result(*args: str, timeout: int = 30, read_only: bool = False):
+    from external_effects import ENV
     return subprocess.run(
         [str(DEVCTL), *args],
         cwd=ROOT,
@@ -50,11 +61,12 @@ def devctl_result(*args: str, timeout: int = 30):
         stderr=subprocess.STDOUT,
         text=True,
         timeout=timeout,
+        **({'env': dict(os.environ, **{ENV: '1'})} if read_only else {}),
     )
 
 
-def devctl(*args: str, timeout: int = 30) -> str:
-    result = devctl_result(*args, timeout=timeout)
+def devctl(*args: str, timeout: int = 30, read_only: bool = False) -> str:
+    result = devctl_result(*args, timeout=timeout, **({'read_only': True} if read_only else {}))
     output = result.stdout.strip()
 
     if result.returncode in (2, 3):
@@ -107,6 +119,9 @@ def get_transition_capabilities() -> dict:
 @io_tool
 def inspect_start_request(request_id: str, fence: bool = False) -> dict:
     """Inspect a start receipt; optionally fence only a proven unaccepted request."""
+    if fence:
+        from external_effects import refuse
+        refuse('worker')
     args = ['inspect-start-request', request_id]
     if fence:
         args.append('--fence')
@@ -131,6 +146,8 @@ def start_task(
 
     Uses the project's default agent unless agent is explicitly specified.
     """
+    from external_effects import refuse
+    refuse('worker')
     projects = load_projects()
 
     if project not in projects:
@@ -187,17 +204,25 @@ def start_task(
 
 
 @io_tool
-def get_task_report(task_id: str) -> dict:
+def get_task_report(task_id: str, read_only: bool = False) -> dict:
     """Return task status and latest concise result."""
     return json.loads(
-        devctl("report", task_id, "--json")
+        devctl("report", task_id, "--json", **({'read_only': True} if read_only else {}))
     )
+
+
+@io_tool
+def get_task_observation(task_id: str) -> dict:
+    """Always read-only, including when the MCP server itself is unlatched."""
+    return get_task_report(task_id, read_only=True)
 
 
 @io_tool
 def continue_task(task_id: str, prompt: str, request_id: str | None = None,
                   role: Literal["coding", "review"] = "coding") -> dict:
     """Continue the same Codex or Cursor session."""
+    from external_effects import refuse
+    refuse('worker')
     args = ["continue", task_id, prompt]
     if request_id:
         args += ["--request-id", request_id]
@@ -212,14 +237,20 @@ def continue_task(task_id: str, prompt: str, request_id: str | None = None,
 
 
 @io_tool
-def list_tasks(control: bool = False, project: str | None = None) -> list:
+def list_tasks(control: bool = False, project: str | None = None, read_only: bool = False) -> list:
     """Control reads target worker ownership without running recovery sweeps."""
     args = ["tasks", "--json", "--cached"]
     if control:
         args += ["--control"]
         if project:
             args += ["--control-project", project]
-    return json.loads(devctl(*args))
+    return json.loads(devctl(*args, **({'read_only': True} if read_only else {})))
+
+
+@io_tool
+def list_task_observations(control: bool = False, project: str | None = None) -> list:
+    """Always read-only; an older server cannot silently drop a mode argument."""
+    return list_tasks(control, project, read_only=True)
 
 
 @io_tool
@@ -232,6 +263,8 @@ def adopt_task(
     effort: str | None = None,
 ) -> dict:
     """Register an existing agent session as a DevOrchestrator task."""
+    from external_effects import refuse
+    refuse('worker')
     args = [
         "adopt",
         project,
@@ -263,6 +296,8 @@ def orchestrator_health() -> dict:
     READY and DEGRADED have ok=true; FAILED has ok=false and blocks rollout.
     MCP/project identity and task-list transport still require separate checks.
     """
+    from external_effects import refuse
+    refuse('worker')
     try:
         result = devctl_result('doctor', '--json', timeout=MCP_HEALTH_TIMEOUT)
         report = validate_health(json.loads(result.stdout))

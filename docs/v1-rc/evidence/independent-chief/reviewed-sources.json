@@ -1,0 +1,33 @@
+{
+  "integration": {
+    "root": "/home/siovush/DevOrchestrator-integration",
+    "head": "d447ebc6e88531dc003665874ad9cfd498d5d0b4",
+    "git_status": "",
+    "sha256": {
+      "bridge_effects.py": "74b70e6187f5cbc2646b2e5829883c601c54ea16037b53a2b714e553ef10be3f",
+      "task_bridge.py": "66817484ef2137de0049e9133714bf44f76e18388cc5fe5be212289c7a77ec94",
+      "tests/test_chief_delivery_retry.py": "656a587bd8e6b9520745d89d1da8a326b4d89454acaff5eba8adb3f425ead1a6",
+      "durable.py": "d581b6815788a350aed665068a8806e249bf09daf0355431a47838a664136041",
+      "transition_io.py": "85f8010cc06b65805a45108e3ec25803044c2b7aa575ab13222ebf50bba772e4",
+      "transition_executor.py": "e9a2091e3810dfabf3d9802e421546558fedd5493a485a5898c2c7011eaeabb9",
+      "control_loop.py": "98ef0ade8d7977bfe412a321494a7cf690d0be61eb0e7889a905b038013f64ad",
+      "chief_review.py": "25b39b1d908de2542bb545c4e5e2f0d5944a27698f6137ebd887fa37ffa28cb9"
+    }
+  },
+  "acceptance": {
+    "root": "/home/siovush/DevOrchestrator-acceptance",
+    "head": "adab54726e7427d83cf42d9241c570ec619dceec",
+    "git_status": " M .gitignore\n M bridge_effects.py\n M control_loop.py\n M devctl.py\n M mcp_server.py\n M mcp_smoke.py\n M notifications.py\n M operational_state.py\n M publication.py\n M remote_worker.py\n M runtime_liveness.py\n M scheduler.py\n M task_bridge.py\n M telegram_setup.py\n M transition_executor.py\n M worker_runtime.py\n?? docs/acceptance/\n?? external_effects.py\n?? tests/test_acceptance_archived_merge.py\n?? tests/test_acceptance_effect_gate.py\n?? tests/test_acceptance_effect_latch.py\n?? tests/test_acceptance_fsync.py\n?? tests/test_acceptance_migration_probe.py\n?? tests/test_acceptance_report_latch.py\n?? tests/test_safety_latch_final.py\n",
+    "sha256": {
+      "bridge_effects.py": "d16aa54f2f79c4702acc72f70fec46c1a78f1e5fa9e1f131bd96aeb81a5d312b",
+      "task_bridge.py": "e776e3031765af2653ac8912fa79414178a4178d3bad4214f8d0a4f45fb977e6",
+      "tests/test_chief_delivery_retry.py": "656a587bd8e6b9520745d89d1da8a326b4d89454acaff5eba8adb3f425ead1a6",
+      "durable.py": "d581b6815788a350aed665068a8806e249bf09daf0355431a47838a664136041",
+      "transition_io.py": "85f8010cc06b65805a45108e3ec25803044c2b7aa575ab13222ebf50bba772e4",
+      "transition_executor.py": "0345ea86a2de7a869baf3aced5876269d6970c7bc3e5ff83df2683fbdee5fc22",
+      "control_loop.py": "557f8b15ae2cb6b8783bdf3aedb41ee5255f3fcc22974a6d580ba9d51b84bfbd",
+      "chief_review.py": "25b39b1d908de2542bb545c4e5e2f0d5944a27698f6137ebd887fa37ffa28cb9",
+      "external_effects.py": "f3a6c20c57748514ca37e8a7b62b07e8bf6aa1ed189679f9ee9579734ffc2ef3"
+    }
+  }
+}

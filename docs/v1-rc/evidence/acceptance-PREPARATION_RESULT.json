@@ -1,0 +1,40 @@
+{
+  "baseline_regressions": {
+    "complete": {
+      "provenance": "accepted log hash verified; not rerun during preparation",
+      "status": "PASS",
+      "tests": 737
+    },
+    "independent": {
+      "provenance": "owner statement",
+      "status": "PASS",
+      "tests": 173
+    }
+  },
+  "git_diff_check": "PASS",
+  "guard_source_hash_matches": 17,
+  "guard_source_hash_mismatches": 0,
+  "issue_holds_removed": false,
+  "latch_removed": false,
+  "namespace_preflight": "PASS",
+  "planned_smoke_cases": 9,
+  "preflight_evidence": "/home/siovush/DevOrchestrator-acceptance/.acceptance-lab/controlled-smoke-prep/runs/preflight-20261010T161713Z-566299c3/evidence",
+  "preparation_manifest_sha256": "a4db4f76cdabe8750f51d5fd229e9e97cb7519c9d221db6e2dff7865d790c255",
+  "production_operations": false,
+  "quarantined_effects_released": false,
+  "release_commit_created": false,
+  "review_notes": [
+    "Source and existing acceptance docs unchanged; preparation artifacts only in ignored lab.",
+    "Prepared harness has syntax/static review only; no claim of smoke PASS.",
+    "Existing live rollout requires separately authorized published/accepted release SHA.",
+    "Nonblocking CLOSED/OPEN race unchanged."
+  ],
+  "reviewed_source_files": 124,
+  "smoke_cases_executed": 0,
+  "smoke_executed": false,
+  "status": "PREPARED_AWAITING_OWNER_AUTHORIZATION",
+  "syntax_checks": "PASS (3 helpers)",
+  "tracked_files": 103,
+  "tree_manifest_sha256": "31834a44973af92ad721b3cf6bc8ce45fe63802ca1dbad28c1a0708964175495",
+  "untracked_files": 21
+}

@@ -1,0 +1,12 @@
+{
+  "status": "PASS",
+  "latch": "1",
+  "source_files": 124,
+  "pid_namespace": "pid:[4026533641]",
+  "network_namespace": "net:[4026533643]",
+  "production_paths_visible": false,
+  "host_mcp_reachable": false,
+  "synthetic_home_empty": true,
+  "synthetic_tmp_empty": true,
+  "source_mount_read_only": true
+}

@@ -1,0 +1,58 @@
+[
+  {
+    "path": "SMOKE_PLAN.md",
+    "sha256": "17c60aeb4d069e4895018544d5be7d1a450bb289ba1157c42aa2fd2d33c3b92c"
+  },
+  {
+    "path": "accepted-evidence/dependencies.txt",
+    "sha256": "a293a5bb2363df1373733c4fb69fcaa8eb8a6b68ddc51685fa6c417f88848ece"
+  },
+  {
+    "path": "accepted-evidence/full.log",
+    "sha256": "f1072599b44bb8ac9caa4d7138e7768061aaa0035e872f8db28668a044ff03a8"
+  },
+  {
+    "path": "accepted-evidence/source-manifest.json",
+    "sha256": "dbf2089e440e41256ce21ebce9804d0418f17be79cf22d9653b7c3d516eddc96"
+  },
+  {
+    "path": "accepted-evidence/targeted.log",
+    "sha256": "6bd77d61a0ec221d3bc5340092ba40b8faca2da2d9e5b56dc60670252383c943"
+  },
+  {
+    "path": "accepted-evidence/verification.json",
+    "sha256": "f79a713ea9fb0d7ba2916bcc3758cb69a3fcc07b234755ce17db817ffcda6267"
+  },
+  {
+    "path": "freeze.json",
+    "sha256": "3298152478fef22b5849d8733e8c1a25d0229f94c8e004f8149e200951f896a9"
+  },
+  {
+    "path": "git-status.txt",
+    "sha256": "36ac66ee9781c9a5c243862165d77478044dbe5def4131c55202d603120ab93c"
+  },
+  {
+    "path": "isolation_probe.py",
+    "sha256": "e023437bf133e6f3d37d05a95e5b27c6bde4e33ae7dcf89170c9e7b12a62cf74"
+  },
+  {
+    "path": "reviewed.patch",
+    "sha256": "073cb632b1a609dd0d97f0a7dc2aa27773eb1e8535a9c3cbc081c4d230d52398"
+  },
+  {
+    "path": "smoke.py",
+    "sha256": "e2412d71724e7b5e4d2904e65a57d0fb629679505fa6c11f5a745d90db19a73e"
+  },
+  {
+    "path": "smoke_control.py",
+    "sha256": "1797002403a21f254b1efe1c5f86805de284a9d33c23fb0b458bdcdab9e6e38a"
+  },
+  {
+    "path": "tree-manifest.json",
+    "sha256": "31834a44973af92ad721b3cf6bc8ce45fe63802ca1dbad28c1a0708964175495"
+  },
+  {
+    "path": "venv-manifest.json",
+    "sha256": "9692c51dd9b505cacb57edb2003ec906dd9a0d72033a7421a335f1ed084d159b"
+  }
+]

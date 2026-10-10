@@ -1,0 +1,15 @@
+{
+  "status": "PASS",
+  "group": "targeted",
+  "tests": 120,
+  "discovered": 120,
+  "unique_ids": 120,
+  "seconds": 36.78035632503452,
+  "failures": 0,
+  "errors": 0,
+  "skips": 0,
+  "python": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]",
+  "mcp": "2.3.0",
+  "failed_ids": [],
+  "skipped_ids": []
+}

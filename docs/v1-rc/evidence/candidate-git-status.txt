@@ -1,0 +1,158 @@
+ M .gitignore
+ M PLAN.md
+ M PROGRESS.md
+ M bridge_effects.py
+ M control_loop.py
+ M devctl.py
+ M mcp_server.py
+ M mcp_smoke.py
+ M notifications.py
+ M operational_state.py
+ M publication.py
+ M remote_worker.py
+ M runtime_liveness.py
+ M scheduler.py
+ M task_bridge.py
+ M telegram_setup.py
+ M tests/test_operational_stability.py
+ M transition_executor.py
+ M worker_runtime.py
+?? docs/acceptance/ACCEPTANCE_REPORT.md
+?? docs/acceptance/PLAN.md
+?? docs/acceptance/PROGRESS.md
+?? docs/acceptance/ROLLOUT_PLAN.md
+?? docs/acceptance/capability_probe.py
+?? docs/acceptance/evidence/measurement-baseline.json
+?? docs/acceptance/evidence/measurement-deferred-baseline.json
+?? docs/acceptance/evidence/measurement-deferred-fixed.json
+?? docs/acceptance/evidence/measurement-fixed.json
+?? docs/acceptance/evidence/migration-diff.json
+?? docs/acceptance/evidence/migration-summary.json
+?? docs/acceptance/migration_probe.py
+?? docs/acceptance/source_manifest.py
+?? docs/v1-rc/architectural-review.md
+?? docs/v1-rc/evidence/acceptance-PREPARATION_RESULT.json
+?? docs/v1-rc/evidence/acceptance-freeze.json
+?? docs/v1-rc/evidence/acceptance-git-status.txt
+?? docs/v1-rc/evidence/acceptance-preparation-manifest.json
+?? docs/v1-rc/evidence/acceptance-reviewed.patch
+?? docs/v1-rc/evidence/acceptance-tree-manifest.json
+?? docs/v1-rc/evidence/background-writer-observation.json
+?? docs/v1-rc/evidence/background-writer-second-observation.json
+?? docs/v1-rc/evidence/baseline.json
+?? docs/v1-rc/evidence/candidate-python-manifest.json
+?? docs/v1-rc/evidence/deferred/SHA256.json
+?? docs/v1-rc/evidence/deferred/command.json
+?? docs/v1-rc/evidence/deferred/execution.json
+?? docs/v1-rc/evidence/deferred/isolation.json
+?? docs/v1-rc/evidence/deferred/measurement.json
+?? docs/v1-rc/evidence/dependency-lock.txt
+?? docs/v1-rc/evidence/environment-root-cause.json
+?? docs/v1-rc/evidence/full-final/SHA256.json
+?? docs/v1-rc/evidence/full-final/command.json
+?? docs/v1-rc/evidence/full-final/execution.json
+?? docs/v1-rc/evidence/full-final/isolation.json
+?? docs/v1-rc/evidence/full-final/log-inventory-verification.json
+?? docs/v1-rc/evidence/full-final/result.json
+?? docs/v1-rc/evidence/full-final/test-inventory.json
+?? docs/v1-rc/evidence/full-initial-failed/SHA256.json
+?? docs/v1-rc/evidence/full-initial-failed/command.json
+?? docs/v1-rc/evidence/full-initial-failed/execution.json
+?? docs/v1-rc/evidence/full-initial-failed/isolation.json
+?? docs/v1-rc/evidence/full-initial-failed/result.json
+?? docs/v1-rc/evidence/full-initial-failed/test-inventory.json
+?? docs/v1-rc/evidence/full-superseded-fixture/SHA256.json
+?? docs/v1-rc/evidence/full-superseded-fixture/command.json
+?? docs/v1-rc/evidence/full-superseded-fixture/execution.json
+?? docs/v1-rc/evidence/full-superseded-fixture/isolation.json
+?? docs/v1-rc/evidence/full-superseded-fixture/result.json
+?? docs/v1-rc/evidence/full-superseded-fixture/test-inventory.json
+?? docs/v1-rc/evidence/historical-regression/dependencies.txt
+?? docs/v1-rc/evidence/historical-regression/source-manifest.json
+?? docs/v1-rc/evidence/historical-regression/verification.json
+?? docs/v1-rc/evidence/historical-smoke/SHA256.json
+?? docs/v1-rc/evidence/historical-smoke/bridge-assertions.json
+?? docs/v1-rc/evidence/historical-smoke/command.json
+?? docs/v1-rc/evidence/historical-smoke/execution.json
+?? docs/v1-rc/evidence/historical-smoke/isolation.json
+?? docs/v1-rc/evidence/historical-smoke/pre-execution-verification.json
+?? docs/v1-rc/evidence/historical-smoke/result.json
+?? docs/v1-rc/evidence/idle/SHA256.json
+?? docs/v1-rc/evidence/idle/command.json
+?? docs/v1-rc/evidence/idle/execution.json
+?? docs/v1-rc/evidence/idle/isolation.json
+?? docs/v1-rc/evidence/idle/measurement.json
+?? docs/v1-rc/evidence/independent-chief/acceptance-adversarial.json
+?? docs/v1-rc/evidence/independent-chief/acceptance-chief.json
+?? docs/v1-rc/evidence/independent-chief/adversarial_review.py
+?? docs/v1-rc/evidence/independent-chief/decision.json
+?? docs/v1-rc/evidence/independent-chief/followup/baseline-with-awk.json
+?? docs/v1-rc/evidence/independent-chief/followup/baseline-without-awk.json
+?? docs/v1-rc/evidence/independent-chief/followup/baseline_probe.py
+?? docs/v1-rc/evidence/independent-chief/followup/cleanup-final-premises.json
+?? docs/v1-rc/evidence/independent-chief/followup/cleanup-followup-final.json
+?? docs/v1-rc/evidence/independent-chief/followup/cleanup-followup-initial.json
+?? docs/v1-rc/evidence/independent-chief/followup/cleanup-followup.json
+?? docs/v1-rc/evidence/independent-chief/followup/cleanup_followup.py
+?? docs/v1-rc/evidence/independent-chief/followup/decision.json
+?? docs/v1-rc/evidence/independent-chief/followup/narrow-only-intermediate-decision.json
+?? docs/v1-rc/evidence/independent-chief/followup/narrow-only-intermediate-review.md
+?? docs/v1-rc/evidence/independent-chief/followup/review.md
+?? docs/v1-rc/evidence/independent-chief/followup/source-comparison.json
+?? docs/v1-rc/evidence/independent-chief/independent-review.md
+?? docs/v1-rc/evidence/independent-chief/integration-adversarial.json
+?? docs/v1-rc/evidence/independent-chief/integration-chief.json
+?? docs/v1-rc/evidence/independent-chief/rc-combined.json
+?? docs/v1-rc/evidence/independent-chief/rc-source-comparison.json
+?? docs/v1-rc/evidence/independent-chief/reviewed-sources.json
+?? docs/v1-rc/evidence/independent-chief/run_candidate_review.py
+?? docs/v1-rc/evidence/preservation-final.json
+?? docs/v1-rc/evidence/preservation.json
+?? docs/v1-rc/evidence/source-change-manifest.json
+?? docs/v1-rc/evidence/source-manifest.json
+?? docs/v1-rc/evidence/static-checks.json
+?? docs/v1-rc/evidence/targeted-broad-fixture-failed/SHA256.json
+?? docs/v1-rc/evidence/targeted-broad-fixture-failed/command.json
+?? docs/v1-rc/evidence/targeted-broad-fixture-failed/execution.json
+?? docs/v1-rc/evidence/targeted-broad-fixture-failed/isolation.json
+?? docs/v1-rc/evidence/targeted-broad-fixture-failed/result.json
+?? docs/v1-rc/evidence/targeted-broad-fixture-failed/test-inventory.json
+?? docs/v1-rc/evidence/targeted-final/SHA256.json
+?? docs/v1-rc/evidence/targeted-final/command.json
+?? docs/v1-rc/evidence/targeted-final/execution.json
+?? docs/v1-rc/evidence/targeted-final/isolation.json
+?? docs/v1-rc/evidence/targeted-final/result.json
+?? docs/v1-rc/evidence/targeted-final/test-inventory.json
+?? docs/v1-rc/evidence/targeted-initial/SHA256.json
+?? docs/v1-rc/evidence/targeted-initial/command.json
+?? docs/v1-rc/evidence/targeted-initial/execution.json
+?? docs/v1-rc/evidence/targeted-initial/isolation.json
+?? docs/v1-rc/evidence/targeted-initial/result.json
+?? docs/v1-rc/evidence/targeted-initial/test-inventory.json
+?? docs/v1-rc/evidence/targeted-intermediate/SHA256.json
+?? docs/v1-rc/evidence/targeted-intermediate/command.json
+?? docs/v1-rc/evidence/targeted-intermediate/execution.json
+?? docs/v1-rc/evidence/targeted-intermediate/isolation.json
+?? docs/v1-rc/evidence/targeted-intermediate/result.json
+?? docs/v1-rc/evidence/targeted-intermediate/test-inventory.json
+?? docs/v1-rc/evidence/targeted-narrowed-intermediate/SHA256.json
+?? docs/v1-rc/evidence/targeted-narrowed-intermediate/command.json
+?? docs/v1-rc/evidence/targeted-narrowed-intermediate/execution.json
+?? docs/v1-rc/evidence/targeted-narrowed-intermediate/isolation.json
+?? docs/v1-rc/evidence/targeted-narrowed-intermediate/result.json
+?? docs/v1-rc/evidence/targeted-narrowed-intermediate/test-inventory.json
+?? docs/v1-rc/historical-integration-PLAN.md
+?? docs/v1-rc/historical-integration-PROGRESS.md
+?? docs/v1-rc/integration-report.md
+?? docs/v1-rc/release-and-rollback.md
+?? docs/v1-rc/run_verification.py
+?? docs/v1-rc/verify_candidate.py
+?? docs/v1-rc/verify_suite.py
+?? external_effects.py
+?? tests/test_acceptance_archived_merge.py
+?? tests/test_acceptance_effect_gate.py
+?? tests/test_acceptance_effect_latch.py
+?? tests/test_acceptance_fsync.py
+?? tests/test_acceptance_migration_probe.py
+?? tests/test_acceptance_report_latch.py
+?? tests/test_safety_latch_final.py

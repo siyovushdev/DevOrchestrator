@@ -182,6 +182,12 @@ def watchdog(directory, meta, *, probe=True, terminal=None, clock=None, evidence
     Only semantic transitions write runtime_health.json, making repeated ticks
     idempotent; elapsed heartbeat ages are calculated at read time.
     """
+    # Same variable as external_effects.ENV. The SSH worker bundle cannot import it.
+    if os.environ.get('DEVORCHESTRATOR_BLOCK_EXTERNAL_EFFECTS') == '1':
+        return dict(state='UNKNOWN', reason='reconciliation_blocked',
+                    observation_confidence='READ_ONLY', generation=meta.get('runtime_generation'),
+                    worker_alive=None, process_alive=None, phase='UNKNOWN', exit_code=None,
+                    lease_state='UNKNOWN', heartbeat_age_seconds=None)
     now = time.time() if clock is None else clock
     with nullcontext() if read_only else exclusive(directory / 'liveness.lock', blocking=True):
         record = None
@@ -255,6 +261,8 @@ def task_status(health):
 
 
 def final_report_missing(directory, meta):
+    if os.environ.get('DEVORCHESTRATOR_BLOCK_EXTERNAL_EFFECTS') == '1':
+        return
     with exclusive(directory / 'liveness.lock', blocking=True):
         record = validate(read_record(directory), meta)
         if record['exit_code'] == 0 and record.get('terminal_reason') == 'process_exited':
@@ -264,6 +272,8 @@ def final_report_missing(directory, meta):
 
 def annotate_session(directory, meta, session_id):
     """Session discovery is activity metadata, never a heartbeat/lease refresh."""
+    if os.environ.get('DEVORCHESTRATOR_BLOCK_EXTERNAL_EFFECTS') == '1':
+        return
     with exclusive(directory / 'liveness.lock', blocking=True):
         record = validate(read_record(directory), meta)
         if type(session_id) is str and 0 < len(session_id) <= 512 and record['session_id'] != session_id:
@@ -273,6 +283,8 @@ def annotate_session(directory, meta, session_id):
 
 def run(directory, generation, command):
     """Supervise independently of stdout; no silence-based kills/retries."""
+    if os.environ.get('DEVORCHESTRATOR_BLOCK_EXTERNAL_EFFECTS') == '1':
+        raise RuntimeError('External worker effect blocked')
     directory = Path(directory)
     record = validate(read_record(directory))
     if record['generation'] != generation:

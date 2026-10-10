@@ -1,0 +1,24 @@
+{
+  "status": "PASS",
+  "exact_capability_verified": true,
+  "observation_tools_verified": true,
+  "bridge_cycles": 3,
+  "legacy_quarantined": 3,
+  "new_quarantined": 3,
+  "unrelated_preserved": true,
+  "ownership_preserved": true,
+  "issue_holds_preserved": true,
+  "worker_metadata_unchanged": true,
+  "worker_signals": 0,
+  "unexpected_worker_creation": 0,
+  "ssh_calls": 0,
+  "publication_callbacks": 0,
+  "latch_removed": false,
+  "classifications": {
+    "empty_final": "FAILED/READ_ONLY",
+    "invalid_final": "FAILED/READ_ONLY",
+    "valid_final": "DONE/READ_ONLY",
+    "cached_lost_health": "UNKNOWN"
+  },
+  "actionable_promotions": 0
+}

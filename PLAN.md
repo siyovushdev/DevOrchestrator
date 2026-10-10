@@ -1,48 +1,41 @@
-# Integration plan: F1/F2/F3 + semantic durability (#47)
+# Automation AI V1 release candidate
 
-Scope: this integration worktree only. Sources are read-only. No production,
-live state, service/configuration changes, commit, push, PR, merge or restart.
+Scope: isolated `/home/siovush/DevOrchestrator-v1-rc-20261010`, independent Git
+repository with detached baseline `adab54726e7427d83cf42d9241c570ec619dceec`.
+No production/source changes, live worker operations, real publication, commits,
+pushes, PRs, merges, restarts or deployment are authorized.
 
-## Invariants
+## Sequence and verification
 
-- One lifecycle writer; detached I/O only receives copied commands/results.
-- Preserve resumable phases, immutable request IDs/arguments, receipts, locks,
-  sandbox, independent review, Chief, owner and publication boundary gates.
-- Durable checkpoints before dispatch; ambiguous acceptance retains ownership.
-- Runtime observations/timings and deferred notification display do not rewrite
-  authoritative state; optional telemetry cannot influence recovery or gates.
-- Legacy migration is fail-closed; restart reconciles without duplicate launches.
+1. [x] Inventory all existing worktrees, HEADs and dirty/untracked files; record
+   source and protected production/state hashes before candidate creation.
+2. [x] Verify 124 frozen acceptance files and 17 guarded hashes. Acceptance
+   includes integration/Chief changes; preserve exact bytes and 21 untracked files.
+3. [x] Create independent candidate Git/object store and local test environment.
+   Archive historical PLAN/PROGRESS and source evidence with provenance.
+4. [x] Obtain independent Chief review and integrated safety verification.
+5. [x] Run targeted and complete regression with no skips using private HOME/TMPDIR,
+   mocked transports and process/network/filesystem isolation.
+6. [x] Investigate failures; fix confirmed defects minimally with regressions;
+   repeat affected checks and full regression after runtime changes.
+7. [x] Review integrated diff, schema/durability/recovery/ownership/request IDs,
+   Chief/owner/publication gates, latch/holds and repository isolation.
+8. [x] Freeze hashes, verify sources/protected data, deliver report, change
+   manifest, exact logs, risks and release/rollback/owner gates.
 
-## Stages
+Expected conflicts: none to replay; acceptance extends integration content.
+Verify latch withholding with Chief no-send retry. Never clear old
+SENDING/UNCERTAIN, quarantines or issue holds.
 
-1. [x] Inspect both tracked diffs and all untracked files; map intersections.
-2. [x] Apply F1/F2/F3 and transfer #47 with manual integration at intersections.
-3. [x] Run transferred focused tests; fix compatibility and combined-path defects.
-4. [x] Add focused F3 + semantic durability regressions, including migration,
-   writer failures, suspended transitions, send receipts and restart deduplication.
-5. [x] Run full regression without skips, compile and diff checks; reproduce
-   wall-clock write amplification on final tree, baseline and fixed.
-6. [x] Self-review final diff, verify sources unchanged, document evidence,
-   complete change inventory and remaining operational risks.
+Completion: exact isolated candidate; independent Chief ACCEPTED; targeted/full
+PASS without skips; no confirmed release blocker; safety invariants preserved;
+production/source preservation verified; independent release acceptance and
+owner publication/deployment gates documented. No production acceptance claim.
+Discovery cache ordering and real-provider soak remain separate work unless
+review demonstrates a release-blocking interaction.
 
-Record commands, results and decisions in PROGRESS.md at each checkpoint.
-No production-ready claim; acceptance/rollout is a separate task.
-
-Completed: 669 tests PASS in 308.263s, no skips. Four final-tree measurement
-windows and source invariants are recorded in docs/integration-evidence.
-Ready for independent review; full inventory and remaining risks are in
-docs/integration-report.md. The follow-up below supersedes the initial handoff.
-
-## Independent review follow-up: Chief delivery lock contention
-
-1. [x] Reproduce/analyze SENDING -> UNCERTAIN after pre-dispatch lock refusal.
-2. [x] Add explicit no-send proof at lock acquisition; preserve ambiguity handling.
-3. [x] Add real flock, retry/restart, receipt and semantic-durability regressions.
-4. [x] Run focused and complete regressions; fix findings and self-review.
-5. [x] Record final evidence/report; stop for independent verification.
-
-Follow-up complete: 108 focused PASS; 677 full PASS in 263.395s, no skips.
-Current-tree idle/deferred measurements both retain zero authoritative writes.
-Ready for independent verification; docs/chief-delivery-fix-report.md records
-the no-send boundary, legacy uncertain holds, evidence and remaining limits.
-No additional test run or operational action is planned.
+Completed engineering handoff: 737 full PASS / 277.412s; 136 targeted
+PASS / 53.459s; independent Chief/latch 106 PASS and fixture/runner
+14 PASS, ACCEPTED. All no-skip criteria met. Production/source/config untouched
+by this task; active production writer caused documented live-state byte drift.
+Ready for independent full release acceptance, never production-ready.

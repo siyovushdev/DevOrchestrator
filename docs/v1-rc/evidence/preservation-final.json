@@ -1,0 +1,86 @@
+{
+  "status": "PASS_SOURCE_CONFIG_ISOLATION_WITH_BACKGROUND_LIVE_DRIFT",
+  "observed_utc": "2026-10-10T17:16:18.350915+00:00",
+  "worktrees": {
+    "/home/siovush/DevOrchestrator": {
+      "head_unchanged": true,
+      "status_unchanged": true,
+      "file_set_unchanged": true,
+      "hash_mismatches": [],
+      "verified_files": 61
+    },
+    "/home/siovush/DevOrchestrator-acceptance": {
+      "head_unchanged": true,
+      "status_unchanged": true,
+      "file_set_unchanged": true,
+      "hash_mismatches": [],
+      "verified_files": 124
+    },
+    "/home/siovush/DevOrchestrator-dev": {
+      "head_unchanged": true,
+      "status_unchanged": true,
+      "file_set_unchanged": true,
+      "hash_mismatches": [],
+      "verified_files": 65
+    },
+    "/home/siovush/DevOrchestrator-integration": {
+      "head_unchanged": true,
+      "status_unchanged": true,
+      "file_set_unchanged": true,
+      "hash_mismatches": [],
+      "verified_files": 103
+    },
+    "/home/siovush/DevOrchestrator-p0-runtime": {
+      "head_unchanged": true,
+      "status_unchanged": true,
+      "file_set_unchanged": true,
+      "hash_mismatches": [],
+      "verified_files": 54
+    },
+    "/home/siovush/DevOrchestrator-p0-write": {
+      "head_unchanged": true,
+      "status_unchanged": true,
+      "file_set_unchanged": true,
+      "hash_mismatches": [],
+      "verified_files": 53
+    },
+    "/home/siovush/DevOrchestrator-review-fix": {
+      "head_unchanged": true,
+      "status_unchanged": true,
+      "file_set_unchanged": true,
+      "hash_mismatches": [],
+      "verified_files": 82
+    }
+  },
+  "protected": {
+    "/home/siovush/DevOrchestrator": {
+      "verified_files": 3290,
+      "added": [],
+      "removed": [],
+      "mismatches": [],
+      "unchanged": true
+    },
+    "/home/siovush/.local/share/devorchestrator": {
+      "verified_files": 1307,
+      "added": [],
+      "removed": [],
+      "mismatches": [
+        "task_bridge_state.json"
+      ],
+      "unchanged": false
+    },
+    "/home/siovush/.config/devorchestrator": {
+      "verified_files": 2,
+      "added": [],
+      "removed": [],
+      "mismatches": [],
+      "unchanged": true
+    }
+  },
+  "task_writes_to_live_state": false,
+  "live_state_interval_byte_immutability": false,
+  "original_worktree_registry_unchanged": true,
+  "original_branch_inventory_unchanged": true,
+  "candidate_no_remotes": true,
+  "candidate_git_common_dir": ".git"
+}

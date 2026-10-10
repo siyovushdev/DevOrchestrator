@@ -1,0 +1,29 @@
+{
+  "observed_utc": "2026-10-10T17:04:23.564109+00:00",
+  "service": {
+    "MainPID": "1541746",
+    "ExecMainStartTimestamp": "Fri 2026-10-09 11:54:18 MSK",
+    "Id": "devorchestrator-task-bridge.service",
+    "ActiveState": "active",
+    "SubState": "running"
+  },
+  "production_script_matches": true,
+  "bridge_lock_fd_owned_by_service": true,
+  "kernel_lock_records_for_service": [
+    "7: FLOCK  ADVISORY  WRITE 1541746 103:01:28072683 0 EOF"
+  ],
+  "state_sha256": "6506cac3a0bccfec74c0b64c0ccbfd4ebf9a96beb855554f1ab254bc1d6ae7b2",
+  "state_mtime_utc": "2026-10-10T17:04:23.453115+00:00",
+  "state_size": 2738838,
+  "field_hashes": {
+    "issues": "08ea91f5a1ca2b4b113170cd9c335727d53215096e639f0985bfc657a82a2128",
+    "work_queue": "d2514b1a8228a6b54cf867e1cc1c7e7cc96357d02b1ad3a116228d495b7953aa",
+    "repo_locks": "060e376b0a526ce87cd49fd8f1fed42ca2ac0060e8281bcd35675099b3b942cc",
+    "queue_sequence": "69f59c273b6e669ac32a6dd5e1b2cb63333d8b004f9696447aee2d422ce63763",
+    "outbox": "3c0f5453fe8b55719f48c3141918c611619d6bb0fd6162169fa77116a562b5b5",
+    "scheduler_diagnostics": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    "timings": "8fc661e23f1f1dd87d6d768126669e83d3012c2f77f70da5d38c214ebddea2ae",
+    "recovery_diagnostic": "0b613ea502828f8798c80f3938911359abdac2dfb0925fc1a4a1734098ee4b52"
+  },
+  "interpretation": "Existing production bridge remains active; task performed read-only service/lock observation. No stop/restart/signal/publication. RC tests cannot access host state. Exact interval live-state byte preservation is not asserted."
+}

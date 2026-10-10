@@ -21,12 +21,20 @@ def synchronous(name, args):
         adapter = bridge.github_task_transport()
         return adapter.fetch_labels(adapter.issue_ref(args['number']))
     if name == 'post_comment':
+        from external_effects import refuse
+        refuse('github')
         return bridge.raw_add_comment(args['number'], args['body'])
     if name == 'transition':
+        from external_effects import refuse
+        refuse('github')
         return bridge.raw_transition_issue(args['issue'], args['target'])
     if name == 'telegram':
+        from external_effects import refuse
+        refuse('telegram')
         return bridge.send_telegram(args['text'])
     if name == 'github':
+        from external_effects import guard_github
+        guard_github(args['args'])
         return bridge.gh(*args['args'])
     if name == 'issues':
         return bridge.open_issues()
@@ -40,6 +48,8 @@ def synchronous(name, args):
     if name == 'repository':
         if args['method'] not in ('snapshot', 'review_evidence', 'git', 'run'):
             raise ValueError('Unknown repository operation')
+        from external_effects import refuse
+        refuse('publication')
         repo = bridge.Repository(args['project'], args.get('report'))
         if 'configuration' in args and repo.cfg != args['configuration']:
             from publication import PublicationError
@@ -70,7 +80,12 @@ async def execute(command):
     args = command.arguments()
     if command.name == 'discovery':
         from control_loop import discover
-        return await discover()
+        from external_effects import blocked
+        latched = blocked()
+        result = await discover()
+        if latched or blocked():
+            result['observation_confidence'] = 'READ_ONLY'
+        return result
     if command.name == 'legacy_review_inspect':
         from transition_io import Command
         capability = await execute(Command.create('rpc', dict(name='get_transition_capabilities', arguments={})))
@@ -83,6 +98,14 @@ async def execute(command):
         return await (prepare(command) if command.name == 'prepare_review' else verify(command))
     if command.name == 'rpc':
         import task_bridge as bridge
-        return await bridge.transport_call(args['name'], args['arguments'])
+        from external_effects import guard_worker_rpc, blocked
+        guard_worker_rpc(args['name'], args['arguments'])
+        latched = blocked()
+        result = await bridge.transport_call(args['name'], args['arguments'])
+        if args['name'] in ('get_task_report', 'list_tasks') and (latched or blocked()):
+            if isinstance(result, list):
+                return [dict(row, observation_confidence='READ_ONLY') for row in result]
+            return dict(result, observation_confidence='READ_ONLY')
+        return result
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(POOLS[command.lane], synchronous, command.name, args)

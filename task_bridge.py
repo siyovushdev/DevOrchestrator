@@ -118,6 +118,8 @@ MAX_REVIEW_FORMAT_RESTARTS = 1
 
 
 def gh(*args):
+    from external_effects import guard_github
+    guard_github(args)
     result = subprocess.run(
         ["gh", *args],
         stdin=subprocess.DEVNULL,
@@ -146,6 +148,8 @@ def send_telegram(text):
 
 
 def notify(status, issue, item, report=None, blocker=None):
+    if WORK_CONTEXT and observation_barrier(WORK_CONTEXT[0], WORK_CONTEXT[1], report):
+        return
     if exclusion_reason(item, issue):
         return
     text = redact(notifications.terminal_text(status, issue, item, report, blocker,
@@ -659,13 +663,17 @@ def invalidate_quality_gates(item):
 
 def coding_report_successful(report, item):
     turn = report.get('turns')
-    return (report.get('id') == item.get('task_id') and report.get('status') == 'DONE' and
+    return (not item.get('safety_latch_hold') and report.get('observation_confidence') != 'READ_ONLY' and
+            report.get('id') == item.get('task_id') and report.get('status') == 'DONE' and
             type(report.get('exit_code')) is int and report['exit_code'] == 0 and
             type(turn) is int and turn > 0 and turn == item.get('coding_turn', turn))
 
 
 def observe_coding_turn(item, state, report):
     """Invalidate reviews on mutable/new coding turns, never adopt old review evidence."""
+    number = next((n for n, tracked in state['issues'].items() if tracked is item), None)
+    if number is not None and observation_barrier(state, number, report):
+        return
     if exclusion_reason(item) or report.get('id') != item.get('task_id'):
         return
     turn = report.get('turns')
@@ -909,6 +917,39 @@ def load_state():
     return bridge_telemetry.durable_state(state)
 
 
+def observation_barrier(state, number, report=None):
+    """One writer boundary for all read-only/cached observation consumers.
+
+    A sticky hold prevents later reconciliation from regenerating effects from
+    smoke state. It is cleared only by an audited, explicit owner recovery,
+    never by removing the environment latch or by a later automatic poll.
+    """
+    from external_effects import blocked
+    number = str(number)
+    if blocked() or (report or {}).get('observation_confidence') == 'READ_ONLY':
+        bridge_effects.hold_observation(state, number)
+        save_state(state)  # Must precede any lifecycle application or dispatch.
+        return True
+    return bridge_effects.observation_held(state, number)
+
+
+async def observe_latched_poll(state):
+    """No lifecycle reducers, scheduler recovery or command consumption."""
+    global WORK_CONTEXT
+    WORK_CONTEXT = None
+    for number, item in state['issues'].items():
+        if not str(number).isdigit() or not isinstance(item, dict):
+            continue
+        # Hold before I/O, including failed reads and legacy smoke projections.
+        if item.get('task_id') or item.get('review_task_id'):
+            observation_barrier(state, number)
+        for task_id in {item.get('task_id'), item.get('review_task_id')} - {None}:
+            try:
+                await rpc_io('get_task_report', {'task_id': task_id})
+            except Exception:
+                pass  # Failed observations cannot grant workflow authority.
+
+
 def save_state(state):
     # Semantic workflow first; optional display telemetry is never recovery
     # authority. A failed checkpoint must stop the resumable lifecycle writer.
@@ -958,6 +999,8 @@ def archive_issue(issue, item, state):
 
 
 def reconcile_projection(issue, item, state):
+    if observation_barrier(state, issue['number']):
+        return
     if exclusion_reason(item, issue):
         return
     global WORK_CONTEXT
@@ -1068,6 +1111,8 @@ def transition_issue(issue, target):
     if not WORK_CONTEXT:
         return raw_transition_issue(issue, target)
     state, number, item = WORK_CONTEXT
+    if observation_barrier(state, number):
+        return
     if exclusion_reason(item, issue):
         return
     event = [target, item.get("task_id"), item.get("review_task_id"), item.get("review_round"),
@@ -1088,6 +1133,8 @@ def add_comment(number, body):
     if not WORK_CONTEXT:
         return raw_add_comment(number, body)
     state, _, item = WORK_CONTEXT
+    if observation_barrier(state, number):
+        return
     if exclusion_reason(item):
         return
     bridge_effects.enqueue(state, number, "comment", body)
@@ -1111,6 +1158,8 @@ def merge_complete(item):
 
 
 def project_merge(issue, item, state):
+    if observation_barrier(state, issue['number']):
+        return
     """Completion is a durable projection only, independent of Git history."""
     if not merge_complete(item):
         return
@@ -1127,9 +1176,17 @@ def flush_effects(state, reconciled=True, control_fresh=None, telegram_dispatch=
 
 
 async def flush_effects_async(state, reconciled=True, control_fresh=None, telegram_dispatch=None, telegram_inflight=(), *, owners=None):
+    from external_effects import blocked
+    if blocked():
+        for number, item in state['issues'].items():
+            if (isinstance(item, dict) and (item.get('task_id') or item.get('review_task_id')) and
+                    (owners is None or str(number) in owners)):
+                observation_barrier(state, number)
     telegram_issues = {}  # Fresh display views; never installed in the outbox.
     suppressed = False
     for entry in state.get('outbox', {}).values():
+        if entry.get('status') == 'QUARANTINED' or entry.get('effect_origin') in ('safety_latch', 'legacy_unverified'):
+            continue
         if owners is not None and str(entry['number']) not in owners:
             continue
         item = state.get('issues', {}).get(str(entry['number']), {})
@@ -1300,6 +1357,9 @@ async def flush_effects_async(state, reconciled=True, control_fresh=None, telegr
                 entry['completion_comment'] = 'UNCERTAIN'
                 save_state(state)
                 raise PublicationError('Completion comment acceptance uncertain; reconcile existing receipt')
+            from external_effects import blocked, ExternalEffectBlocked
+            if blocked():
+                raise ExternalEffectBlocked('github')
             entry['completion_comment'] = 'SENDING'
             save_state(state)
             (await io_call('post_comment', dict(number=number, body='Owner action MERGE: ALLOWED; state MERGED. Workflow completed.\n\n' + marker), lane='effect'))
@@ -1330,13 +1390,18 @@ async def flush_effects_async(state, reconciled=True, control_fresh=None, telegr
             continue
         if not isinstance(item, dict) or exclusion_reason(item):
             continue
+        if bridge_effects.observation_held(state, number):
+            continue
         pending = [e for e in state.get('outbox', {}).values() if str(e['number']) == str(number) and
                    e['kind'] in ('transition', 'comment', 'chief_comment') and e['status'] != 'DONE']
         if pending:
+            from external_effects import blocked
             repeated = any(e.get('attempts', 0) >= 3 or e['status'] in ('UNCERTAIN', 'FAILED') for e in pending)
-            item.setdefault('projection', {})['health'] = 'ERROR' if repeated else 'DRIFT'
-            if repeated:
-                item.setdefault('consistency_diagnostics', {})['projection'] = 'External projection incomplete after repeated delivery failures'
+            # A smoke withhold is not a failed delivery. UNCERTAIN receipts still count.
+            if not (blocked() and all(e.get('status') == 'PENDING' for e in pending)):
+                item.setdefault('projection', {})['health'] = 'ERROR' if repeated else 'DRIFT'
+                if repeated:
+                    item.setdefault('consistency_diagnostics', {})['projection'] = 'External projection incomplete after repeated delivery failures'
         elif item.get('desired_label') and item.get('projection', {}).get('target') == item['desired_label']:
             item['projection']['health'] = 'SYNCED'
             item.setdefault('consistency_diagnostics', {}).pop('projection', None)
@@ -1395,6 +1460,8 @@ def task_execution_request(issue):
 
 
 async def transport_call(name, arguments):
+    from external_effects import guard_worker_rpc
+    guard_worker_rpc(name, arguments)
     return await asyncio.wait_for(_transport_call(name, arguments), timeout=120)
 
 
@@ -1404,7 +1471,14 @@ async def rpc_io(name, arguments):
         item = WORK_CONTEXT[2]
         if item.get('chief_review') or item.get('chief_required') or item.get('owner_state'):
             lane = 'control_rpc'
-    return await io_call('rpc', dict(name=name, arguments=arguments), lane=lane)
+    result = await io_call('rpc', dict(name=name, arguments=arguments), lane=lane)
+    if WORK_CONTEXT and (name in ('get_task_report', 'get_task_observation') or
+                         (isinstance(result, dict) and result.get('observation_confidence') == 'READ_ONLY')):
+        state, number, _ = WORK_CONTEXT
+        if observation_barrier(state, number, result):
+            from external_effects import ExternalEffectBlocked
+            raise ExternalEffectBlocked('observation')
+    return result
 
 
 async def comments_io(number):
@@ -1427,6 +1501,9 @@ def publication_authority(item):
 def authorize_dispatch(number, command, state, issue):
     """Writer-only last check, including commands waiting for I/O capacity."""
     item = state['issues'][str(number)]
+    if observation_barrier(state, number):
+        from external_effects import ExternalEffectBlocked
+        raise ExternalEffectBlocked('observation')
     if issue and str(issue.get('state', '')).upper() == 'CLOSED':
         archive_issue(issue, item, state)
     if command.authorization is not None:
@@ -1483,6 +1560,8 @@ def archived_reconciliation_pending(item):
 async def reconcile_archived(issue, item, state):
     """Reconcile existing authority; closed issues never authorize a new send."""
     number = str(issue['number'])
+    if observation_barrier(state, number):
+        return
     pending = item.get('pending_rpc')
     if pending:
         if pending.get('name') != 'start_task':
@@ -1546,18 +1625,25 @@ async def reconcile_archived(issue, item, state):
 
 async def _transport_call(name, arguments):
     from mcp import Client
+    from external_effects import blocked
+    tool_name = name
+    if blocked():
+        # A distinct tool name fails closed on old MCP servers. Unknown mode
+        # arguments can be silently dropped by an older SDK's input model.
+        tool_name = {'get_task_report': 'get_task_observation',
+                     'list_tasks': 'list_task_observations'}.get(name, name)
     async with Client(MCP_URL) as client:
-        result = await client.call_tool(name, arguments)
+        result = await client.call_tool(tool_name, arguments)
 
     return decode_mcp_result(name, result)
 
 
 # Return contracts from mcp_server.py. A project registry is an object even though
 # it contains multiple projects; only list_tasks has collection-valued output.
-MCP_COLLECTION_TOOLS = frozenset({"list_tasks"})
+MCP_COLLECTION_TOOLS = frozenset({"list_tasks", "list_task_observations"})
 MCP_OBJECT_TOOLS = frozenset({"list_projects", "get_task_report", "start_task",
                               "continue_task", "adopt_task", "orchestrator_health", "get_execution_catalog", "preflight_task",
-                              "get_transition_capabilities", "inspect_start_request"})
+                              "get_transition_capabilities", "inspect_start_request", "get_task_observation"})
 
 
 def decode_mcp_result(name, result):
@@ -1669,7 +1755,12 @@ async def mcp_call(name, arguments):
             Scheduler(state).observe(arguments["task_id"], result.get("status"), result.get('cleanup_state'))
             save_state(state)
         return result
+    from external_effects import blocked, ExternalEffectBlocked
+    if blocked():
+        raise ExternalEffectBlocked('worker')
     state, number, item = WORK_CONTEXT
+    if observation_barrier(state, number):
+        raise ExternalEffectBlocked('observation')
     from operational_state import post_merge_repository_hold
     if post_merge_repository_hold(item) or review_transitions.holds_repository(item):
         # Keep the original quality gates and merge journal intact for retry.
@@ -1888,6 +1979,8 @@ def project_runtime_health(issue, item, state, report, slot='coding'):
     review or publication is authorized by these observations. External labels
     cannot override the durable local report, including on duplicate ticks.
     """
+    if observation_barrier(state, issue['number'], report):
+        return True
     if exclusion_reason(item, issue):
         return False
     health = report.get('liveness')
@@ -1926,6 +2019,9 @@ async def start_queued(issue, state, *, progress=None):
     global WORK_CONTEXT
     WORK_CONTEXT = (state, number, state["issues"].setdefault(number, {"queue_status": "QUEUED"}))
     if archive_issue(issue, state['issues'][number], state):
+        return
+    from external_effects import blocked
+    if blocked():
         return
 
     progress = progress if progress is not None else {}
@@ -2033,6 +2129,9 @@ async def start_queued(issue, state, *, progress=None):
         notify("FAILED", issue, item, blocker=str(exc))
         save_state(state)
     except Exception as exc:
+        from external_effects import ExternalEffectBlocked
+        if isinstance(exc, ExternalEffectBlocked):
+            return
         # An RPC failure may mean the agent started. Keep its reservation and retry the same request ID.
         defer_issue(state["issues"][number], state, number, exc, stage=progress.get('stage'))
     finally:
@@ -2068,13 +2167,14 @@ def stale_chief(item, state, number, diagnostic):
 def chief_tree_current(item, state, number):
     if exclusion_reason(item):
         return False
+    from external_effects import ExternalEffectBlocked
     try:
         chief_review.validate_identity(item['chief_review']['identity'], item)
         if Repository(item['project']).snapshot() != item['reviewed_tree']:
             stale_chief(item, state, number, 'Repository changed after independent PASS; fresh independent review and Chief bundle required.')
             return False
         return True
-    except PublicationError:
+    except (PublicationError, ExternalEffectBlocked):
         return False  # Unavailable evidence cannot authorize a send or verdict.
     except (ValueError, KeyError, TypeError):
         stale_chief(item, state, number, 'Chief identity is stale; fresh independent review and Chief bundle required.')
@@ -2084,6 +2184,7 @@ def chief_tree_current(item, state, number):
 async def chief_tree_current_async(item, state, number):
     if exclusion_reason(item):
         return False
+    from external_effects import ExternalEffectBlocked
     try:
         chief_review.validate_identity(item['chief_review']['identity'], item)
         snapshot = await repository_io(Repository(item['project']), 'snapshot')
@@ -2091,8 +2192,8 @@ async def chief_tree_current_async(item, state, number):
             stale_chief(item, state, number, 'Repository changed after independent PASS; fresh independent review and Chief bundle required.')
             return False
         return True
-    except PublicationError:
-        return False
+    except (PublicationError, ExternalEffectBlocked):
+        return False  # Unavailable evidence cannot authorize a send or verdict.
     except (ValueError, KeyError, TypeError):
         stale_chief(item, state, number, 'Chief identity is stale; fresh independent review and Chief bundle required.')
         return False
@@ -2160,13 +2261,20 @@ async def process_chief_review(issue, item, state, report, *, allow_evidence=Tru
     save_state(state)
 
     from devctl import DATA_DIR
+    from external_effects import ExternalEffectBlocked
     with exclusive(DATA_DIR.parent / 'worker.lock', blocking=not DRIVING.get()):
         repository = Repository(item['project'], report)
-        snapshot = await repository_io(repository, 'snapshot')
-        if snapshot != item['reviewed_tree']:
+        try:
+            snapshot = await repository_io(repository, 'snapshot')
+        except ExternalEffectBlocked:
+            snapshot = None
+        if snapshot is None:
+            if not record:
+                return True
+        elif snapshot != item['reviewed_tree']:
             stale_chief(item, state, str(issue['number']), 'Repository changed after independent PASS; fresh review required.')
             return True
-        if not record:
+        if snapshot is not None and not record:
             coding_data, _ = parse_autopilot_result(report.get('result'))
             if coding_data:
                 verification = {name: coding_data[name] for name in ('implementation', 'verification', 'self_review', 'state')}
@@ -2179,17 +2287,26 @@ async def process_chief_review(issue, item, state, report, *, allow_evidence=Tru
                 try:
                     review = await mcp_call('get_task_report', {'task_id': item['review_task_id']})
                     data, _ = parse_review_result(review.get('result'))
+                except ExternalEffectBlocked:
+                    raise
                 except Exception:
                     data = None  # Durable PASS/tree evidence does not depend on log retention.
                 item['independent_review_summary'] = chief_review.sanitize(data['summary'])[:2000] if (
                     data and data['verdict'] == 'PASS') else 'Independent PASS recorded in durable bridge state; reviewer summary unavailable.'
             if evidence is None:
                 with measure(state, 'chief_evidence'):
-                    evidence = await repository_io(repository, 'review_evidence', snapshot)
+                    try:
+                        evidence = await repository_io(repository, 'review_evidence', snapshot)
+                    except ExternalEffectBlocked:
+                        return True
             bodies = chief_review.evidence_comments(identity, item['project'],
                 repository.cfg.get('github_repo') or snapshot.get('origin') or '(local registered repository)',
                 item, report, evidence)
-            if await repository_io(repository, 'snapshot') != snapshot:
+            try:
+                current_snapshot = await repository_io(repository, 'snapshot')
+            except ExternalEffectBlocked:
+                return True
+            if current_snapshot != snapshot:
                 stale_chief(item, state, str(issue['number']), 'Repository changed during Chief evidence extraction; fresh review required.')
                 return True
             keys = [bridge_effects.enqueue(state, issue['number'], 'chief_comment', body,
@@ -3348,6 +3465,8 @@ def malformed_item(item):
 
 async def process_tracked(issue, item, state, runtime_reports=None, *, initial_report=None, chief_evidence=None,
                           progress=None):
+    if observation_barrier(state, issue['number'], initial_report):
+        return
     restore_merged_state(item, state)
     if merge_complete(item):
         project_merge(issue, item, state)
@@ -3488,6 +3607,10 @@ async def process_tracked(issue, item, state, runtime_reports=None, *, initial_r
         failed = True
         raise
     except Exception as exc:
+        from external_effects import ExternalEffectBlocked
+        if isinstance(exc, ExternalEffectBlocked):
+            failed = True
+            return
         failed = True
         # Cached observations can still expose expired/uncertain leases when
         # the worker report RPC is unavailable. Do not leave a stale running
@@ -3517,6 +3640,10 @@ async def process_tracked(issue, item, state, runtime_reports=None, *, initial_r
 
 
 async def tick(state):
+    from external_effects import blocked
+    if blocked():
+        await observe_latched_poll(state)
+        return
     global WORK_CONTEXT
     reconciled = False
     try:
@@ -3533,6 +3660,8 @@ async def tick(state):
                     break
                 if not str(number).isdigit() or not isinstance(item, dict) or exclusion_reason(item) or malformed_item(item):
                     continue
+                if bridge_effects.observation_held(state, number):
+                    continue
                 try:
                     issue = (await io_call('issue', dict(number=number)))
                     if issue and not archive_issue(issue, item, state):
@@ -3546,6 +3675,10 @@ async def tick(state):
 
 
 async def reconcile_tick(state):
+    from external_effects import blocked
+    if blocked():
+        await observe_latched_poll(state)
+        return
     global WORK_CONTEXT
     WORK_CONTEXT = None
     issues = open_issues()
@@ -3569,6 +3702,8 @@ async def reconcile_tick(state):
     for number, item in sorted(list(state["issues"].items()),
                                key=lambda pair: (not str(pair[0]).isdigit(), int(pair[0]) if str(pair[0]).isdigit() else str(pair[0]))):
         WORK_CONTEXT = None
+        if bridge_effects.observation_held(state, number):
+            continue
         if not isinstance(item, dict):
             item = state["issues"][number] = {"legacy_value": item}
         if item.get("compatibility_status") == "QUARANTINED":
@@ -3636,11 +3771,17 @@ def reject_unready_commands(issue, item, state, comments=None):
 async def control_pass(state, *, telegram_dispatch=None, telegram_inflight=()):
     """Only the caller mutates lifecycle state. No global recovery prerequisite."""
     global WORK_CONTEXT
+    from external_effects import blocked
+    if blocked():
+        await observe_latched_poll(state)
+        return
     fresh = set()
     with measure(state, 'control_total'):
         for number, item in list(state['issues'].items()):
             WORK_CONTEXT = None
             if not str(number).isdigit() or not isinstance(item, dict):
+                continue
+            if bridge_effects.observation_held(state, number):
                 continue
             restore_merged_state(item, state)
             if merge_complete(item):

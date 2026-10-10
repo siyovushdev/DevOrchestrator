@@ -1,0 +1,19 @@
+test_active_and_identity_or_turn_mismatch_are_never_signalled (test_operational_stability.OwnedCleanupTests.test_active_and_identity_or_turn_mismatch_are_never_signalled) ... ok
+test_escalation_rechecks_ownership_and_is_bounded (test_operational_stability.OwnedCleanupTests.test_escalation_rechecks_ownership_and_is_bounded) ... ok
+test_external_terminal_ambiguous_group_is_imported_as_occupied (test_operational_stability.OwnedCleanupTests.test_external_terminal_ambiguous_group_is_imported_as_occupied) ... ok
+test_operator_status_with_runtime_is_strictly_read_only (test_operational_stability.OwnedCleanupTests.test_operator_status_with_runtime_is_strictly_read_only) ... ok
+test_scheduler_releases_only_proven_terminal_locks (test_operational_stability.OwnedCleanupTests.test_scheduler_releases_only_proven_terminal_locks) ... ok
+test_terminal_ambiguous_group_retains_scheduler_capacity (test_operational_stability.OwnedCleanupTests.test_terminal_ambiguous_group_retains_scheduler_capacity) ... ok
+test_terminal_failure_metadata_and_ambiguous_orphan_lease (test_operational_stability.OwnedCleanupTests.test_terminal_failure_metadata_and_ambiguous_orphan_lease) ... ok
+test_terminal_owned_child_in_separate_group_is_cleaned (test_operational_stability.OwnedCleanupTests.test_terminal_owned_child_in_separate_group_is_cleaned) ... ok
+test_terminal_owned_children_metadata_and_lease_converge_idempotently (test_operational_stability.OwnedCleanupTests.test_terminal_owned_children_metadata_and_lease_converge_idempotently) ... ok
+test_unrecorded_survivors_fail_closed (test_operational_stability.OwnedCleanupTests.test_unrecorded_survivors_fail_closed) ... ok
+test_git_baseline_fingerprint_detects_dirty_content_change (test_worker_integration.WorkerIntegrationTests.test_git_baseline_fingerprint_detects_dirty_content_change) ... ok
+test_absent_wrapper_with_unrecorded_child_is_ambiguous (__main__.AnchorProof.test_absent_wrapper_with_unrecorded_child_is_ambiguous) ... ok
+test_live_wrapper_identity_mismatch_rejects_even_recorded_child_anchor (__main__.AnchorProof.test_live_wrapper_identity_mismatch_rejects_even_recorded_child_anchor) ... ok
+test_live_wrapper_remains_anchor_when_members_receipt_empty (__main__.AnchorProof.test_live_wrapper_remains_anchor_when_members_receipt_empty) ... ok
+
+----------------------------------------------------------------------
+Ran 14 tests in 2.418s
+
+OK
