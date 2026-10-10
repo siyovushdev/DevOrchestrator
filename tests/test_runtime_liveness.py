@@ -275,7 +275,9 @@ class RuntimeLivenessTests(unittest.TestCase):
                 self.assertEqual(report['liveness']['state'], 'TERMINAL')
         self.assertEqual(read_json(self.directory / 'liveness.json')['terminal_reason'], 'process_exited_without_final_report')
 
-    def test_zero_exit_is_failed_on_every_status_path_before_report_is_read(self):
+    @patch.object(devctl, 'load_projects', return_value={
+        'test': {'machine': 'work', 'workspace': '/registered'}})
+    def test_zero_exit_is_failed_on_every_status_path_before_report_is_read(self, _registry):
         for action in ('state', 'status', 'list'):
             with self.subTest(action=action):
                 process = self.launch('true'); process.wait(timeout=3)
@@ -568,7 +570,9 @@ class RemoteRuntimeLivenessTests(unittest.TestCase):
             self.assertEqual(report['error'], 'process_exited_without_final_report')
             self.assertEqual(devctl.task_state(restored, self.directory)[0], 'FAILED')
 
-    def test_remote_final_report_diagnosis_waits_for_complete_log_download(self):
+    @patch.object(devctl, 'load_projects', return_value={
+        'test': {'machine': 'firefly', 'workspace': '/registered'}})
+    def test_remote_final_report_diagnosis_waits_for_complete_log_download(self, _registry):
         record = runtime.initialize(self.directory, self.meta)
         record = runtime.heartbeat(self.directory, record['generation'], worker_pid=os.getpid(),
                                    agent_pid=os.getpid(), phase='EXITED', exit_code=0)

@@ -46,6 +46,28 @@ blindly retried. Later exact receipts reconcile it. Missing, edited, duplicate,
 or uncertain evidence blocks verdict acceptance. Persisted bundles are reused
 across restart without publishing duplicate comments.
 
+Chief delivery takes `worker.lock` nonblocking. If acquisition fails before a
+POST command is yielded, a writer-local `CommentNotDispatched` proof returns the
+effect to durable `PENDING` with exponential retry delay (2s initially, capped
+at 256s by the existing backoff formula). The next eligible attempt checks the
+current issue, Chief/tree identity and exact receipts again before sending.
+ControlLoop keeps polling while the lock is busy. Waiting before `next_attempt`,
+heartbeat samples and timing updates do not rewrite authoritative state.
+
+Only the lock-acquisition handler produces this proof. A `BlockingIOError` from
+GitHub POST, tree checks or lock release is not a no-send result: uncertain
+delivery stays `UNCERTAIN` and reconciles receipts without blind resend.
+`SENDING` is still checkpointed before POST. A crash or failed checkpoint before
+the no-send result is durably recorded therefore retains conservative `SENDING`
+recovery. Existing `SENDING`/`UNCERTAIN` records are not reclassified merely
+because a lock is now free or no receipt is visible. Old uncertain entries have
+no durable no-send proof; they retain the original inspection/reconciliation hold.
+
+Regression coverage is in `tests/test_chief_delivery_retry.py`: real flock,
+restart/backoff recovery, ambiguous and accepted POST errors, crash/checkpoint
+failure, exact/duplicate receipts, ControlLoop polling, immutable payloads and
+unchanged authoritative content/inode/mtime during deferred heartbeats.
+
 ## Verdicts and correction
 
 An authorized GitHub account in the existing `DEVORCHESTRATOR_OWNERS` allowlist

@@ -4,6 +4,24 @@ import json
 import time
 
 
+class CommentNotDispatched(Exception):
+    """Trusted writer-local proof that the comment POST boundary was not crossed.
+
+    Raise only around pre-dispatch work, never around the external call. An
+    arbitrary transport exception (including BlockingIOError) is not this proof.
+    """
+
+
+def comment_matches(entry, key, observations):
+    expected = entry['payload'] + '\n\n' + f'<!-- DEVORCHESTRATOR_EFFECT_V1 {key} -->'
+    if entry['kind'] == 'chief_comment':
+        return [c for c in observations if c.get('body') == expected]
+    from chief_review import is_evidence_comment
+    return [c for c in observations if not is_evidence_comment(c.get('body')) and (
+        c.get('body') == expected or ('Task started:' in entry['payload'] and
+        (c.get('body') or '').split('\n\n<!-- DEVORCHESTRATOR_EFFECT_V1 ')[0] == entry['payload']))]
+
+
 def enqueue(state, number, kind, payload, event=None):
     digest = hashlib.sha256(json.dumps([str(number), kind, event or payload], sort_keys=True).encode()).hexdigest()
     if kind == 'transition':
@@ -11,11 +29,12 @@ def enqueue(state, number, kind, payload, event=None):
             if existing_key != digest and str(existing['number']) == str(number) and existing['kind'] == 'transition' and existing['status'] != 'DONE':
                 existing['status'] = 'DONE'  # A newer desired state supersedes undelivered older labels.
     state.setdefault('outbox', {}).setdefault(digest, dict(number=number, kind=kind, payload=payload,
-                                                         status='PENDING', attempts=0, next_attempt=0))
+                                                         status='PENDING', attempts=0, next_attempt=0,
+                                                         delivery_version=2))
     return digest
 
 
-def flush(state, persist, comments, post_comment, transition, telegram, now=None, eligible=None, complete=None, telegram_dispatch=None, telegram_inflight=()):
+def _flush_steps(state, persist, comments, post_comment, transition, telegram, now=None, eligible=None, complete=None, telegram_dispatch=None, telegram_inflight=(), selection=None, render_telegram=None):
     now = time.time() if now is None else now
     started = time.monotonic()
     deliveries = 0
@@ -24,8 +43,12 @@ def flush(state, persist, comments, post_comment, transition, telegram, now=None
     entries.sort(key=lambda pair: 0 if pair[1]['kind'] == 'transition' else
                  1 if pair[1]['kind'] == 'comment' and 'Task started:' in pair[1]['payload'] else 2)
     for key, entry in entries:
-        chief_reconcile = entry['kind'] == 'chief_comment' and entry['status'] in ('SENDING', 'UNCERTAIN')
-        if not chief_reconcile and (entry['status'] in ('DONE', 'UNCERTAIN', 'FAILED') or entry.get('next_attempt', 0) > now):
+        if selection is not None and key not in selection:
+            continue
+        comment = entry['kind'] in ('comment', 'chief_comment')
+        reconcile_comment = comment and (entry['status'] in ('SENDING', 'UNCERTAIN') or
+            (entry['kind'] == 'comment' and entry['status'] == 'PENDING' and entry.get('delivery_version') != 2))
+        if not reconcile_comment and (entry['status'] in ('DONE', 'UNCERTAIN', 'FAILED') or entry.get('next_attempt', 0) > now):
             continue
         if entry['kind'] == 'telegram' and entry['status'] == 'SENDING' and key in telegram_inflight:
             continue
@@ -36,22 +59,22 @@ def flush(state, persist, comments, post_comment, transition, telegram, now=None
             continue
         if deliveries >= 5 or time.monotonic() - started >= 5:
             break
-        if eligible is not None and not eligible(entry):
+        if eligible is not None and not (yield ('eligible', (entry,))):
             continue
         deliveries += 1
-        if chief_reconcile:
+        if reconcile_comment:
             expected = entry['payload'] + '\n\n' + f'<!-- DEVORCHESTRATOR_EFFECT_V1 {key} -->'
             try:
-                matches = [c for c in comments(entry['number']) if c.get('body') == expected]
+                matches = comment_matches(entry, key, (yield ('comments', (entry['number'],))))
                 entry['status'] = 'DONE' if len(matches) == 1 else 'UNCERTAIN'
             except Exception:
                 entry['status'] = 'UNCERTAIN'
             persist()
             continue
-        if entry['kind'] == 'chief_comment':
+        if comment:
             expected = entry['payload'] + '\n\n' + f'<!-- DEVORCHESTRATOR_EFFECT_V1 {key} -->'
             try:
-                matches = [c for c in comments(entry['number']) if c.get('body') == expected]
+                matches = comment_matches(entry, key, (yield ('comments', (entry['number'],))))
             except Exception:
                 # No POST was attempted: a failed preflight read is safe to retry.
                 entry['attempts'] += 1
@@ -62,30 +85,26 @@ def flush(state, persist, comments, post_comment, transition, telegram, now=None
                 entry['status'] = 'DONE' if len(matches) == 1 else 'UNCERTAIN'
                 persist()
                 continue
-        if entry['kind'] in ('telegram', 'chief_comment'):
+        if entry['kind'] == 'telegram':
+            # Rendering is writer-local and occurs only after backoff/freshness
+            # checks. Persist the stable event payload, never this send buffer.
+            text = render_telegram(entry) if render_telegram is not None else entry['payload']
+        if entry['kind'] in ('telegram', 'chief_comment', 'comment'):
             entry['status'] = 'SENDING'
             persist()  # Must be durable before the POST; persistence errors must stop delivery.
         result = None
         try:
-            if entry['kind'] == 'chief_comment':
-                post_comment(entry['number'], expected)
-            elif entry['kind'] == 'comment':
-                marker = f'<!-- DEVORCHESTRATOR_EFFECT_V1 {key} -->'
-                from chief_review import is_evidence_comment
-                if not any((marker in (c.get('body') or '') or
-                            ('Task started:' in entry['payload'] and
-                             (c.get('body') or '').split('\n\n<!-- DEVORCHESTRATOR_EFFECT_V1 ')[0] == entry['payload']))
-                           and not is_evidence_comment(c.get('body')) for c in comments(entry['number'])):
-                    post_comment(entry['number'], entry['payload'] + '\n\n' + marker)
+            if comment:
+                (yield ('post_comment', (entry['number'], expected)))
             elif entry['kind'] == 'transition':
-                transition(entry['payload']['issue'], entry['payload']['target'])
+                (yield ('transition', (entry['payload']['issue'], entry['payload']['target'])))
             elif entry['kind'] == 'completion':
-                complete(entry['number'])
+                (yield ('complete', (entry['number'], key)))
             elif entry['kind'] == 'telegram':
                 if telegram_dispatch is not None:
-                    telegram_dispatch(key, entry['payload'])
+                    (yield ('telegram_dispatch', (key, text)))
                     continue  # SENDING is durable; the single writer applies acceptance later.
-                result = telegram(entry['payload'])
+                result = (yield ('telegram', (text,)))
                 if result is None:
                     entry.update(status='UNCERTAIN', diagnostic='Telegram acceptance uncertain; automatic resend suppressed')
                     persist()
@@ -95,12 +114,21 @@ def flush(state, persist, comments, post_comment, transition, telegram, now=None
             else:
                 raise ValueError('Unknown external effect')
             entry['status'] = 'DONE'
+        except CommentNotDispatched:
+            if not comment:
+                raise
+            # A durable no-send result permits retry. If this checkpoint fails
+            # or a crash precedes it, SENDING still reconciles conservatively.
+            entry['attempts'] += 1
+            entry.update(status='PENDING',
+                next_attempt=now + min(300, 2 ** min(entry['attempts'], 8)),
+                diagnostic='Comment not dispatched; delivery deferred')
         except Exception:
             # Never persist exception messages (URLs/tokens/credentials may appear in them).
             entry['attempts'] += 1
             entry['next_attempt'] = now + min(300, 2 ** min(entry['attempts'], 8))
-            if entry['kind'] == 'chief_comment':
-                entry.update(status='UNCERTAIN', diagnostic='Chief evidence acceptance uncertain; exact receipt reconciliation required')
+            if comment:
+                entry.update(status='UNCERTAIN', diagnostic='Comment acceptance uncertain; exact receipt reconciliation required')
             if entry['kind'] == 'telegram':
                 # A thrown callback may have sent; a known False is safe to retry.
                 if result is not False:
@@ -108,3 +136,44 @@ def flush(state, persist, comments, post_comment, transition, telegram, now=None
                 else:
                     entry['status'] = 'FAILED' if entry['attempts'] >= 5 else 'PENDING'
         persist()
+
+
+
+def flush(state, persist, comments, post_comment, transition, telegram, now=None, eligible=None, complete=None,
+          telegram_dispatch=None, telegram_inflight=(), render_telegram=None):
+    callbacks = dict(comments=comments, post_comment=post_comment, transition=transition, telegram=telegram,
+                     eligible=eligible, complete=lambda number, key: complete(number), telegram_dispatch=telegram_dispatch)
+    steps = _flush_steps(state, persist, comments, post_comment, transition, telegram, now, eligible, complete,
+                         telegram_dispatch, telegram_inflight, render_telegram=render_telegram)
+    value, error = None, None
+    while True:
+        try:
+            name, args = steps.throw(error) if error is not None else steps.send(value)
+        except StopIteration as result:
+            return result.value
+        try:
+            value, error = callbacks[name](*args), None
+        except Exception as exc:
+            value, error = None, exc
+
+
+async def flush_async(state, persist, comments, post_comment, transition, telegram, now=None, eligible=None,
+                      complete=None, telegram_dispatch=None, telegram_inflight=(), selection=None, render_telegram=None):
+    """Callbacks execute on the lifecycle writer and may yield copied I/O commands."""
+    callbacks = dict(comments=comments, post_comment=post_comment, transition=transition, telegram=telegram,
+                     eligible=eligible, complete=complete)
+    async def dispatch(key, text):
+        return telegram_dispatch(key, text)
+    callbacks['telegram_dispatch'] = dispatch
+    steps = _flush_steps(state, persist, comments, post_comment, transition, telegram, now, eligible, complete,
+                         telegram_dispatch, telegram_inflight, selection, render_telegram)
+    value, error = None, None
+    while True:
+        try:
+            name, args = steps.throw(error) if error is not None else steps.send(value)
+        except StopIteration as result:
+            return result.value
+        try:
+            value, error = await callbacks[name](*args), None
+        except Exception as exc:
+            value, error = None, exc

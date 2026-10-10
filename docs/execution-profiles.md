@@ -203,13 +203,21 @@ original signatures, with saved execution provenance checked where available.
 
 Before reserving a repository or persisting launch intent, the bridge calls
 read-only MCP `preflight_task` to validate role, profiles, and installed runtime.
-Runtime probes share a three-second deadline within the control loop's issue
-budget. A confirmed prelaunch rejection carries its actionable error in a
+Runtime preflight probes share a three-second discovery deadline. Timeouts,
+OS errors, failed version/help/model commands, and empty/unparseable model
+inventories return `UNAVAILABLE` with `launch_started: false`; these cannot
+establish policy incompatibility. The bridge keeps queue ownership and retries
+the same request ID. A successful inventory excluding the selected model, missing
+required CLI flags, or invalid policy remains `REJECTED`.
+A confirmed prelaunch rejection carries its bounded, redacted error in a
 structured result, terminates the coding queue or review loop, and releases the
 repository when existing safety holds permit. Locked worker preparation repeats
 validation to catch changes after preflight. Existing receipts replay without
 reapplying catalog policy; network errors, corrupt receipts, and uncertain
 worker ownership retain their reservations for reconciliation.
+Locked preparation also preserves the transient exception classification;
+an RPC failure there retains pending intent for safe replay. No failed probe
+authorizes a launch or bypasses independent review, Chief or owner gates.
 
 Publication, owner, Chief, post-merge convergence, runtime cleanup, and control
 loop gates are unchanged. Editing a catalog does not authorize publication or

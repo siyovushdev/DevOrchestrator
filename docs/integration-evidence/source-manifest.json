@@ -1,0 +1,63 @@
+{
+  "/home/siovush/DevOrchestrator-review-fix": {
+    "head": "6de216192084b9902c73f5a81e1965d1d9b5c7a1",
+    "status": " M bridge_effects.py\n M chief_review.py\n M devctl.py\n M docs/execution-profiles.md\n M docs/operational-control-loop.md\n M execution_profiles.py\n M mcp_server.py\n M operational_state.py\n M publication.py\n M scheduler.py\n M task_bridge.py\n M tests/test_bridge_integration.py\n M tests/test_cleanup_attestation.py\n M tests/test_control_loop.py\n M tests/test_execution_profiles.py\n M tests/test_mcp_adapter.py\n M tests/test_recovery.py\n M tests/test_runtime_liveness.py\n M worker_runtime.py\n?? PLAN.md\n?? PROGRESS.md\n?? control_loop.py\n?? docs/resumable-transitions.md\n?? review_coordinator.py\n?? review_driver.py\n?? review_migration.py\n?? review_transitions.py\n?? tests/test_mcp_concurrency.py\n?? tests/test_publication_closure.py\n?? tests/test_request_protocol.py\n?? tests/test_resumable_control.py\n?? tests/test_review_binding.py\n?? tests/test_review_coordinator.py\n?? tests/test_review_driver.py\n?? tests/test_review_launch_retry.py\n?? tests/test_review_migration.py\n?? tests/test_review_transitions.py\n?? tests/test_transition_io.py\n?? transition_executor.py\n?? transition_io.py\n",
+    "files": {
+      "bridge_effects.py": "6f80c1b3b8e0c4e1734a5581c7a78d4c749b97834699e6f5b1c5c301f795d177",
+      "chief_review.py": "25b39b1d908de2542bb545c4e5e2f0d5944a27698f6137ebd887fa37ffa28cb9",
+      "devctl.py": "89ce3f7d3b9ef05c5144b15a154314b59ca28962c86f9d780591dd20cd02237f",
+      "docs/execution-profiles.md": "c4c3deabf2ef930be9acc49d9660974c7a94353698591826df2ce6f593b73fc9",
+      "docs/operational-control-loop.md": "7184f8fda612091c0927cf4e1accf6c456741be9a0ea20ec7e22ce003b29df62",
+      "execution_profiles.py": "c87caaf61e975c81bc639e2d728d3758664d163e750842b4a2c7c7893b6e6e88",
+      "mcp_server.py": "13c02c5391b7981e22fc9f938aaaf35670a075f802df117002ee04b9c0328bd3",
+      "operational_state.py": "400b9662ac8b358be01385c8919e8ee2dd26fe1d50519b236ac29e309307df97",
+      "publication.py": "826e5e7e2997eb9325a3c9d3bb37cb00861b40da4f67bc4672d8bcdc0bf409d3",
+      "scheduler.py": "e8ed3675fe35e59dac44b8e8f5dc3e6274a2bff7fecb97c0835bd1d620788bd5",
+      "task_bridge.py": "e8243fd971ddf287c19b7f1ae622ea10542ccecccff3f3a547344c2d43a64424",
+      "tests/test_bridge_integration.py": "da91afcbab6e363060021594b203859bce378a36ad36c95ccc2a0008ebb906cc",
+      "tests/test_cleanup_attestation.py": "c88ca77ad01a58a41b82a4e6151adb024843834897c46a146e256d1d105122ac",
+      "tests/test_control_loop.py": "4a99bfce2b8fa3bb59c0c71a4eeab7528a9bcd3a3d4ecba28b1f87e4731969f1",
+      "tests/test_execution_profiles.py": "6294fe8c34569852eab0fc20dc4b6c43f4624fd3f71496a3a681688c197cbc88",
+      "tests/test_mcp_adapter.py": "ba8653be4eb1dc982789c5aaaa877e1767aceaaf32e5d3841eb3b5cb227f978a",
+      "tests/test_recovery.py": "b78d9a364f6315403670c2e6ec0bcda88e1ee687238d32707c81805b6f4f5d62",
+      "tests/test_runtime_liveness.py": "fc7cb600c3507c535f1616da9d5531a5446211a5cd138f9018f846404f1e66de",
+      "worker_runtime.py": "8a394eb3365e1f2e406c6393dcb9e12a897b0409d6176b5412eed09365f1cea1",
+      "PLAN.md": "97cf85675eb4890d1ae3cee3d74e17bcb50f3e553e22c44567d70c1edaaa18df",
+      "PROGRESS.md": "22f503c2db8df59a96d7010f7346c21033af36e339bffccdcb7f38904548d68a",
+      "control_loop.py": "98ef0ade8d7977bfe412a321494a7cf690d0be61eb0e7889a905b038013f64ad",
+      "docs/resumable-transitions.md": "b4f627c2e3808e051f411ce0ac4e7f0c56f445e51b633dc807e1f4b54823fa8e",
+      "review_coordinator.py": "22aec159854d6e8528fd50729ca3b07e214ad53d17a3e55f132d030bd542ea52",
+      "review_driver.py": "99ab032e80a0b342375588dfcb0cf7ebe0c1cc232dc4940f9c6df05727365b1e",
+      "review_migration.py": "3dd1f7e622af3c5ca2ccd5965c345fe9622c1d3e68bf91f4555b6041f96a21d6",
+      "review_transitions.py": "ce15d0cb9416106bfd7121cf6f80942099efcc1ae2de7377c724e244788d9120",
+      "tests/test_mcp_concurrency.py": "e7a45639fde911f700539cbe562b7e4632d67d17f815a35bfead81854c3ead97",
+      "tests/test_publication_closure.py": "7652a4ccfd3e6bbf36f55f12b4115136da950f4387a6def3cb91523c3487be5d",
+      "tests/test_request_protocol.py": "1894cc6909d754f346445df55a16b62288a41dae73203ce710299f90ae09ddda",
+      "tests/test_resumable_control.py": "28722835a0bd8db82f01efcdd423c597ac39378a1caa7b2efcb147a4c1677fea",
+      "tests/test_review_binding.py": "bd0f674efdcc86c6528802763aacbd0821467736d2a65155f0900d09fa0e79ea",
+      "tests/test_review_coordinator.py": "f7f16c3bc5501ba1958d4611c685242c89f7415b28fb74c959854128fb0323b7",
+      "tests/test_review_driver.py": "2eae4869ecbc7a46f0ceb37d041fc76abf52da6b661aa353837c8de675fd2651",
+      "tests/test_review_launch_retry.py": "a84a28600fa4294b293d9699e67ca70f9743f1d464654601490242cfc446da78",
+      "tests/test_review_migration.py": "a708e5a576d57e33444ed61bbc6dcd5fcc52bba62c97c9a77b49f64e25431732",
+      "tests/test_review_transitions.py": "21b180b9151445db12bd11828762b864a851311c14eefc54178430945b723e01",
+      "tests/test_transition_io.py": "a250c76faf8df970871e776232fbdebdcac3deec996d1d972d859e40dd112a94",
+      "transition_executor.py": "e9a2091e3810dfabf3d9802e421546558fedd5493a485a5898c2c7011eaeabb9",
+      "transition_io.py": "85f8010cc06b65805a45108e3ec25803044c2b7aa575ab13222ebf50bba772e4"
+    }
+  },
+  "/home/siovush/DevOrchestrator-dev": {
+    "head": "6de216192084b9902c73f5a81e1965d1d9b5c7a1",
+    "status": " M bridge_effects.py\n M devctl.py\n M notifications.py\n M operational_state.py\n M task_bridge.py\n?? bridge_telemetry.py\n?? docs/semantic-durability.md\n?? tests/measure_semantic_durability.py\n?? tests/test_semantic_durability.py\n",
+    "files": {
+      "bridge_effects.py": "9623a2923c717a0836dc798f810d40fd6c8641d1c51388208f6a27883cf4058f",
+      "devctl.py": "116a7e56d9f89837e558cac289f739a3d792cc91ebc27166150760e14e9cdede",
+      "notifications.py": "14629454decf090942540f12efa3df58322b3e08fca232545b850a610f07deda",
+      "operational_state.py": "52acfa29af1aef13083843a6e83736d24ee165de2c50b0e060cbdf26d3a2370c",
+      "task_bridge.py": "638ab190077480b6bcd1f0cd60c8b382a37f8f90a5c053bd913ee8b38d569b34",
+      "bridge_telemetry.py": "5ea752e88268cb76ce6b5cea5707e78ea56a661da55a19276e306b6d4cea700b",
+      "docs/semantic-durability.md": "8a5e2cd19ae71feaf021bde92f813d490ec61b27c3bcdc4472a891b5dd0cfe3c",
+      "tests/measure_semantic_durability.py": "944c98d1d96459715f24f41ec77fb7c1d248f71e150c915ee6242a9f15bdf082",
+      "tests/test_semantic_durability.py": "8d6746532e71c14c03a984969da7bc417c5f5d9ac7770cbb6041ce5860189271"
+    }
+  }
+}

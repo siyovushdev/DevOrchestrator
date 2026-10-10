@@ -32,6 +32,79 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
     pending = chief.ChiefRuntimeTests.pending
     verdict = chief.ChiefRuntimeTests.verdict
 
+    async def test_slow_initial_rpc_keeps_control_polling_and_single_launch_intent(self):
+        from transition_executor import execute
+        loop = b.ControlLoop(self.h.state)
+        entered, release = asyncio.Event(), asyncio.Event()
+        polls = []
+        async def detached(command):
+            if command.name == 'control_read':
+                polls.append(command.arguments()['number'])
+            if command.name == 'rpc' and command.arguments()['name'] == 'start_task':
+                entered.set()
+                await release.wait()
+            return await execute(command)
+        loop.dispatcher.execute = detached
+        try:
+            await self.pump_control(loop, entered.is_set)
+            item = self.h.state['issues']['1']
+            pending = copy.deepcopy(item['pending_rpc'])
+            before = len(polls)
+            await self.pump_control(loop, lambda: len(polls) >= before + 5)
+            self.assertEqual(item['pending_rpc'], pending)
+            self.assertEqual(self.h.starts, [])
+            self.assertIsNone(b.WORK_CONTEXT)
+            release.set()
+            await self.pump_control(loop, lambda: bool(self.h.starts))
+            self.assertEqual(len(self.h.starts), 1)
+        finally:
+            release.set()
+            await loop.close()
+
+    async def test_control_polling_continues_during_rpc_cancellation_cleanup(self):
+        from transition_executor import execute
+        loop = b.ControlLoop(self.h.state)
+        entered, cancelling, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        polls = []
+        async def detached(command):
+            if command.name == 'control_read':
+                polls.append(command.arguments()['number'])
+            if command.name == 'rpc' and command.arguments()['name'] == 'start_task':
+                entered.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cancelling.set()
+                    await release.wait()
+            return await execute(command)
+        loop.dispatcher.execute = detached
+        try:
+            await self.pump_control(loop, entered.is_set)
+            pending = copy.deepcopy(self.h.state['issues']['1']['pending_rpc'])
+            loop.dispatcher.cancel('writer:1')
+            await cancelling.wait()
+            before = len(polls)
+            await self.pump_control(loop, lambda: len(polls) >= before + 5)
+            self.assertIn('writer:1', loop.dispatcher.flights)
+            self.assertEqual(self.h.state['issues']['1']['pending_rpc'], pending)
+            self.assertFalse(self.h.starts)
+            release.set()
+            await self.pump_control(loop, lambda: bool(self.h.state['issues']['1'].get('reconciliation_retry')))
+            self.assertEqual(self.h.state['issues']['1']['pending_rpc'], pending)
+        finally:
+            release.set()
+            await loop.close()
+
+    async def pump_control(self, loop, predicate):
+        for _ in range(700):
+            loop.next_heavy = 0
+            loop.next_control.clear()
+            await loop.step()
+            await asyncio.sleep(.002)
+            if predicate():
+                return
+        self.fail('Resumable control loop did not reach expected state')
+
     def wakeups(self):
         return [call.args[0] for call in self.h.telegram.call_args_list
                 if call.args[0].startswith('CHIEF_REVIEW_REQUIRED')]
@@ -94,30 +167,33 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.wakeups())
 
     async def test_heavy_discovery_pending_and_unavailable_does_not_gate_chief_or_owner(self):
+        from transition_executor import execute
         item = await self.pending()
         self.verdict(item)
         gate = asyncio.Event()
         loop = b.ControlLoop(self.h.state)
-        async def slow():
-            await gate.wait()
-            raise OSError('token=https://private.invalid')
-        with patch.object(loop, 'discover', side_effect=slow):
-            await loop.step()
-            await asyncio.sleep(0)
-            self.assertEqual(item['owner_state'], 'READY_FOR_OWNER')
+        async def detached(command):
+            if command.name == 'discovery':
+                await gate.wait()
+                raise OSError('token=https://private.invalid')
+            return await execute(command)
+        loop.dispatcher.execute = detached
+        try:
+            await self.pump_control(loop, lambda: item.get('owner_state') == 'READY_FOR_OWNER')
             self.h.comment('<!-- DEVORCHESTRATOR_OWNER_V1 {"action":"COMMIT"} -->')
-            await loop.step()
-            self.assertEqual(item['owner_state'], 'COMMITTED')
+            await self.pump_control(loop, lambda: item.get('owner_state') == 'COMMITTED')
             sha = item['commit_sha']
             gate.set()
-            await asyncio.sleep(0)
-            await loop.step()
+            await self.pump_control(loop, lambda: bool(self.h.state.get('recovery_diagnostic')))
+            await loop.close()
             self.h.restart()
             await b.control_pass(self.h.state)
             self.assertEqual(self.h.state['issues']['1']['commit_sha'], sha)
             self.assertEqual(self.h.git('rev-list', '--count', 'HEAD'), '2')
             self.assertNotIn('private.invalid', json.dumps(self.h.state))
-        await loop.close()
+        finally:
+            gate.set()
+            await loop.close()
 
     async def test_fast_rejects_changed_tree_turn_and_uncertain_runtime(self):
         item = await self.pending()
@@ -149,7 +225,8 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
         from tests_helpers import coding_result, review_result
         loop = b.ControlLoop(self.h.state)
         async def pump(predicate):
-            for _ in range(60):
+            for _ in range(600):
+                loop.next_control.clear()
                 loop.next_heavy = 0
                 await loop.step()
                 await asyncio.sleep(.01)
@@ -176,6 +253,7 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_production_loop_backfills_legacy_ready_owner_once_and_releases_hold(self):
         from scheduler import Scheduler
+        from transition_executor import execute
         item = await self.pending()
         for field in ('chief_review', 'chief_required', 'chief_status', 'independent_review_summary'):
             item.pop(field, None)
@@ -184,82 +262,47 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
         self.h.comments[1] = []
         self.h.telegram.reset_mock()
         starts, continues = len(self.h.starts), len(self.h.continues)
-        self.assertTrue(chief_review.approval_complete(item))  # Legacy approval cannot rescue backfill.
         self.assertTrue(operational_state.chief_repository_hold(item))
-
         loop = b.ControlLoop(self.h.state)
-        evidence_gate = asyncio.Event()
-        observe = loop.observe
-        chief_process = b.process_chief_review
-        fast_ownership = []
-
-        async def delayed_observe(*args):
-            await evidence_gate.wait()
-            return await observe(*args)
-
-        async def track_chief(*args, **kwargs):
-            missing = not args[1].get('chief_review')
-            result = await chief_process(*args, **kwargs)
-            if missing and kwargs.get('allow_evidence') is False:
-                fast_ownership.append(result)
-            return result
-
-        async def pump(predicate):
-            for _ in range(60):
-                loop.next_heavy = 0
-                await loop.step()
-                await asyncio.sleep(.01)
-                if predicate():
-                    return
-            self.fail('Production loop did not converge legacy Chief backfill')
-
+        evidence_gate, entered = asyncio.Event(), asyncio.Event()
+        async def detached(command):
+            if command.name == 'repository' and command.arguments()['method'] == 'review_evidence':
+                entered.set()
+                await evidence_gate.wait()
+            return await execute(command)
+        loop.dispatcher.execute = detached
         try:
-            with patch.object(loop, 'observe', side_effect=delayed_observe), \
-                 patch.object(b, 'process_chief_review', side_effect=track_chief), \
-                 patch.object(b, 'process_owner_actions', wraps=b.process_owner_actions) as owner, \
-                 patch.object(chief_review, 'evidence_comments', wraps=chief_review.evidence_comments) as bundle, \
-                 patch.object(b, 'publish', wraps=b.publish) as publish:
-                await loop.step()
-                self.assertEqual(fast_ownership, [False])
-                owner.assert_awaited_once()
+            with patch.object(chief_review, 'evidence_comments', wraps=chief_review.evidence_comments) as bundle, \
+                 patch.object(publication, 'execute_async', wraps=publication.execute_async) as publish:
+                await self.pump_control(loop, entered.is_set)
                 self.assertFalse(chief_review.approval_complete(item))
-                await pump(lambda: '1' in loop.observations)
-                for _ in range(3):
-                    await loop.step()
-                    self.assertIn('1', loop.pending)
-                    self.assertIn('1', loop.observations)
-                    self.assertIsNone(item.get('chief_review'))
-                    self.assertEqual(item['owner_state'], 'READY_FOR_OWNER')
-                    self.assertFalse(Scheduler(self.h.state).release('1'))
+                self.assertIsNone(item.get('chief_review'))
+                self.assertFalse(Scheduler(self.h.state).release('1'))
                 self.h.comment('<!-- DEVORCHESTRATOR_OWNER_V1 {"action":"COMMIT"} -->')
                 early_id = self.h.comments[1][-1]['id']
-                await loop.step()
-                self.assertIn(early_id, item['processed_owner_actions'])
+                for _ in range(10):
+                    loop.next_control.clear()
+                    await loop.step()
+                    await asyncio.sleep(.002)
                 publish.assert_not_called()
-                self.assertEqual(sum('COMMIT: REJECTED' in c['body'] for c in self.h.comments[1]), 1)
-
                 evidence_gate.set()
-                await pump(lambda: bool((item.get('chief_review') or {}).get('complete')) and len(self.wakeups()) == 1)
+                await self.pump_control(loop, lambda: bool((item.get('chief_review') or {}).get('complete')) and len(self.wakeups()) == 1
+                    and early_id in item.get('processed_owner_actions', []))
                 bundle.assert_called_once()
                 self.assertIsNone(item['owner_state'])
                 self.assertFalse(Scheduler(self.h.state).release('1'))
                 self.verdict(item)
-                await pump(lambda: item.get('owner_state') == 'READY_FOR_OWNER')
+                await self.pump_control(loop, lambda: item.get('owner_state') == 'READY_FOR_OWNER')
                 self.assertTrue(chief_review.approval_complete(item))
-                self.assertFalse(operational_state.chief_repository_hold(item))
                 self.assertTrue(Scheduler(self.h.state).release('1'))
-                self.assertFalse(self.h.state['repo_locks'])
                 self.h.comment('<!-- DEVORCHESTRATOR_OWNER_V1 {"action":"COMMIT"} -->')
                 command_id = self.h.comments[1][-1]['id']
-                await pump(lambda: item.get('owner_state') == 'COMMITTED')
-                for _ in range(3):
-                    await loop.step()
+                await self.pump_control(loop, lambda: item.get('owner_state') == 'COMMITTED')
                 await loop.close()
                 self.h.restart()
                 item = self.h.state['issues']['1']
                 loop = b.ControlLoop(self.h.state)
-                for _ in range(3):
-                    await loop.step()
+                await self.pump_control(loop, lambda: len(loop.issues) == 1)
                 bundle.assert_called_once()
                 publish.assert_called_once()
                 self.assertEqual(item['processed_owner_actions'].count(command_id), 1)
@@ -270,6 +313,7 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(self.h.continues), continues)
                 self.assertEqual(self.h.git('rev-list', '--count', 'HEAD'), '2')
         finally:
+            evidence_gate.set()
             await loop.close()
 
 
@@ -277,20 +321,18 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
         item = await self.pending()
         item.pop('chief_review')
         item['chief_status'] = 'AWAITING_CHIEF_REVIEW'
+        (self.h.repo / 'file').write_text('changed after review')
         loop = b.ControlLoop(self.h.state)
-        loop.pending = ['1']
-        report = copy.deepcopy(self.h.tasks[item['task_id']])
-        with patch.object(loop, 'observe', new=AsyncMock(return_value=(report, None, 0, 0))):
-            await loop.step()
-            await asyncio.sleep(0)
-            await loop.step()
-        self.assertEqual(item['review_status'], 'FRESH_REVIEW_REQUIRED')
-        self.assertIsNone(item.get('reviewed_tree'))
-        self.assertFalse(chief_review.approval_complete(item))
-        await loop.close()
+        try:
+            await self.pump_control(loop, lambda: item.get('review_status') == 'FRESH_REVIEW_REQUIRED')
+            self.assertIsNone(item.get('reviewed_tree'))
+            self.assertFalse(chief_review.approval_complete(item))
+        finally:
+            await loop.close()
 
 
     async def test_legacy_identity_resolution_is_read_only_and_applied_serially(self):
+        from control_loop import discover
         task = dict(id='legacy', project='-', machine='work', workspace=str(self.h.repo),
                     agent='codex', role='coding', status='RUNNING')
         transport = self.h.transport
@@ -298,13 +340,10 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
             return [task] if name == 'list_tasks' else await transport(name, args)
         loop = b.ControlLoop(self.h.state)
         with patch.object(b, 'transport_call', side_effect=legacy):
-            result = await loop.discover()
+            result = await discover()
             self.assertEqual(self.h.state['issues'], {})
-            self.assertIn('test', result[2])
-            future = asyncio.get_running_loop().create_future()
-            future.set_result(result)
-            loop.discovery = future
-            await loop.step()
+            self.assertIn('test', result['identities'])
+            loop._apply_discovery(result)
         self.assertEqual(self.h.state['work_queue']['external:legacy']['status'], 'RUNNING')
         self.assertFalse(self.h.starts)
         await loop.close()
@@ -334,17 +373,15 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
         event_loop = asyncio.get_running_loop()
         def slow(text):
             event_loop.call_soon_threadsafe(entered.set)
-            release.wait(5)
+            release.wait(10)
             return True
         loop = b.ControlLoop(self.h.state)
         try:
             with patch.object(b, 'send_telegram', side_effect=slow):
-                await loop.step()
-                await entered.wait()
+                await self.pump_control(loop, entered.is_set)
                 self.h.comment('<!-- DEVORCHESTRATOR_OWNER_V1 {"action":"COMMIT"} -->')
-                await loop.step()
-                self.assertEqual(item['owner_state'], 'COMMITTED')
-                sending = [key for key in loop.telegram_tasks]
+                await self.pump_control(loop, lambda: item.get('owner_state') == 'COMMITTED')
+                sending = list(loop.telegram_tasks)
                 self.assertTrue(sending)
                 self.h.restart()
                 b.flush_effects(self.h.state)

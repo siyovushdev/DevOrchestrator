@@ -22,14 +22,34 @@ class PreflightRejected(ValueError):
     """Confirmed execution validation failure before any launch receipt."""
 
 
+class RuntimeUnavailable(RuntimeError):
+    """Transient probe failure; does not establish invalid execution policy."""
+
+
+class StaleReviewInput(RuntimeError):
+    """Confirmed source mismatch before any worker preparation or launch."""
+
+
 def rejection(message):
     from redaction import redact
-    return {'status': 'REJECTED', 'launch_started': False, 'error': redact(str(message))}
+    return {'status': 'REJECTED', 'launch_started': False, 'error': redact(str(message))[:512]}
 
 
 def check_preflight(result):
-    if not isinstance(result, dict) or result.get('status') not in ('READY', 'REPLAY', 'REJECTED'):
+    if not isinstance(result, dict) or result.get('status') not in (
+            'READY', 'REPLAY', 'REJECTED', 'UNAVAILABLE', 'STALE_INPUT', 'FENCED'):
         raise RuntimeError('Invalid execution preflight response')
+    if result['status'] in ('STALE_INPUT', 'FENCED'):
+        if result.get('launch_started') is not False:
+            raise RuntimeError('Invalid no-launch proof')
+        if result['status'] == 'FENCED':
+            from worker_runtime import RequestFenced
+            raise RequestFenced('Request was durably fenced before launch')
+        raise StaleReviewInput('Review source changed before launch')
+    if result['status'] == 'UNAVAILABLE':
+        if result.get('launch_started') is not False:
+            raise RuntimeError('Invalid preflight unavailability proof')
+        raise RuntimeUnavailable('Runtime discovery unavailable; check agent connectivity and retry the same request')
     if result['status'] == 'REJECTED':
         if result.get('launch_started') is not False or not isinstance(result.get('error'), str) or not result['error'].strip():
             raise RuntimeError('Invalid prelaunch rejection proof')
@@ -281,7 +301,7 @@ def runtime_probe(machine, command, capture):
     try:
         return capture(machine, command)
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise ValueError(f'Cannot validate runtime on {machine}: {command} unavailable or timed out; '
+        raise RuntimeUnavailable(f'Cannot validate runtime on {machine}: {command} unavailable or timed out; '
                          'check the installed agent and connectivity') from exc
 
 def discover(machine, agent, capture):
@@ -291,15 +311,15 @@ def discover(machine, agent, capture):
     for key, command in [('version', f'{executable} --version'), ('help', f'{executable} --help')]:
         probe = runtime_probe(machine, command, capture)
         if probe.returncode != 0 or not probe.stdout.strip():
-            raise ValueError(f'Cannot validate {agent} runtime on {machine}: {command} failed')
+            raise RuntimeUnavailable(f'Cannot validate {agent} runtime on {machine}: {command} failed')
         result[key] = probe.stdout.strip()
     if agent == 'cursor':
         probe = runtime_probe(machine, 'agent models', capture)
         if probe.returncode != 0:
-            raise ValueError(f'Cannot discover Cursor models on {machine}; run agent models and check authentication/connectivity')
+            raise RuntimeUnavailable(f'Cannot discover Cursor models on {machine}; run agent models and check authentication/connectivity')
         result['models'] = sorted(set(re.findall(r'^([A-Za-z0-9][A-Za-z0-9._:/-]*) - ', probe.stdout, re.M)))
         if not result['models']:
-            raise ValueError('Cursor model discovery returned no model IDs; inspect agent models output')
+            raise RuntimeUnavailable('Cursor model discovery returned no model IDs; inspect agent models output')
     return result
 
 

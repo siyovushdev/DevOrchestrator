@@ -1,5 +1,5 @@
 """Read-only lifecycle policy and operator view over the durable bridge state."""
-from copy import deepcopy
+import bridge_telemetry
 
 
 def merge_convergence_complete(item):
@@ -16,6 +16,15 @@ def post_merge_repository_hold(item):
             item.get('owner_state') != 'MERGED' and not result.get('master_sha')):
         return False
     return item.get('post_merge_convergence') is not None and not merge_convergence_complete(item)
+
+
+def publication_repository_hold(item):
+    """A possibly applied publication needs its repository until reconciliation."""
+    return any(isinstance(entry, dict) and not entry.get('done') and
+               entry.get('outcome') != 'NOT_MERGED' and
+               (entry.get('dispatch_state') in ('SENDING', 'RETURNED') or
+                entry.get('create_status') in ('SENDING', 'SENT') or entry.get('candidate'))
+               for entry in (item.get('publication_journal') or {}).values())
 
 
 def exclusion_reason(item, issue=None):
@@ -88,6 +97,8 @@ def next_action(item, report=None):
     state = lifecycle_state(item)
     if state == 'ARCHIVED':
         return 'NONE'
+    if any(key in item.get('consistency_diagnostics', {}) for key in ('review_migration', 'review_request')):
+        return 'INSPECT_WORKER'
     if any(key.startswith('runtime_') for key in item.get('consistency_diagnostics', {})):
         return 'INSPECT_WORKER'
     if state == 'POST_MERGE_BLOCKED':
@@ -115,7 +126,7 @@ def notification_fingerprint(item):
         'owner_blocker', 'worker_uncertain', 'review_uncertain', 'review_hold')})
 
 
-def status_view(state, number, runtime=None):
+def status_view(state, number, runtime=None, telemetry=None):
     item = state.get('issues', {}).get(str(number))
     if not isinstance(item, dict):
         raise ValueError('Unknown tracked issue')
@@ -131,14 +142,14 @@ def status_view(state, number, runtime=None):
         coding_turn=item.get('coding_turn'), reviewer=item.get('reviewer_agent'), review_task=item.get('review_task_id'),
         review_round=item.get('review_round'), chief_state=item.get('chief_status'),
         chief_bundle=(chief.get('identity') or {}).get('bundle_id'),
-        runtime=runtime or item.get('runtime_health', {}).get('coding') or {'state': 'UNKNOWN'},
-        review_runtime=item.get('runtime_health', {}).get('review') or {'state': 'UNKNOWN'},
+        runtime=runtime or bridge_telemetry.runtime_view(item, number, 'coding', telemetry),
+        review_runtime=bridge_telemetry.runtime_view(item, number, 'review', telemetry),
         queue=jobs, locks=[{'repository': repo, 'owner': lock.get('owner')} for repo, lock in state.get('repo_locks', {}).items()
                            if str(lock.get('owner')) == str(number)], publication=item.get('owner_state'),
         next_action=next_action(item), projection=item.get('projection', {'health': 'UNKNOWN'}),
         diagnostics=item.get('consistency_diagnostics', {}),
         convergence=item.get('post_merge_convergence'),
-        timings=deepcopy(state.get('timings', {'samples': []})),
+        timings={'samples': bridge_telemetry.timing_samples(state.get('timings') or (telemetry or {}).get('timings'))},
         scheduler_diagnostics={repo: state.get('scheduler_diagnostics', {}).get(repo)
             for repo, lock in state.get('repo_locks', {}).items() if str(lock.get('owner')) == str(number)
             and repo in state.get('scheduler_diagnostics', {})})

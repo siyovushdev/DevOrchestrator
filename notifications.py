@@ -101,7 +101,7 @@ def send(text, opener=None, sleep=time.sleep):
     return False
 
 
-def terminal_text(status, issue, item, report=None, blocker=None, *, current_action=None):
+def terminal_text(status, issue, item, report=None, blocker=None, *, current_action=None, include_duration=True):
     report = report or {}
     if status == 'REVIEW_PASSED / READY_FOR_OWNER':
         if not review_approval_complete(item):
@@ -150,7 +150,7 @@ def terminal_text(status, issue, item, report=None, blocker=None, *, current_act
             ('Worker/process owned', f"{health.get('worker_alive')}/{health.get('process_alive')}"),
         ])
     created = report.get('created_at')
-    if created:
+    if created and include_duration:
         try:
             duration = max(0, int((datetime.now(timezone.utc) - datetime.fromisoformat(created)).total_seconds()))
             values.append(('Duration', f'{duration // 60}m {duration % 60}s'))

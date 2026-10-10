@@ -317,7 +317,7 @@ def malformed_runtime(item):
 
 def approval_complete(item):
     """A label, malformed state, or stale identity cannot authorize publication."""
-    if malformed_runtime(item):
+    if item.get('review_transition') is not None or item.get('review_migration') is not None or malformed_runtime(item):
         return False
     if not item.get('chief_required'):
         return item.get('chief_status') in (None, 'NONE', 'NOT_REQUIRED')

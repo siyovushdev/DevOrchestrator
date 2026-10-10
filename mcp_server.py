@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 
 import json
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial, wraps
 import subprocess
 from pathlib import Path
 from typing import Literal
 from health import MCP_HEALTH_TIMEOUT, failed_health, validate_health
 from redaction import redact
-from execution_profiles import PreflightRejected, check_preflight, rejection
+from execution_profiles import PreflightRejected, StaleReviewInput, check_preflight, rejection
+from worker_runtime import RequestFenced
 
 from mcp.server import MCPServer
 
@@ -16,6 +20,21 @@ DEVCTL = ROOT / "devctl.py"
 PROJECTS_FILE = ROOT / "projects.json"
 
 mcp = MCPServer("Siyavush DevOrchestrator")
+
+# Register explicitly async handlers. A synchronous SDK invocation of devctl
+# must not monopolize the MCP event loop during runtime discovery or cleanup.
+# Worker admission remains serialized by worker.lock, independent of these pools.
+TOOL_POOLS = {name: ThreadPoolExecutor(max_workers=2, thread_name_prefix='mcp-' + name)
+              for name in ('control', 'work')}
+
+
+def io_tool(function):
+    lane = 'work' if function.__name__ in ('start_task', 'continue_task', 'adopt_task', 'preflight_task') else 'control'
+    @wraps(function)
+    async def handler(*args, **kwargs):
+        return await asyncio.get_running_loop().run_in_executor(TOOL_POOLS[lane], partial(function, *args, **kwargs))
+    mcp.tool()(handler)
+    return function  # Preserve the direct, synchronous CLI-adapter test contract.
 
 
 def load_projects() -> dict:
@@ -38,12 +57,12 @@ def devctl(*args: str, timeout: int = 30) -> str:
     result = devctl_result(*args, timeout=timeout)
     output = result.stdout.strip()
 
-    if result.returncode == 2:
+    if result.returncode in (2, 3):
         try:
             payload = json.loads(output)
         except ValueError:
             payload = None
-        if isinstance(payload, dict) and payload.get('status') == 'REJECTED':
+        if isinstance(payload, dict) and payload.get('status') in ('REJECTED', 'STALE_INPUT', 'FENCED'):
             check_preflight(payload)
     if result.returncode != 0:
         raise RuntimeError(
@@ -53,13 +72,13 @@ def devctl(*args: str, timeout: int = 30) -> str:
     return output
 
 
-@mcp.tool()
+@io_tool
 def list_projects() -> dict:
     """List projects available to DevOrchestrator."""
     return load_projects()
 
 
-@mcp.tool()
+@io_tool
 def get_execution_catalog(project: str | None = None, discover: bool = False,
                           agent: Literal['cursor', 'codex'] | None = None) -> dict:
     """Validate/catalogue configuration; optionally probe the installed project runtime without launching."""
@@ -73,13 +92,28 @@ def get_execution_catalog(project: str | None = None, discover: bool = False,
     return json.loads(devctl(*args))
 
 
-@mcp.tool()
+@io_tool
 def preflight_task(operation: Literal['start_task', 'continue_task'], arguments: dict) -> dict:
     """Read-only role, profile and runtime validation; never starts a worker."""
     return json.loads(devctl('preflight-task', operation, json.dumps(arguments, sort_keys=True)))
 
 
-@mcp.tool()
+@io_tool
+def get_transition_capabilities() -> dict:
+    """Static protocol support; absence never enables the new launch path."""
+    return {'schema_version': 1, 'review_binding': 1, 'start_request_reconciliation': 1}
+
+
+@io_tool
+def inspect_start_request(request_id: str, fence: bool = False) -> dict:
+    """Inspect a start receipt; optionally fence only a proven unaccepted request."""
+    args = ['inspect-start-request', request_id]
+    if fence:
+        args.append('--fence')
+    return json.loads(devctl(*args))
+
+
+@io_tool
 def start_task(
     project: str,
     prompt: str,
@@ -90,6 +124,8 @@ def start_task(
     role: Literal["coding", "review"] = "coding",
     execution_profile: str | None = None,
     execution_options: dict | None = None,
+    review_binding: dict | None = None,
+    repository_binding: dict | None = None,
 ) -> dict:
     """Start a task in a registered project.
 
@@ -127,11 +163,19 @@ def start_task(
         args += ['--execution-options', json.dumps(execution_options, sort_keys=True)]
     if request_id:
         args += ["--request-id", request_id]
+    if review_binding is not None:
+        args += ['--review-binding', json.dumps(review_binding, sort_keys=True)]
+    if repository_binding is not None:
+        args += ['--repository-binding', json.dumps(repository_binding, sort_keys=True)]
     args += ["--role", role]
     try:
         output = devctl(*args)
     except PreflightRejected as exc:
         return rejection(exc)
+    except StaleReviewInput:
+        return {'status': 'STALE_INPUT', 'launch_started': False}
+    except RequestFenced:
+        return {'status': 'FENCED', 'launch_started': False}
     task_id = output.splitlines()[-1].strip()
 
     report = json.loads(devctl("report", task_id, "--json"))
@@ -142,7 +186,7 @@ def start_task(
 
 
 
-@mcp.tool()
+@io_tool
 def get_task_report(task_id: str) -> dict:
     """Return task status and latest concise result."""
     return json.loads(
@@ -150,7 +194,7 @@ def get_task_report(task_id: str) -> dict:
     )
 
 
-@mcp.tool()
+@io_tool
 def continue_task(task_id: str, prompt: str, request_id: str | None = None,
                   role: Literal["coding", "review"] = "coding") -> dict:
     """Continue the same Codex or Cursor session."""
@@ -167,7 +211,7 @@ def continue_task(task_id: str, prompt: str, request_id: str | None = None,
     )
 
 
-@mcp.tool()
+@io_tool
 def list_tasks(control: bool = False, project: str | None = None) -> list:
     """Control reads target worker ownership without running recovery sweeps."""
     args = ["tasks", "--json", "--cached"]
@@ -178,7 +222,7 @@ def list_tasks(control: bool = False, project: str | None = None) -> list:
     return json.loads(devctl(*args))
 
 
-@mcp.tool()
+@io_tool
 def adopt_task(
     project: str,
     session_id: str,
@@ -212,7 +256,7 @@ def adopt_task(
         devctl("report", new_task_id, "--json")
     )
 
-@mcp.tool()
+@io_tool
 def orchestrator_health() -> dict:
     """Report required WORK health and optional worker availability independently.
 
