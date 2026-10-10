@@ -23,18 +23,86 @@ def comment_matches(entry, key, observations):
 
 
 def enqueue(state, number, kind, payload, event=None):
+    from external_effects import blocked
+    if blocked() and isinstance(state.get('issues', {}).get(str(number)), dict):
+        hold_observation(state, number)
     digest = hashlib.sha256(json.dumps([str(number), kind, event or payload], sort_keys=True).encode()).hexdigest()
+    previous = state.get('outbox', {}).get(digest)
+    if previous and (previous.get('status') == 'QUARANTINED' or
+                     previous.get('effect_origin') in ('safety_latch', 'legacy_unverified')):
+        return digest  # A repeated desire cannot become a new authorization.
+    held = blocked() or observation_held(state, number)
+    if held:
+        # A tombstone is durable even after the environment latch is removed.
+        # Never supersede or reauthorize an existing legitimate operation.
+        state.setdefault('outbox', {}).setdefault(digest, dict(
+            number=number, kind=kind, payload=payload, status='QUARANTINED',
+            attempts=0, next_attempt=0, delivery_version=2,
+            effect_origin='safety_latch', diagnostic='Fresh authorization required'))
+        return digest
     if kind == 'transition':
         for existing_key, existing in state.get('outbox', {}).items():
-            if existing_key != digest and str(existing['number']) == str(number) and existing['kind'] == 'transition' and existing['status'] != 'DONE':
+            if (existing_key != digest and str(existing['number']) == str(number) and
+                    existing['kind'] == 'transition' and existing['status'] not in ('DONE', 'QUARANTINED')):
                 existing['status'] = 'DONE'  # A newer desired state supersedes undelivered older labels.
     state.setdefault('outbox', {}).setdefault(digest, dict(number=number, kind=kind, payload=payload,
                                                          status='PENDING', attempts=0, next_attempt=0,
-                                                         delivery_version=2))
+                                                         delivery_version=2, effect_origin='runtime'))
     return digest
 
 
+def observation_held(state, number):
+    item = state.get('issues', {}).get(str(number), {})
+    return isinstance(item, dict) and bool(item.get('safety_latch_hold'))
+
+
+def hold_observation(state, number):
+    """Writer-local, sticky revocation; removal of the env latch is not approval.
+
+    V1 entries contain no evidence distinguishing legitimate pending work from
+    a prior smoke. Retain affected entries for audit, never delete them or guess
+    their authority. Explicit runtime-origin entries and other issues survive.
+    """
+    item = state['issues'][str(number)]
+    changed = not item.get('safety_latch_hold')
+    item.setdefault('safety_latch_hold', dict(reason='Read-only observation; fresh authorization required'))
+    for entry in state.get('outbox', {}).values():
+        if (str(entry['number']) == str(number) and entry.get('status') == 'PENDING' and
+                not entry.get('effect_origin') and
+                entry.get('completion_comment') not in ('SENDING', 'UNCERTAIN', 'DONE')):
+            entry.update(status='QUARANTINED', effect_origin='legacy_unverified',
+                         diagnostic='Origin unavailable; retained for authorization audit')
+            changed = True
+    return changed
+
+
+def _withheld(entry):
+    """A new smoke-blocked effect has not crossed the send boundary.
+
+    Crash receipts already marked SENDING or UNCERTAIN stay on the exact
+    reconciliation path. Completion uses that marker on the entry itself.
+    """
+    from external_effects import blocked
+    if not blocked() or entry.get('status') != 'PENDING':
+        return False
+    if entry.get('kind') == 'completion' and entry.get('completion_comment') in ('SENDING', 'UNCERTAIN', 'DONE'):
+        return False
+    return entry.get('kind') in ('comment', 'chief_comment', 'telegram', 'transition', 'completion')
+
+
 def _flush_steps(state, persist, comments, post_comment, transition, telegram, now=None, eligible=None, complete=None, telegram_dispatch=None, telegram_inflight=(), selection=None, render_telegram=None):
+    from external_effects import ExternalEffectBlocked, blocked
+    if blocked():
+        changed = False
+        for key, entry in list(state.get('outbox', {}).items()):
+            if selection is not None and key not in selection:
+                continue
+            item = state.get('issues', {}).get(str(entry['number']), {})
+            if (isinstance(item, dict) and (item.get('task_id') or item.get('review_task_id')) and
+                    entry.get('status') == 'PENDING' and not entry.get('effect_origin')):
+                changed = hold_observation(state, entry['number']) or changed
+        if changed:
+            persist()  # Legacy migration is durable even through the generic flush API.
     now = time.time() if now is None else now
     started = time.monotonic()
     deliveries = 0
@@ -43,6 +111,8 @@ def _flush_steps(state, persist, comments, post_comment, transition, telegram, n
     entries.sort(key=lambda pair: 0 if pair[1]['kind'] == 'transition' else
                  1 if pair[1]['kind'] == 'comment' and 'Task started:' in pair[1]['payload'] else 2)
     for key, entry in entries:
+        if entry.get('status') == 'QUARANTINED' or entry.get('effect_origin') in ('safety_latch', 'legacy_unverified'):
+            continue  # No callbacks, retries or receipt-reset paths can authorize this entry.
         if selection is not None and key not in selection:
             continue
         comment = entry['kind'] in ('comment', 'chief_comment')
@@ -67,6 +137,8 @@ def _flush_steps(state, persist, comments, post_comment, transition, telegram, n
             try:
                 matches = comment_matches(entry, key, (yield ('comments', (entry['number'],))))
                 entry['status'] = 'DONE' if len(matches) == 1 else 'UNCERTAIN'
+            except ExternalEffectBlocked:
+                raise
             except Exception:
                 entry['status'] = 'UNCERTAIN'
             persist()
@@ -75,6 +147,8 @@ def _flush_steps(state, persist, comments, post_comment, transition, telegram, n
             expected = entry['payload'] + '\n\n' + f'<!-- DEVORCHESTRATOR_EFFECT_V1 {key} -->'
             try:
                 matches = comment_matches(entry, key, (yield ('comments', (entry['number'],))))
+            except ExternalEffectBlocked:
+                raise
             except Exception:
                 # No POST was attempted: a failed preflight read is safe to retry.
                 entry['attempts'] += 1
@@ -85,6 +159,10 @@ def _flush_steps(state, persist, comments, post_comment, transition, telegram, n
                 entry['status'] = 'DONE' if len(matches) == 1 else 'UNCERTAIN'
                 persist()
                 continue
+        if _withheld(entry):
+            # The latch is proof the transport will not be entered. Leave the
+            # retryable receipt where it is: no SENDING checkpoint, no attempt.
+            continue
         if entry['kind'] == 'telegram':
             # Rendering is writer-local and occurs only after backoff/freshness
             # checks. Persist the stable event payload, never this send buffer.
@@ -114,6 +192,11 @@ def _flush_steps(state, persist, comments, post_comment, transition, telegram, n
             else:
                 raise ValueError('Unknown external effect')
             entry['status'] = 'DONE'
+        except ExternalEffectBlocked:
+            # Raised before the transport. A SENDING checkpoint from this same
+            # attempt is unsent and returns to the retryable receipt.
+            if entry.get('status') == 'SENDING':
+                entry['status'] = 'PENDING'
         except CommentNotDispatched:
             if not comment:
                 raise

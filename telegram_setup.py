@@ -13,6 +13,8 @@ ENV_FILE = CONFIG_DIR / "telegram.env"
 
 
 def api(token, method, data=None):
+    from external_effects import refuse
+    refuse('telegram')
     url = f"https://api.telegram.org/bot{token}/{method}"
 
     payload = None
@@ -31,6 +33,8 @@ def api(token, method, data=None):
 
 
 def main():
+    from external_effects import refuse
+    refuse('telegram')
     print("Telegram DevOrchestrator setup")
     print("Сначала отправь /start своему боту в Telegram.")
     print()

@@ -1,0 +1,32 @@
+{
+  "exclusions": [
+    ".git/",
+    "git-ignored files including .venv/, .acceptance-lab/, projects.json, local secrets and caches"
+  ],
+  "full_suite": {
+    "count": 737,
+    "log_sha256": "f1072599b44bb8ac9caa4d7138e7768061aaa0035e872f8db28668a044ff03a8",
+    "status": "PASS"
+  },
+  "guard_manifest_sha256": "dbf2089e440e41256ce21ebce9804d0418f17be79cf22d9653b7c3d516eddc96",
+  "guard_source_files": 17,
+  "guard_source_mismatches": 0,
+  "head": "adab54726e7427d83cf42d9241c570ec619dceec",
+  "independent_regressions": {
+    "count": 173,
+    "provenance": "Owner statement in this request; separate review log not present in this workspace",
+    "status": "PASS"
+  },
+  "production_operations": false,
+  "python_binary": "/usr/bin/python3.12",
+  "python_binary_sha256": "e50d468e8b0adfb05733f5b87b3cff34829c4a8c1aea50c865aa8bdfe4bb150f",
+  "smoke_executed": false,
+  "source_policy": "All git-tracked and nonignored untracked regular files; no symlinks or missing files accepted",
+  "status": "PREPARED_NOT_EXECUTED",
+  "total_source_files": 124,
+  "tracked_files": 103,
+  "tree_manifest_sha256": "31834a44973af92ad721b3cf6bc8ce45fe63802ca1dbad28c1a0708964175495",
+  "untracked_files": 21,
+  "venv_manifest_sha256": "9692c51dd9b505cacb57edb2003ec906dd9a0d72033a7421a335f1ed084d159b",
+  "workspace": "/home/siovush/DevOrchestrator-acceptance"
+}

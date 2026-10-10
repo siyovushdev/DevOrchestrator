@@ -63,6 +63,8 @@ def chief_repository_hold(item):
 
 
 def lifecycle_state(item):
+    if item.get('safety_latch_hold'):
+        return 'OBSERVATION_HELD'
     if exclusion_reason(item):
         return 'ARCHIVED'
     if item.get('merged') and not merge_convergence_complete(item):
@@ -95,6 +97,8 @@ def lifecycle_state(item):
 
 def next_action(item, report=None):
     state = lifecycle_state(item)
+    if state == 'OBSERVATION_HELD':
+        return 'INSPECT_SAFETY_LATCH_AUTHORIZATION'
     if state == 'ARCHIVED':
         return 'NONE'
     if any(key in item.get('consistency_diagnostics', {}) for key in ('review_migration', 'review_request')):

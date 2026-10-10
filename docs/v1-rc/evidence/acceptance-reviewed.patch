@@ -1,0 +1,1566 @@
+diff --git a/.gitignore b/.gitignore
+index 2ff1d8d..bce5685 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -32,6 +32,9 @@ dist/
+ # Machine-local project registry
+ projects.json
+ 
++# Acceptance lab: private state copies and raw test logs
++.acceptance-lab/
++
+ # Temporary/bootstrap helpers
+ mcp_b4_continue.py
+ mcp_b4_resume.py
+diff --git a/bridge_effects.py b/bridge_effects.py
+index 8e04bab..a86a4c7 100644
+--- a/bridge_effects.py
++++ b/bridge_effects.py
+@@ -23,18 +23,86 @@ def comment_matches(entry, key, observations):
+ 
+ 
+ def enqueue(state, number, kind, payload, event=None):
++    from external_effects import blocked
++    if blocked() and isinstance(state.get('issues', {}).get(str(number)), dict):
++        hold_observation(state, number)
+     digest = hashlib.sha256(json.dumps([str(number), kind, event or payload], sort_keys=True).encode()).hexdigest()
++    previous = state.get('outbox', {}).get(digest)
++    if previous and (previous.get('status') == 'QUARANTINED' or
++                     previous.get('effect_origin') in ('safety_latch', 'legacy_unverified')):
++        return digest  # A repeated desire cannot become a new authorization.
++    held = blocked() or observation_held(state, number)
++    if held:
++        # A tombstone is durable even after the environment latch is removed.
++        # Never supersede or reauthorize an existing legitimate operation.
++        state.setdefault('outbox', {}).setdefault(digest, dict(
++            number=number, kind=kind, payload=payload, status='QUARANTINED',
++            attempts=0, next_attempt=0, delivery_version=2,
++            effect_origin='safety_latch', diagnostic='Fresh authorization required'))
++        return digest
+     if kind == 'transition':
+         for existing_key, existing in state.get('outbox', {}).items():
+-            if existing_key != digest and str(existing['number']) == str(number) and existing['kind'] == 'transition' and existing['status'] != 'DONE':
++            if (existing_key != digest and str(existing['number']) == str(number) and
++                    existing['kind'] == 'transition' and existing['status'] not in ('DONE', 'QUARANTINED')):
+                 existing['status'] = 'DONE'  # A newer desired state supersedes undelivered older labels.
+     state.setdefault('outbox', {}).setdefault(digest, dict(number=number, kind=kind, payload=payload,
+                                                          status='PENDING', attempts=0, next_attempt=0,
+-                                                         delivery_version=2))
++                                                         delivery_version=2, effect_origin='runtime'))
+     return digest
+ 
+ 
++def observation_held(state, number):
++    item = state.get('issues', {}).get(str(number), {})
++    return isinstance(item, dict) and bool(item.get('safety_latch_hold'))
++
++
++def hold_observation(state, number):
++    """Writer-local, sticky revocation; removal of the env latch is not approval.
++
++    V1 entries contain no evidence distinguishing legitimate pending work from
++    a prior smoke. Retain affected entries for audit, never delete them or guess
++    their authority. Explicit runtime-origin entries and other issues survive.
++    """
++    item = state['issues'][str(number)]
++    changed = not item.get('safety_latch_hold')
++    item.setdefault('safety_latch_hold', dict(reason='Read-only observation; fresh authorization required'))
++    for entry in state.get('outbox', {}).values():
++        if (str(entry['number']) == str(number) and entry.get('status') == 'PENDING' and
++                not entry.get('effect_origin') and
++                entry.get('completion_comment') not in ('SENDING', 'UNCERTAIN', 'DONE')):
++            entry.update(status='QUARANTINED', effect_origin='legacy_unverified',
++                         diagnostic='Origin unavailable; retained for authorization audit')
++            changed = True
++    return changed
++
++
++def _withheld(entry):
++    """A new smoke-blocked effect has not crossed the send boundary.
++
++    Crash receipts already marked SENDING or UNCERTAIN stay on the exact
++    reconciliation path. Completion uses that marker on the entry itself.
++    """
++    from external_effects import blocked
++    if not blocked() or entry.get('status') != 'PENDING':
++        return False
++    if entry.get('kind') == 'completion' and entry.get('completion_comment') in ('SENDING', 'UNCERTAIN', 'DONE'):
++        return False
++    return entry.get('kind') in ('comment', 'chief_comment', 'telegram', 'transition', 'completion')
++
++
+ def _flush_steps(state, persist, comments, post_comment, transition, telegram, now=None, eligible=None, complete=None, telegram_dispatch=None, telegram_inflight=(), selection=None, render_telegram=None):
++    from external_effects import ExternalEffectBlocked, blocked
++    if blocked():
++        changed = False
++        for key, entry in list(state.get('outbox', {}).items()):
++            if selection is not None and key not in selection:
++                continue
++            item = state.get('issues', {}).get(str(entry['number']), {})
++            if (isinstance(item, dict) and (item.get('task_id') or item.get('review_task_id')) and
++                    entry.get('status') == 'PENDING' and not entry.get('effect_origin')):
++                changed = hold_observation(state, entry['number']) or changed
++        if changed:
++            persist()  # Legacy migration is durable even through the generic flush API.
+     now = time.time() if now is None else now
+     started = time.monotonic()
+     deliveries = 0
+@@ -43,6 +111,8 @@ def _flush_steps(state, persist, comments, post_comment, transition, telegram, n
+     entries.sort(key=lambda pair: 0 if pair[1]['kind'] == 'transition' else
+                  1 if pair[1]['kind'] == 'comment' and 'Task started:' in pair[1]['payload'] else 2)
+     for key, entry in entries:
++        if entry.get('status') == 'QUARANTINED' or entry.get('effect_origin') in ('safety_latch', 'legacy_unverified'):
++            continue  # No callbacks, retries or receipt-reset paths can authorize this entry.
+         if selection is not None and key not in selection:
+             continue
+         comment = entry['kind'] in ('comment', 'chief_comment')
+@@ -67,6 +137,8 @@ def _flush_steps(state, persist, comments, post_comment, transition, telegram, n
+             try:
+                 matches = comment_matches(entry, key, (yield ('comments', (entry['number'],))))
+                 entry['status'] = 'DONE' if len(matches) == 1 else 'UNCERTAIN'
++            except ExternalEffectBlocked:
++                raise
+             except Exception:
+                 entry['status'] = 'UNCERTAIN'
+             persist()
+@@ -75,6 +147,8 @@ def _flush_steps(state, persist, comments, post_comment, transition, telegram, n
+             expected = entry['payload'] + '\n\n' + f'<!-- DEVORCHESTRATOR_EFFECT_V1 {key} -->'
+             try:
+                 matches = comment_matches(entry, key, (yield ('comments', (entry['number'],))))
++            except ExternalEffectBlocked:
++                raise
+             except Exception:
+                 # No POST was attempted: a failed preflight read is safe to retry.
+                 entry['attempts'] += 1
+@@ -85,6 +159,10 @@ def _flush_steps(state, persist, comments, post_comment, transition, telegram, n
+                 entry['status'] = 'DONE' if len(matches) == 1 else 'UNCERTAIN'
+                 persist()
+                 continue
++        if _withheld(entry):
++            # The latch is proof the transport will not be entered. Leave the
++            # retryable receipt where it is: no SENDING checkpoint, no attempt.
++            continue
+         if entry['kind'] == 'telegram':
+             # Rendering is writer-local and occurs only after backoff/freshness
+             # checks. Persist the stable event payload, never this send buffer.
+@@ -114,6 +192,11 @@ def _flush_steps(state, persist, comments, post_comment, transition, telegram, n
+             else:
+                 raise ValueError('Unknown external effect')
+             entry['status'] = 'DONE'
++        except ExternalEffectBlocked:
++            # Raised before the transport. A SENDING checkpoint from this same
++            # attempt is unsent and returns to the retryable receipt.
++            if entry.get('status') == 'SENDING':
++                entry['status'] = 'PENDING'
+         except CommentNotDispatched:
+             if not comment:
+                 raise
+diff --git a/control_loop.py b/control_loop.py
+index 776bf88..f33f13b 100644
+--- a/control_loop.py
++++ b/control_loop.py
+@@ -60,6 +60,8 @@ class ControlLoop:
+ 
+     def _observe_control(self, number, observation):
+         import task_bridge as bridge
++        if bridge.observation_barrier(self.state, number):
++            return
+         issue = observation['issue']
+         if not issue:
+             return
+@@ -118,6 +120,8 @@ class ControlLoop:
+             if bridge.QUEUE_LABEL in bridge.label_names(issue) and number not in self.state['issues']:
+                 self.state['issues'][number] = {'queue_status': 'QUEUED'}
+             if number in self.state['issues']:
++                if bridge.bridge_effects.observation_held(self.state, number):
++                    continue
+                 self.issues[number] = issue
+                 if number not in self.pending:
+                     self.pending.append(number)
+@@ -126,6 +130,24 @@ class ControlLoop:
+ 
+     def _completion(self, key, command, value, error):
+         import task_bridge as bridge
++        from external_effects import read_only_observation
++        # Delayed detached results cannot revive a writer held during smoke.
++        if key in self.reviews.operations:
++            number = self.reviews.operations[key][0]
++        elif key in self.legacy_reviews.operations:
++            number = self.legacy_reviews.operations[key]
++        elif key.startswith(('control:', 'writer:')):
++            number = key.split(':', 1)[1]
++        else:
++            number = None
++        if read_only_observation(value):
++            targets = [number] if number is not None else [
++                n for n, item in self.state['issues'].items() if isinstance(item, dict) and item.get('task_id')]
++            for target in targets:
++                bridge.observation_barrier(self.state, target, {'observation_confidence': 'READ_ONLY'})
++            return
++        if number is not None and bridge.observation_barrier(self.state, number):
++            return
+         if key == 'discovery':
+             self.next_heavy = time.monotonic() + 30
+             if error is None:
+@@ -174,7 +196,9 @@ class ControlLoop:
+         try:
+             command = writer.advance(value, error)
+         except (Exception, asyncio.CancelledError) as exc:
+-            bridge.defer_issue(self.state['issues'][number], self.state, number, exc)
++            from external_effects import ExternalEffectBlocked
++            if not isinstance(exc, ExternalEffectBlocked):
++                bridge.defer_issue(self.state['issues'][number], self.state, number, exc)
+             command = None
+         if writer.done:
+             del self.continuations[number]
+@@ -187,6 +211,10 @@ class ControlLoop:
+         import task_bridge as bridge
+         if self.closing:
+             return
++        from external_effects import blocked
++        if blocked():
++            await bridge.observe_latched_poll(self.state)
++            return
+         # Control/discovery reducers are lifecycle writers too. A failed save
+         # must escape the generic retry handler before any further dispatch.
+         token = DRIVING.set(True)
+@@ -228,6 +256,8 @@ class ControlLoop:
+             for number, item in list(self.state['issues'].items()):
+                 if not isinstance(item, dict) or not number.isdigit():
+                     continue
++                if bridge.bridge_effects.observation_held(self.state, number):
++                    continue
+                 if item.get('review_migration') is not None:
+                     try:
+                         self.legacy_reviews.schedule(number)
+@@ -275,6 +305,8 @@ class ControlLoop:
+                 ready_numbers = ready_numbers[offset:] + ready_numbers[:offset]
+                 self.writer_cursor += 1
+             for number in ready_numbers:
++                if bridge.bridge_effects.observation_held(self.state, number):
++                    continue
+                 if number not in self.waiting or number in self.ready:
+                     self._advance(number)
+                 command = self.waiting.get(number)
+diff --git a/devctl.py b/devctl.py
+index d1b6a7e..942044e 100755
+--- a/devctl.py
++++ b/devctl.py
+@@ -66,6 +66,8 @@ def reap_processes():
+ 
+ 
+ def spawn_detached(wrapper, log_file):
++    from external_effects import refuse
++    refuse('worker')
+     try:
+         process = subprocess.Popen(["bash", "-lc", wrapper], stdin=subprocess.DEVNULL,
+                                    stdout=log_file, stderr=subprocess.STDOUT, start_new_session=True)
+@@ -103,6 +105,8 @@ def machine_command(machine, command, *, connect_timeout=10, ssh_options=()):
+ 
+ 
+ def capture(machine, command, separate_stderr=False):
++    from external_effects import refuse
++    refuse('worker')
+     return subprocess.run(
+         machine_command(machine, command),
+         text=True,
+@@ -114,6 +118,8 @@ def capture(machine, command, separate_stderr=False):
+ 
+ 
+ def capture_execution(machine, command, *, timeout=PROBE_TIMEOUT):
++    from external_effects import refuse
++    refuse('worker')
+     env = dict(MACHINES[machine].get('agent_env', {}))
+     if machine == 'firefly' and command.startswith('agent '):
+         env['NODE_USE_ENV_PROXY'] = '1'
+@@ -312,6 +318,8 @@ def capture_git_baseline(machine, workspace):
+ 
+ 
+ def doctor_probe(machine, command, timeout):
++    from external_effects import refuse
++    refuse('worker')
+     # A timed-out local version command may have children holding stdout open.
+     # Kill the entire probe group so cleanup cannot wait on those children.
+     process = subprocess.Popen(
+@@ -377,6 +385,8 @@ agent --version 2>/dev/null || true
+ 
+ 
+ def doctor(as_json=False):
++    from external_effects import refuse
++    refuse('worker')
+     report = doctor_health()
+     if as_json:
+         print(json.dumps(report, ensure_ascii=False, indent=2))
+@@ -406,6 +416,9 @@ def load_projects():
+ 
+ 
+ def execution_catalog(project=None, discover=False, agent=None):
++    from external_effects import blocked, refuse
++    if discover and blocked():
++        refuse('worker')
+     cfg = load_projects()[project] if project else {}
+     catalog, identity = execution_profiles.load_catalog(cfg)
+     result = dict(catalog=catalog, identity=identity)
+@@ -473,7 +486,54 @@ def run_project(
+ 
+ 
+ 
++def stored_task_status(meta, directory):
++    """Read-only completion diagnosis, using the authoritative result parser.
++
++    Cached metadata alone cannot establish terminal completion. A generation
++    mismatch invalidates even an apparently successful exit marker.
++    """
++    if meta.get('resume_prepared') or meta.get('launch_prepared') or meta.get('remote_logs_pending'):
++        return 'UNKNOWN', None
++    record = None
++    try:
++        record = runtime_liveness.read_record(directory)
++        if record is not None or meta.get('runtime_generation'):
++            runtime_liveness.validate(record, meta)
++    except (OSError, ValueError, TypeError, KeyError):
++        return 'UNKNOWN', None
++    exit_path = directory / 'exit_code'
++    if exit_path.exists():
++        try:
++            code = int(exit_path.read_text().strip())
++        except (OSError, ValueError):
++            return 'UNKNOWN', None
++        if meta.get('machine') == 'firefly' and code == 255:
++            return 'UNKNOWN', None
++        if record and (record.get('phase') != 'EXITED' or record.get('exit_code') != code):
++            return 'UNKNOWN', None
++    elif record and record.get('phase') == 'EXITED':
++        code = record['exit_code']
++        if meta.get('remote_key'):
++            return 'UNKNOWN', None  # No confirmed final remote log drain.
++    else:
++        return 'UNKNOWN', None
++    if code != 0 or (record and record.get('terminal_reason') != 'process_exited'):
++        return 'FAILED', code
++    return ('DONE' if task_output(meta, directory)['result'] else 'FAILED'), code
++
++
++def stored_runtime_health(directory, state):
++    """Cached health is not current ownership or failure evidence."""
++    return {'state': 'UNKNOWN', 'reason': 'reconciliation_blocked',
++            'observation_confidence': 'READ_ONLY', 'lease_state': 'UNKNOWN',
++            'heartbeat_age_seconds': None}
++
++
+ def task_state(meta, directory, refresh_remote=True):
++    from external_effects import blocked
++    if blocked():
++        reap_processes()
++        return stored_task_status(meta, directory)
+     reap_processes()
+     if not refresh_remote:
+         meta.pop('_runtime_health', None)
+@@ -550,6 +610,9 @@ def project_for_task(meta):
+ 
+ 
+ def runtime_status(meta, directory, state=None):
++    from external_effects import blocked
++    if blocked():
++        return stored_runtime_health(directory, state)
+     if meta.get('remote_key') and meta.get('_runtime_health'):
+         return meta['_runtime_health']
+     return runtime_liveness.watchdog(directory, meta, probe=not meta.get('remote_key'),
+@@ -557,6 +620,8 @@ def runtime_status(meta, directory, state=None):
+ 
+ 
+ def spawn_runtime(directory, meta, command, log_file):
++    from external_effects import refuse
++    refuse('worker')
+     meta['project'] = project_for_task(meta)
+     meta.pop('runtime_generation', None)
+     record = runtime_liveness.initialize(directory, meta)
+@@ -568,14 +633,16 @@ def spawn_runtime(directory, meta, command, log_file):
+ 
+ 
+ def list_tasks(as_json=False, show_all=False, cached=False, control=False, control_project=None):
+-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+-    if not control:
++    from external_effects import blocked
++    if not blocked():
++        DATA_DIR.mkdir(parents=True, exist_ok=True)
++    if not control and not blocked():
+         reconcile_workers()
+ 
+     rows = []
+     scope = load_projects()[control_project] if control_project else None
+ 
+-    directories = [p for p in DATA_DIR.iterdir() if p.name != "archives"]
++    directories = [p for p in DATA_DIR.iterdir() if p.name != "archives"] if DATA_DIR.exists() else []
+     if (DATA_DIR / "archives").exists():
+         directories.extend((DATA_DIR / "archives").iterdir())
+     for directory in directories:
+@@ -610,7 +677,7 @@ def list_tasks(as_json=False, show_all=False, cached=False, control=False, contr
+                 # supplies cleanup proof, including terminal wrapper children.
+                 if not worker_runtime.publication_safe(directory, meta):
+                     state, exit_code = 'UNKNOWN', None
+-            if meta.get('remote_key') and not cached:
++            if meta.get('remote_key') and not cached and not blocked():
+                 reconcile_remote_observation(directory, meta, state, exit_code)
+         except Exception:
+             state, exit_code = 'UNKNOWN', None
+@@ -619,6 +686,7 @@ def list_tasks(as_json=False, show_all=False, cached=False, control=False, contr
+ 
+         rows.append({
+             "id": meta.get("id", directory.name),
++            "observation_confidence": 'READ_ONLY' if blocked() else 'RUNTIME',
+             "project": project_for_task(meta),
+             "machine": meta.get("machine", "-"),
+             "agent": meta.get("agent", "-"),
+@@ -702,6 +770,9 @@ def worker_lease_evidence(directory, meta, state, code, refresh_remote=False):
+ 
+ def reconcile_remote_observation(directory, meta, state, code):
+     """Use an existing fresh report probe, without repeating SSH or a stale write."""
++    from external_effects import blocked
++    if blocked():
++        return
+     try:
+         with exclusive(DATA_DIR.parent / 'worker.lock'):
+             snapshot = {k: v for k, v in meta.items() if k != '_runtime_health'}
+@@ -716,6 +787,9 @@ def reconcile_remote_observation(directory, meta, state, code):
+ 
+ def reconcile_workers(refresh_remote=False):
+     """Bounded self-healing; skipped remote probes leave leases unclassified."""
++    from external_effects import blocked
++    if blocked():
++        return
+     try:
+         with exclusive(DATA_DIR.parent / 'worker.lock'):
+             started = time.monotonic()
+@@ -759,6 +833,8 @@ def certify_local_absent(task_id, generation, *, control_group_reset_verified=Fa
+     The reset is external evidence asserted by the caller, not inferred from PIDs.
+     No startup or reconciliation path calls this helper.
+     """
++    from external_effects import refuse
++    refuse('worker')
+     if control_group_reset_verified is not True:
+         raise ValueError('A verified complete MCP control-group reset is required')
+     with exclusive(DATA_DIR.parent / 'worker.lock', blocking=True):
+@@ -788,6 +864,8 @@ def adopt_task(
+     model=None,
+     effort=None,
+ ):
++    from external_effects import refuse
++    refuse('worker')
+     projects = load_projects()
+ 
+     if project not in projects:
+@@ -1144,6 +1222,9 @@ def preflight_task(operation, arguments):
+         if receipt.get('status') == 'FENCED':
+             return {'status': 'FENCED', 'launch_started': False}
+         return {'status': 'REPLAY'}
++    from external_effects import blocked, refuse
++    if blocked():
++        refuse('worker')
+     if request_id and (task_dir(request_id[:24]) / 'meta.json').exists() and operation == 'start_task':
+         raise RuntimeError('Existing task metadata without request receipt; inspect worker ownership before retrying')
+     # Bound read-only discovery independently from the full issue transition.
+@@ -1183,6 +1264,8 @@ def preflight_task(operation, arguments):
+ def run_agent(machine, agent, workspace, prompt, model=None, effort=None,
+               request_id=None, role="coding", execution_profile=None, execution_options=None,
+               review_binding=None, repository_binding=None):
++    from external_effects import refuse
++    refuse('worker')
+     worker_runtime.valid_request(request_id)
+     task_id = request_id[:24] if request_id else uuid.uuid4().hex[:12]
+     with exclusive(DATA_DIR.parent / "worker.lock", blocking=True):
+@@ -1508,6 +1591,8 @@ def find_cursor_session_id(task_id):
+ 
+ 
+ def continue_task(task_id, prompt, request_id=None):
++    from external_effects import refuse
++    refuse('worker')
+     with exclusive(DATA_DIR.parent / "worker.lock", blocking=True):
+         meta = load_meta(task_id)
+         project = project_for_task(meta)
+@@ -1800,12 +1885,15 @@ def task_output(meta, directory):
+ 
+ 
+ def task_report(task_id, as_json=False):
+-    reconcile_workers()
++    from external_effects import blocked
++    quiet = blocked()
++    if not quiet:
++        reconcile_workers()
+     directory = task_dir(task_id)
+     meta = load_meta(task_id)
+ 
+     state, exit_code = task_state(meta, directory)
+-    if meta.get('remote_key'):
++    if meta.get('remote_key') and not quiet:
+         reconcile_remote_observation(directory, meta, state, exit_code)
+ 
+     output = task_output(meta, directory)
+@@ -1819,7 +1907,7 @@ def task_report(task_id, as_json=False):
+     if state == "FAILED" and not last_error:
+         last_error = last_non_json
+ 
+-    if session_id and meta.get('runtime_generation'):
++    if session_id and meta.get('runtime_generation') and not quiet:
+         try:
+             runtime_liveness.annotate_session(directory, meta, session_id)
+         except (OSError, ValueError, TypeError):
+@@ -1832,6 +1920,7 @@ def task_report(task_id, as_json=False):
+ 
+     report = {
+         "id": task_id,
++        "observation_confidence": 'READ_ONLY' if quiet else 'RUNTIME',
+         "role": meta.get('role', 'coding'),
+         "runtime_generation": meta.get('runtime_generation'),
+         "launch_request_id": meta.get('launch_request_id'),
+@@ -1902,6 +1991,8 @@ def task_report(task_id, as_json=False):
+ 
+ 
+ def exec_command(machine, command):
++    from external_effects import refuse
++    refuse('worker')
+     return subprocess.run(
+         machine_command(machine, command),
+         stdin=subprocess.DEVNULL,
+diff --git a/mcp_server.py b/mcp_server.py
+index 061f851..46cbfeb 100755
+--- a/mcp_server.py
++++ b/mcp_server.py
+@@ -2,6 +2,7 @@
+ 
+ import json
+ import asyncio
++import os
+ from concurrent.futures import ThreadPoolExecutor
+ from functools import partial, wraps
+ import subprocess
+@@ -32,7 +33,16 @@ def io_tool(function):
+     lane = 'work' if function.__name__ in ('start_task', 'continue_task', 'adopt_task', 'preflight_task') else 'control'
+     @wraps(function)
+     async def handler(*args, **kwargs):
+-        return await asyncio.get_running_loop().run_in_executor(TOOL_POOLS[lane], partial(function, *args, **kwargs))
++        from external_effects import blocked
++        latched = blocked()
++        result = await asyncio.get_running_loop().run_in_executor(TOOL_POOLS[lane], partial(function, *args, **kwargs))
++        if function.__name__ in ('get_task_report', 'list_tasks', 'get_task_observation', 'list_task_observations') and (latched or blocked() or kwargs.get('read_only')):
++            # Retain dispatch provenance across environment changes in flight.
++            if isinstance(result, list):
++                result = [dict(row, observation_confidence='READ_ONLY') for row in result]
++            else:
++                result = dict(result, observation_confidence='READ_ONLY')
++        return result
+     mcp.tool()(handler)
+     return function  # Preserve the direct, synchronous CLI-adapter test contract.
+ 
+@@ -41,7 +51,8 @@ def load_projects() -> dict:
+     return json.loads(PROJECTS_FILE.read_text())
+ 
+ 
+-def devctl_result(*args: str, timeout: int = 30):
++def devctl_result(*args: str, timeout: int = 30, read_only: bool = False):
++    from external_effects import ENV
+     return subprocess.run(
+         [str(DEVCTL), *args],
+         cwd=ROOT,
+@@ -50,11 +61,12 @@ def devctl_result(*args: str, timeout: int = 30):
+         stderr=subprocess.STDOUT,
+         text=True,
+         timeout=timeout,
++        **({'env': dict(os.environ, **{ENV: '1'})} if read_only else {}),
+     )
+ 
+ 
+-def devctl(*args: str, timeout: int = 30) -> str:
+-    result = devctl_result(*args, timeout=timeout)
++def devctl(*args: str, timeout: int = 30, read_only: bool = False) -> str:
++    result = devctl_result(*args, timeout=timeout, **({'read_only': True} if read_only else {}))
+     output = result.stdout.strip()
+ 
+     if result.returncode in (2, 3):
+@@ -107,6 +119,9 @@ def get_transition_capabilities() -> dict:
+ @io_tool
+ def inspect_start_request(request_id: str, fence: bool = False) -> dict:
+     """Inspect a start receipt; optionally fence only a proven unaccepted request."""
++    if fence:
++        from external_effects import refuse
++        refuse('worker')
+     args = ['inspect-start-request', request_id]
+     if fence:
+         args.append('--fence')
+@@ -131,6 +146,8 @@ def start_task(
+ 
+     Uses the project's default agent unless agent is explicitly specified.
+     """
++    from external_effects import refuse
++    refuse('worker')
+     projects = load_projects()
+ 
+     if project not in projects:
+@@ -187,17 +204,25 @@ def start_task(
+ 
+ 
+ @io_tool
+-def get_task_report(task_id: str) -> dict:
++def get_task_report(task_id: str, read_only: bool = False) -> dict:
+     """Return task status and latest concise result."""
+     return json.loads(
+-        devctl("report", task_id, "--json")
++        devctl("report", task_id, "--json", **({'read_only': True} if read_only else {}))
+     )
+ 
+ 
++@io_tool
++def get_task_observation(task_id: str) -> dict:
++    """Always read-only, including when the MCP server itself is unlatched."""
++    return get_task_report(task_id, read_only=True)
++
++
+ @io_tool
+ def continue_task(task_id: str, prompt: str, request_id: str | None = None,
+                   role: Literal["coding", "review"] = "coding") -> dict:
+     """Continue the same Codex or Cursor session."""
++    from external_effects import refuse
++    refuse('worker')
+     args = ["continue", task_id, prompt]
+     if request_id:
+         args += ["--request-id", request_id]
+@@ -212,14 +237,20 @@ def continue_task(task_id: str, prompt: str, request_id: str | None = None,
+ 
+ 
+ @io_tool
+-def list_tasks(control: bool = False, project: str | None = None) -> list:
++def list_tasks(control: bool = False, project: str | None = None, read_only: bool = False) -> list:
+     """Control reads target worker ownership without running recovery sweeps."""
+     args = ["tasks", "--json", "--cached"]
+     if control:
+         args += ["--control"]
+         if project:
+             args += ["--control-project", project]
+-    return json.loads(devctl(*args))
++    return json.loads(devctl(*args, **({'read_only': True} if read_only else {})))
++
++
++@io_tool
++def list_task_observations(control: bool = False, project: str | None = None) -> list:
++    """Always read-only; an older server cannot silently drop a mode argument."""
++    return list_tasks(control, project, read_only=True)
+ 
+ 
+ @io_tool
+@@ -232,6 +263,8 @@ def adopt_task(
+     effort: str | None = None,
+ ) -> dict:
+     """Register an existing agent session as a DevOrchestrator task."""
++    from external_effects import refuse
++    refuse('worker')
+     args = [
+         "adopt",
+         project,
+@@ -263,6 +296,8 @@ def orchestrator_health() -> dict:
+     READY and DEGRADED have ok=true; FAILED has ok=false and blocks rollout.
+     MCP/project identity and task-list transport still require separate checks.
+     """
++    from external_effects import refuse
++    refuse('worker')
+     try:
+         result = devctl_result('doctor', '--json', timeout=MCP_HEALTH_TIMEOUT)
+         report = validate_health(json.loads(result.stdout))
+diff --git a/mcp_smoke.py b/mcp_smoke.py
+index 1e2f812..6463858 100644
+--- a/mcp_smoke.py
++++ b/mcp_smoke.py
+@@ -5,6 +5,10 @@ from health import validate_health
+ 
+ 
+ async def main():
++    from external_effects import refuse
++    # This legacy client requests doctor/recovery on a separately running MCP.
++    # Its local environment cannot latch that server over the wire.
++    refuse('worker')
+     async with Client(MCP_URL) as client:
+         tools = await client.list_tools()
+ 
+diff --git a/notifications.py b/notifications.py
+index d5169af..4716a96 100644
+--- a/notifications.py
++++ b/notifications.py
+@@ -62,6 +62,8 @@ def send(text, opener=None, sleep=time.sleep):
+     The normal transport runs in a killable subprocess with a wall-clock bound;
+     even a server trickling response bytes cannot keep the bridge blocked.
+     """
++    from external_effects import refuse
++    refuse('telegram')
+     token, chat = os.environ.get('TELEGRAM_BOT_TOKEN'), os.environ.get('TELEGRAM_CHAT_ID')
+     if not token or not chat:
+         return False
+diff --git a/operational_state.py b/operational_state.py
+index 2356905..85a5a93 100644
+--- a/operational_state.py
++++ b/operational_state.py
+@@ -63,6 +63,8 @@ def chief_repository_hold(item):
+ 
+ 
+ def lifecycle_state(item):
++    if item.get('safety_latch_hold'):
++        return 'OBSERVATION_HELD'
+     if exclusion_reason(item):
+         return 'ARCHIVED'
+     if item.get('merged') and not merge_convergence_complete(item):
+@@ -95,6 +97,8 @@ def lifecycle_state(item):
+ 
+ def next_action(item, report=None):
+     state = lifecycle_state(item)
++    if state == 'OBSERVATION_HELD':
++        return 'INSPECT_SAFETY_LATCH_AUTHORIZATION'
+     if state == 'ARCHIVED':
+         return 'NONE'
+     if any(key in item.get('consistency_diagnostics', {}) for key in ('review_migration', 'review_request')):
+diff --git a/publication.py b/publication.py
+index 398e29e..7f25a4e 100644
+--- a/publication.py
++++ b/publication.py
+@@ -69,6 +69,8 @@ class Repository:
+             raise PublicationError('Task no longer matches registered workspace')
+ 
+     def run(self, *args):
++        from external_effects import refuse
++        refuse('publication')
+         merge_api = (args[:6] == ('gh', 'api', '--hostname', 'github.com', '--method', 'PUT') and
+                      len(args) > 6 and re.fullmatch(
+                          r'repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pulls/[1-9][0-9]*/merge', args[6]))
+@@ -104,6 +106,8 @@ class Repository:
+         return self.run('git', *args)
+ 
+     def snapshot(self):
++        from external_effects import refuse
++        refuse('publication')
+         result = devctl.capture(self.machine, shlex.join([
+             'python3', '-c', SNAPSHOT_SCRIPT, self.workspace]), separate_stderr=True)
+         if result.returncode:
+@@ -112,6 +116,8 @@ class Repository:
+ 
+     def review_evidence(self, snapshot):
+         """Local registered workspace and freshly verified object IDs only."""
++        from external_effects import refuse
++        refuse('publication')
+         from chief_evidence import EVIDENCE_SCRIPT
+         result = devctl.capture(self.machine, shlex.join([
+             'python3', '-c', EVIDENCE_SCRIPT, self.workspace,
+@@ -285,16 +291,37 @@ def _prove_non_merge_steps(repo, item, persist, *, allow_open=False):
+     return True
+ 
+ 
++def _merge_send_latched(item, entry):
++    """True only after a merge send was authorized or its result is already durable.
++
++    A journal command, base and repo are the pre-send record. They are not
++    authorization to invent a PENDING attempt.
++    """
++    convergence = item.get('post_merge_convergence') or {}
++    if item.get('merged') or item.get('owner_state') == 'MERGED':
++        return True
++    if entry.get('outcome') in ('PENDING', 'MERGED', 'NOT_MERGED'):
++        return True
++    if entry.get('dispatch_state') in ('SENDING', 'RETURNED'):
++        return True
++    if convergence.get('status') in ('PENDING', 'BLOCKED', 'DONE', 'NOT_REQUIRED', 'NOT_MERGED'):
++        return True
++    return convergence.get('refusal_http_status') is not None
++
++
+ def _execute_steps(repo, item, report, command, persist, *, reconcile_only=False):
+     """Failed preconditions cannot erase an uncertain earlier external effect."""
+     try:
+         return (yield from __execute_steps(repo, item, report, command, persist, reconcile_only=reconcile_only))
+     except PublicationError:
+-        if command.get('action') == 'MERGE' and (
+-                item.get('post_merge_convergence') or {}).get('status') != 'NOT_MERGED':
++        entry = ((item.get('publication_journal') or {}).get('MERGE') or {})
++        if (command.get('action') == 'MERGE' and
++                (item.get('post_merge_convergence') or {}).get('status') != 'NOT_MERGED' and
++                not (reconcile_only and not _merge_send_latched(item, entry))):
+             # Also inspect after early permanent errors (dirty tree, stale Chief,
+             # moved refs). A CLOSED observation can settle a previous uncertainty
+             # without authorizing a publication or changing any Git history.
++            # Archived recovery with no latched send must not invent that record.
+             (yield from _prove_non_merge_steps(repo, item, persist))
+         raise
+ 
+@@ -437,6 +464,12 @@ def __execute_steps(repo, item, report, command, persist, *, reconcile_only=Fals
+                             (('branch', branch), ('base', base), ('method', method)))):
+                     raise PublicationError('Post-merge convergence assessment changed')
+                 if pr['state'] != 'MERGED':
++                    if reconcile_only:
++                        # A bound MERGED observation above is reconciliation.
++                        # Anything else needs a send that already happened.
++                        if not _merge_send_latched(item, entry):
++                            raise PublicationError('Archived recovery cannot authorize a new merge')
++                        raise PublicationError('Archived recovery cannot repeat a merge send')
+                     uncertain_retry = convergence is not None and convergence.get('status') == 'PENDING'
+                     # Assess only a new publication, before the external mutation.
+                     # A merged historical PR with no record must remain archival.
+diff --git a/remote_worker.py b/remote_worker.py
+index 9def2a7..b4d6a50 100644
+--- a/remote_worker.py
++++ b/remote_worker.py
+@@ -43,6 +43,19 @@ def identity(pid):
+         return fields[19]
+     except OSError: return None
+ boot = pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip()
++if os.environ.get('DEVORCHESTRATOR_BLOCK_EXTERNAL_EFFECTS') == '1':
++    if mode != 'report':
++        raise RuntimeError('External worker effect blocked')
++    # Direct script invocation must be observational too: no mkdir, lock,
++    # watchdog write, cleanup or successful completion from cached status.
++    path = root / 'events.jsonl'
++    chunk = b''; more = False
++    if path.exists():
++        with path.open('rb') as log:
++            log.seek(int(sys.argv[3])); chunk = log.read(524288); more = bool(log.read(1))
++    print(json.dumps(dict(status='UNKNOWN', exit_code=None, cleanup_state='ACTIVE',
++        observation_confidence='READ_ONLY', chunk=base64.b64encode(chunk).decode(), more=more)))
++    raise SystemExit(0)
+ root.mkdir(parents=True, exist_ok=True, mode=0o700)
+ # Concurrent/replayed SSH invocations must share a single launch receipt.
+ import fcntl
+@@ -96,7 +109,10 @@ with (root / 'lock').open('a') as lock:
+                 health = runtime_liveness.watchdog(root, context)
+                 status, code = runtime_liveness.task_status(health)
+                 import worker_runtime
+-                cleanup = worker_runtime.cleanup_group(root, context, status)
++                if os.environ.get('DEVORCHESTRATOR_BLOCK_EXTERNAL_EFFECTS') == '1':
++                    cleanup = 'ACTIVE'
++                else:
++                    cleanup = worker_runtime.cleanup_group(root, context, status)
+                 extra = dict(liveness=record, runtime_health=health, cleanup_state=cleanup)
+             # Observe exit before reading logs. A process that exits while this
+             # chunk is being read must not make an incomplete chunk final.
+@@ -115,6 +131,8 @@ SCRIPT = SCRIPT.replace('runner = BUNDLE +', 'runner = ' + repr(BUNDLE) + ' +')
+ 
+ 
+ def rpc(machine, mode, key, value, context=None):
++    from external_effects import refuse
++    refuse('worker')
+     import devctl
+     args = ['python3', '-c', SCRIPT, mode, key, str(value)]
+     if context is not None:
+@@ -131,7 +149,16 @@ def start(machine, key, command, context=None):
+     return rpc(machine, 'start', key, command, context)
+ 
+ 
++def cached_refresh(meta, directory):
++    """Share local read-only diagnosis; cached status is never authority."""
++    from devctl import stored_task_status
++    return stored_task_status(meta, directory)
++
++
+ def refresh(meta, directory):
++    from external_effects import blocked
++    if blocked():
++        return cached_refresh(meta, directory)
+     from durable import exclusive, read_json
+     with exclusive(directory / 'remote-refresh.lock', blocking=True):
+         meta.update(read_json(directory / 'meta.json'))
+@@ -140,6 +167,9 @@ def refresh(meta, directory):
+ 
+ 
+ def _refresh(meta, directory):
++    from external_effects import blocked
++    if blocked():
++        return cached_refresh(meta, directory)
+     from durable import exclusive, read_json
+     key = meta['remote_key']
+     log = directory / 'events.jsonl'
+diff --git a/runtime_liveness.py b/runtime_liveness.py
+index c896b42..1a6b390 100644
+--- a/runtime_liveness.py
++++ b/runtime_liveness.py
+@@ -182,6 +182,12 @@ def watchdog(directory, meta, *, probe=True, terminal=None, clock=None, evidence
+     Only semantic transitions write runtime_health.json, making repeated ticks
+     idempotent; elapsed heartbeat ages are calculated at read time.
+     """
++    # Same variable as external_effects.ENV. The SSH worker bundle cannot import it.
++    if os.environ.get('DEVORCHESTRATOR_BLOCK_EXTERNAL_EFFECTS') == '1':
++        return dict(state='UNKNOWN', reason='reconciliation_blocked',
++                    observation_confidence='READ_ONLY', generation=meta.get('runtime_generation'),
++                    worker_alive=None, process_alive=None, phase='UNKNOWN', exit_code=None,
++                    lease_state='UNKNOWN', heartbeat_age_seconds=None)
+     now = time.time() if clock is None else clock
+     with nullcontext() if read_only else exclusive(directory / 'liveness.lock', blocking=True):
+         record = None
+@@ -255,6 +261,8 @@ def task_status(health):
+ 
+ 
+ def final_report_missing(directory, meta):
++    if os.environ.get('DEVORCHESTRATOR_BLOCK_EXTERNAL_EFFECTS') == '1':
++        return
+     with exclusive(directory / 'liveness.lock', blocking=True):
+         record = validate(read_record(directory), meta)
+         if record['exit_code'] == 0 and record.get('terminal_reason') == 'process_exited':
+@@ -264,6 +272,8 @@ def final_report_missing(directory, meta):
+ 
+ def annotate_session(directory, meta, session_id):
+     """Session discovery is activity metadata, never a heartbeat/lease refresh."""
++    if os.environ.get('DEVORCHESTRATOR_BLOCK_EXTERNAL_EFFECTS') == '1':
++        return
+     with exclusive(directory / 'liveness.lock', blocking=True):
+         record = validate(read_record(directory), meta)
+         if type(session_id) is str and 0 < len(session_id) <= 512 and record['session_id'] != session_id:
+@@ -273,6 +283,8 @@ def annotate_session(directory, meta, session_id):
+ 
+ def run(directory, generation, command):
+     """Supervise independently of stdout; no silence-based kills/retries."""
++    if os.environ.get('DEVORCHESTRATOR_BLOCK_EXTERNAL_EFFECTS') == '1':
++        raise RuntimeError('External worker effect blocked')
+     directory = Path(directory)
+     record = validate(read_record(directory))
+     if record['generation'] != generation:
+diff --git a/scheduler.py b/scheduler.py
+index 752df90..4d27a41 100644
+--- a/scheduler.py
++++ b/scheduler.py
+@@ -162,6 +162,8 @@ class Scheduler:
+     def release(self, owner):
+         from operational_state import chief_repository_hold, post_merge_repository_hold, publication_repository_hold
+         item = self.state.get('issues', {}).get(str(owner))
++        if isinstance(item, dict) and item.get('safety_latch_hold'):
++            return False
+         from review_transitions import holds_repository
+         if item is not None and holds_repository(item):
+             return False
+@@ -179,6 +181,13 @@ class Scheduler:
+ 
+     def recover(self, tasks, identity_resolver=None):
+         """Import active legacy/direct tasks; never steal an uncertain lock."""
++        from external_effects import blocked
++        if blocked():
++            return  # Observations cannot settle or manufacture queue ownership.
++        held_tasks = {task_id for item in self.state.get('issues', {}).values()
++                      if isinstance(item, dict) and item.get('safety_latch_hold')
++                      for task_id in (item.get('task_id'), item.get('review_task_id')) if task_id}
++        tasks = [t for t in tasks if t.get('observation_confidence') != 'READ_ONLY' and t.get('id') not in held_tasks]
+         identity_resolver = identity_resolver or project_identity
+         for task in tasks:
+             project = task.get('project')
+@@ -220,7 +229,8 @@ class Scheduler:
+         # admission predicate also honors this hold before recovery can run.
+         for key, job in self.jobs.items():
+             item = self.state.get('issues', {}).get(str(job['owner']), {})
+-            if job.get('repo') and (post_merge_repository_hold(item) or holds_repository(item) or publication_repository_hold(item)):
++            if job.get('repo') and (item.get('safety_latch_hold') or post_merge_repository_hold(item) or
++                                    holds_repository(item) or publication_repository_hold(item)):
+                 self.locks.setdefault(job['repo'], {'owner': job['owner'], 'key': key})
+         for repo, lock in list(self.locks.items()):
+             jobs = [j for j in self.jobs.values() if j.get('repo') == repo and j.get('owner') == lock.get('owner')]
+@@ -230,6 +240,8 @@ class Scheduler:
+             if diagnostics.get(repo) == 'Lock retained: missing queue ownership proof':
+                 diagnostics.pop(repo)
+             item = self.state.get('issues', {}).get(str(lock.get('owner')))
++            if isinstance(item, dict) and item.get('safety_latch_hold'):
++                continue
+             from review_transitions import holds_repository
+             if item is not None and holds_repository(item):
+                 continue
+diff --git a/task_bridge.py b/task_bridge.py
+index 646a82a..d43f01d 100755
+--- a/task_bridge.py
++++ b/task_bridge.py
+@@ -118,6 +118,8 @@ MAX_REVIEW_FORMAT_RESTARTS = 1
+ 
+ 
+ def gh(*args):
++    from external_effects import guard_github
++    guard_github(args)
+     result = subprocess.run(
+         ["gh", *args],
+         stdin=subprocess.DEVNULL,
+@@ -146,6 +148,8 @@ def send_telegram(text):
+ 
+ 
+ def notify(status, issue, item, report=None, blocker=None):
++    if WORK_CONTEXT and observation_barrier(WORK_CONTEXT[0], WORK_CONTEXT[1], report):
++        return
+     if exclusion_reason(item, issue):
+         return
+     text = redact(notifications.terminal_text(status, issue, item, report, blocker,
+@@ -659,13 +663,17 @@ def invalidate_quality_gates(item):
+ 
+ def coding_report_successful(report, item):
+     turn = report.get('turns')
+-    return (report.get('id') == item.get('task_id') and report.get('status') == 'DONE' and
++    return (not item.get('safety_latch_hold') and report.get('observation_confidence') != 'READ_ONLY' and
++            report.get('id') == item.get('task_id') and report.get('status') == 'DONE' and
+             type(report.get('exit_code')) is int and report['exit_code'] == 0 and
+             type(turn) is int and turn > 0 and turn == item.get('coding_turn', turn))
+ 
+ 
+ def observe_coding_turn(item, state, report):
+     """Invalidate reviews on mutable/new coding turns, never adopt old review evidence."""
++    number = next((n for n, tracked in state['issues'].items() if tracked is item), None)
++    if number is not None and observation_barrier(state, number, report):
++        return
+     if exclusion_reason(item) or report.get('id') != item.get('task_id'):
+         return
+     turn = report.get('turns')
+@@ -909,6 +917,39 @@ def load_state():
+     return bridge_telemetry.durable_state(state)
+ 
+ 
++def observation_barrier(state, number, report=None):
++    """One writer boundary for all read-only/cached observation consumers.
++
++    A sticky hold prevents later reconciliation from regenerating effects from
++    smoke state. It is cleared only by an audited, explicit owner recovery,
++    never by removing the environment latch or by a later automatic poll.
++    """
++    from external_effects import blocked
++    number = str(number)
++    if blocked() or (report or {}).get('observation_confidence') == 'READ_ONLY':
++        bridge_effects.hold_observation(state, number)
++        save_state(state)  # Must precede any lifecycle application or dispatch.
++        return True
++    return bridge_effects.observation_held(state, number)
++
++
++async def observe_latched_poll(state):
++    """No lifecycle reducers, scheduler recovery or command consumption."""
++    global WORK_CONTEXT
++    WORK_CONTEXT = None
++    for number, item in state['issues'].items():
++        if not str(number).isdigit() or not isinstance(item, dict):
++            continue
++        # Hold before I/O, including failed reads and legacy smoke projections.
++        if item.get('task_id') or item.get('review_task_id'):
++            observation_barrier(state, number)
++        for task_id in {item.get('task_id'), item.get('review_task_id')} - {None}:
++            try:
++                await rpc_io('get_task_report', {'task_id': task_id})
++            except Exception:
++                pass  # Failed observations cannot grant workflow authority.
++
++
+ def save_state(state):
+     # Semantic workflow first; optional display telemetry is never recovery
+     # authority. A failed checkpoint must stop the resumable lifecycle writer.
+@@ -958,6 +999,8 @@ def archive_issue(issue, item, state):
+ 
+ 
+ def reconcile_projection(issue, item, state):
++    if observation_barrier(state, issue['number']):
++        return
+     if exclusion_reason(item, issue):
+         return
+     global WORK_CONTEXT
+@@ -1068,6 +1111,8 @@ def transition_issue(issue, target):
+     if not WORK_CONTEXT:
+         return raw_transition_issue(issue, target)
+     state, number, item = WORK_CONTEXT
++    if observation_barrier(state, number):
++        return
+     if exclusion_reason(item, issue):
+         return
+     event = [target, item.get("task_id"), item.get("review_task_id"), item.get("review_round"),
+@@ -1088,6 +1133,8 @@ def add_comment(number, body):
+     if not WORK_CONTEXT:
+         return raw_add_comment(number, body)
+     state, _, item = WORK_CONTEXT
++    if observation_barrier(state, number):
++        return
+     if exclusion_reason(item):
+         return
+     bridge_effects.enqueue(state, number, "comment", body)
+@@ -1111,6 +1158,8 @@ def merge_complete(item):
+ 
+ 
+ def project_merge(issue, item, state):
++    if observation_barrier(state, issue['number']):
++        return
+     """Completion is a durable projection only, independent of Git history."""
+     if not merge_complete(item):
+         return
+@@ -1127,9 +1176,17 @@ def flush_effects(state, reconciled=True, control_fresh=None, telegram_dispatch=
+ 
+ 
+ async def flush_effects_async(state, reconciled=True, control_fresh=None, telegram_dispatch=None, telegram_inflight=(), *, owners=None):
++    from external_effects import blocked
++    if blocked():
++        for number, item in state['issues'].items():
++            if (isinstance(item, dict) and (item.get('task_id') or item.get('review_task_id')) and
++                    (owners is None or str(number) in owners)):
++                observation_barrier(state, number)
+     telegram_issues = {}  # Fresh display views; never installed in the outbox.
+     suppressed = False
+     for entry in state.get('outbox', {}).values():
++        if entry.get('status') == 'QUARANTINED' or entry.get('effect_origin') in ('safety_latch', 'legacy_unverified'):
++            continue
+         if owners is not None and str(entry['number']) not in owners:
+             continue
+         item = state.get('issues', {}).get(str(entry['number']), {})
+@@ -1300,6 +1357,9 @@ async def flush_effects_async(state, reconciled=True, control_fresh=None, telegr
+                 entry['completion_comment'] = 'UNCERTAIN'
+                 save_state(state)
+                 raise PublicationError('Completion comment acceptance uncertain; reconcile existing receipt')
++            from external_effects import blocked, ExternalEffectBlocked
++            if blocked():
++                raise ExternalEffectBlocked('github')
+             entry['completion_comment'] = 'SENDING'
+             save_state(state)
+             (await io_call('post_comment', dict(number=number, body='Owner action MERGE: ALLOWED; state MERGED. Workflow completed.\n\n' + marker), lane='effect'))
+@@ -1330,13 +1390,18 @@ async def flush_effects_async(state, reconciled=True, control_fresh=None, telegr
+             continue
+         if not isinstance(item, dict) or exclusion_reason(item):
+             continue
++        if bridge_effects.observation_held(state, number):
++            continue
+         pending = [e for e in state.get('outbox', {}).values() if str(e['number']) == str(number) and
+                    e['kind'] in ('transition', 'comment', 'chief_comment') and e['status'] != 'DONE']
+         if pending:
++            from external_effects import blocked
+             repeated = any(e.get('attempts', 0) >= 3 or e['status'] in ('UNCERTAIN', 'FAILED') for e in pending)
+-            item.setdefault('projection', {})['health'] = 'ERROR' if repeated else 'DRIFT'
+-            if repeated:
+-                item.setdefault('consistency_diagnostics', {})['projection'] = 'External projection incomplete after repeated delivery failures'
++            # A smoke withhold is not a failed delivery. UNCERTAIN receipts still count.
++            if not (blocked() and all(e.get('status') == 'PENDING' for e in pending)):
++                item.setdefault('projection', {})['health'] = 'ERROR' if repeated else 'DRIFT'
++                if repeated:
++                    item.setdefault('consistency_diagnostics', {})['projection'] = 'External projection incomplete after repeated delivery failures'
+         elif item.get('desired_label') and item.get('projection', {}).get('target') == item['desired_label']:
+             item['projection']['health'] = 'SYNCED'
+             item.setdefault('consistency_diagnostics', {}).pop('projection', None)
+@@ -1395,6 +1460,8 @@ def task_execution_request(issue):
+ 
+ 
+ async def transport_call(name, arguments):
++    from external_effects import guard_worker_rpc
++    guard_worker_rpc(name, arguments)
+     return await asyncio.wait_for(_transport_call(name, arguments), timeout=120)
+ 
+ 
+@@ -1404,7 +1471,14 @@ async def rpc_io(name, arguments):
+         item = WORK_CONTEXT[2]
+         if item.get('chief_review') or item.get('chief_required') or item.get('owner_state'):
+             lane = 'control_rpc'
+-    return await io_call('rpc', dict(name=name, arguments=arguments), lane=lane)
++    result = await io_call('rpc', dict(name=name, arguments=arguments), lane=lane)
++    if WORK_CONTEXT and (name in ('get_task_report', 'get_task_observation') or
++                         (isinstance(result, dict) and result.get('observation_confidence') == 'READ_ONLY')):
++        state, number, _ = WORK_CONTEXT
++        if observation_barrier(state, number, result):
++            from external_effects import ExternalEffectBlocked
++            raise ExternalEffectBlocked('observation')
++    return result
+ 
+ 
+ async def comments_io(number):
+@@ -1427,6 +1501,9 @@ def publication_authority(item):
+ def authorize_dispatch(number, command, state, issue):
+     """Writer-only last check, including commands waiting for I/O capacity."""
+     item = state['issues'][str(number)]
++    if observation_barrier(state, number):
++        from external_effects import ExternalEffectBlocked
++        raise ExternalEffectBlocked('observation')
+     if issue and str(issue.get('state', '')).upper() == 'CLOSED':
+         archive_issue(issue, item, state)
+     if command.authorization is not None:
+@@ -1483,6 +1560,8 @@ def archived_reconciliation_pending(item):
+ async def reconcile_archived(issue, item, state):
+     """Reconcile existing authority; closed issues never authorize a new send."""
+     number = str(issue['number'])
++    if observation_barrier(state, number):
++        return
+     pending = item.get('pending_rpc')
+     if pending:
+         if pending.get('name') != 'start_task':
+@@ -1546,18 +1625,25 @@ async def reconcile_archived(issue, item, state):
+ 
+ async def _transport_call(name, arguments):
+     from mcp import Client
++    from external_effects import blocked
++    tool_name = name
++    if blocked():
++        # A distinct tool name fails closed on old MCP servers. Unknown mode
++        # arguments can be silently dropped by an older SDK's input model.
++        tool_name = {'get_task_report': 'get_task_observation',
++                     'list_tasks': 'list_task_observations'}.get(name, name)
+     async with Client(MCP_URL) as client:
+-        result = await client.call_tool(name, arguments)
++        result = await client.call_tool(tool_name, arguments)
+ 
+     return decode_mcp_result(name, result)
+ 
+ 
+ # Return contracts from mcp_server.py. A project registry is an object even though
+ # it contains multiple projects; only list_tasks has collection-valued output.
+-MCP_COLLECTION_TOOLS = frozenset({"list_tasks"})
++MCP_COLLECTION_TOOLS = frozenset({"list_tasks", "list_task_observations"})
+ MCP_OBJECT_TOOLS = frozenset({"list_projects", "get_task_report", "start_task",
+                               "continue_task", "adopt_task", "orchestrator_health", "get_execution_catalog", "preflight_task",
+-                              "get_transition_capabilities", "inspect_start_request"})
++                              "get_transition_capabilities", "inspect_start_request", "get_task_observation"})
+ 
+ 
+ def decode_mcp_result(name, result):
+@@ -1669,7 +1755,12 @@ async def mcp_call(name, arguments):
+             Scheduler(state).observe(arguments["task_id"], result.get("status"), result.get('cleanup_state'))
+             save_state(state)
+         return result
++    from external_effects import blocked, ExternalEffectBlocked
++    if blocked():
++        raise ExternalEffectBlocked('worker')
+     state, number, item = WORK_CONTEXT
++    if observation_barrier(state, number):
++        raise ExternalEffectBlocked('observation')
+     from operational_state import post_merge_repository_hold
+     if post_merge_repository_hold(item) or review_transitions.holds_repository(item):
+         # Keep the original quality gates and merge journal intact for retry.
+@@ -1888,6 +1979,8 @@ def project_runtime_health(issue, item, state, report, slot='coding'):
+     review or publication is authorized by these observations. External labels
+     cannot override the durable local report, including on duplicate ticks.
+     """
++    if observation_barrier(state, issue['number'], report):
++        return True
+     if exclusion_reason(item, issue):
+         return False
+     health = report.get('liveness')
+@@ -1927,6 +2020,9 @@ async def start_queued(issue, state, *, progress=None):
+     WORK_CONTEXT = (state, number, state["issues"].setdefault(number, {"queue_status": "QUEUED"}))
+     if archive_issue(issue, state['issues'][number], state):
+         return
++    from external_effects import blocked
++    if blocked():
++        return
+ 
+     progress = progress if progress is not None else {}
+     token = RECONCILIATION_PROGRESS.set(progress)
+@@ -2033,6 +2129,9 @@ async def start_queued(issue, state, *, progress=None):
+         notify("FAILED", issue, item, blocker=str(exc))
+         save_state(state)
+     except Exception as exc:
++        from external_effects import ExternalEffectBlocked
++        if isinstance(exc, ExternalEffectBlocked):
++            return
+         # An RPC failure may mean the agent started. Keep its reservation and retry the same request ID.
+         defer_issue(state["issues"][number], state, number, exc, stage=progress.get('stage'))
+     finally:
+@@ -2068,13 +2167,14 @@ def stale_chief(item, state, number, diagnostic):
+ def chief_tree_current(item, state, number):
+     if exclusion_reason(item):
+         return False
++    from external_effects import ExternalEffectBlocked
+     try:
+         chief_review.validate_identity(item['chief_review']['identity'], item)
+         if Repository(item['project']).snapshot() != item['reviewed_tree']:
+             stale_chief(item, state, number, 'Repository changed after independent PASS; fresh independent review and Chief bundle required.')
+             return False
+         return True
+-    except PublicationError:
++    except (PublicationError, ExternalEffectBlocked):
+         return False  # Unavailable evidence cannot authorize a send or verdict.
+     except (ValueError, KeyError, TypeError):
+         stale_chief(item, state, number, 'Chief identity is stale; fresh independent review and Chief bundle required.')
+@@ -2084,6 +2184,7 @@ def chief_tree_current(item, state, number):
+ async def chief_tree_current_async(item, state, number):
+     if exclusion_reason(item):
+         return False
++    from external_effects import ExternalEffectBlocked
+     try:
+         chief_review.validate_identity(item['chief_review']['identity'], item)
+         snapshot = await repository_io(Repository(item['project']), 'snapshot')
+@@ -2091,8 +2192,8 @@ async def chief_tree_current_async(item, state, number):
+             stale_chief(item, state, number, 'Repository changed after independent PASS; fresh independent review and Chief bundle required.')
+             return False
+         return True
+-    except PublicationError:
+-        return False
++    except (PublicationError, ExternalEffectBlocked):
++        return False  # Unavailable evidence cannot authorize a send or verdict.
+     except (ValueError, KeyError, TypeError):
+         stale_chief(item, state, number, 'Chief identity is stale; fresh independent review and Chief bundle required.')
+         return False
+@@ -2160,13 +2261,20 @@ async def process_chief_review(issue, item, state, report, *, allow_evidence=Tru
+     save_state(state)
+ 
+     from devctl import DATA_DIR
++    from external_effects import ExternalEffectBlocked
+     with exclusive(DATA_DIR.parent / 'worker.lock', blocking=not DRIVING.get()):
+         repository = Repository(item['project'], report)
+-        snapshot = await repository_io(repository, 'snapshot')
+-        if snapshot != item['reviewed_tree']:
++        try:
++            snapshot = await repository_io(repository, 'snapshot')
++        except ExternalEffectBlocked:
++            snapshot = None
++        if snapshot is None:
++            if not record:
++                return True
++        elif snapshot != item['reviewed_tree']:
+             stale_chief(item, state, str(issue['number']), 'Repository changed after independent PASS; fresh review required.')
+             return True
+-        if not record:
++        if snapshot is not None and not record:
+             coding_data, _ = parse_autopilot_result(report.get('result'))
+             if coding_data:
+                 verification = {name: coding_data[name] for name in ('implementation', 'verification', 'self_review', 'state')}
+@@ -2179,17 +2287,26 @@ async def process_chief_review(issue, item, state, report, *, allow_evidence=Tru
+                 try:
+                     review = await mcp_call('get_task_report', {'task_id': item['review_task_id']})
+                     data, _ = parse_review_result(review.get('result'))
++                except ExternalEffectBlocked:
++                    raise
+                 except Exception:
+                     data = None  # Durable PASS/tree evidence does not depend on log retention.
+                 item['independent_review_summary'] = chief_review.sanitize(data['summary'])[:2000] if (
+                     data and data['verdict'] == 'PASS') else 'Independent PASS recorded in durable bridge state; reviewer summary unavailable.'
+             if evidence is None:
+                 with measure(state, 'chief_evidence'):
+-                    evidence = await repository_io(repository, 'review_evidence', snapshot)
++                    try:
++                        evidence = await repository_io(repository, 'review_evidence', snapshot)
++                    except ExternalEffectBlocked:
++                        return True
+             bodies = chief_review.evidence_comments(identity, item['project'],
+                 repository.cfg.get('github_repo') or snapshot.get('origin') or '(local registered repository)',
+                 item, report, evidence)
+-            if await repository_io(repository, 'snapshot') != snapshot:
++            try:
++                current_snapshot = await repository_io(repository, 'snapshot')
++            except ExternalEffectBlocked:
++                return True
++            if current_snapshot != snapshot:
+                 stale_chief(item, state, str(issue['number']), 'Repository changed during Chief evidence extraction; fresh review required.')
+                 return True
+             keys = [bridge_effects.enqueue(state, issue['number'], 'chief_comment', body,
+@@ -3348,6 +3465,8 @@ def malformed_item(item):
+ 
+ async def process_tracked(issue, item, state, runtime_reports=None, *, initial_report=None, chief_evidence=None,
+                           progress=None):
++    if observation_barrier(state, issue['number'], initial_report):
++        return
+     restore_merged_state(item, state)
+     if merge_complete(item):
+         project_merge(issue, item, state)
+@@ -3488,6 +3607,10 @@ async def process_tracked(issue, item, state, runtime_reports=None, *, initial_r
+         failed = True
+         raise
+     except Exception as exc:
++        from external_effects import ExternalEffectBlocked
++        if isinstance(exc, ExternalEffectBlocked):
++            failed = True
++            return
+         failed = True
+         # Cached observations can still expose expired/uncertain leases when
+         # the worker report RPC is unavailable. Do not leave a stale running
+@@ -3517,6 +3640,10 @@ async def process_tracked(issue, item, state, runtime_reports=None, *, initial_r
+ 
+ 
+ async def tick(state):
++    from external_effects import blocked
++    if blocked():
++        await observe_latched_poll(state)
++        return
+     global WORK_CONTEXT
+     reconciled = False
+     try:
+@@ -3533,6 +3660,8 @@ async def tick(state):
+                     break
+                 if not str(number).isdigit() or not isinstance(item, dict) or exclusion_reason(item) or malformed_item(item):
+                     continue
++                if bridge_effects.observation_held(state, number):
++                    continue
+                 try:
+                     issue = (await io_call('issue', dict(number=number)))
+                     if issue and not archive_issue(issue, item, state):
+@@ -3546,6 +3675,10 @@ async def tick(state):
+ 
+ 
+ async def reconcile_tick(state):
++    from external_effects import blocked
++    if blocked():
++        await observe_latched_poll(state)
++        return
+     global WORK_CONTEXT
+     WORK_CONTEXT = None
+     issues = open_issues()
+@@ -3569,6 +3702,8 @@ async def reconcile_tick(state):
+     for number, item in sorted(list(state["issues"].items()),
+                                key=lambda pair: (not str(pair[0]).isdigit(), int(pair[0]) if str(pair[0]).isdigit() else str(pair[0]))):
+         WORK_CONTEXT = None
++        if bridge_effects.observation_held(state, number):
++            continue
+         if not isinstance(item, dict):
+             item = state["issues"][number] = {"legacy_value": item}
+         if item.get("compatibility_status") == "QUARANTINED":
+@@ -3636,12 +3771,18 @@ def reject_unready_commands(issue, item, state, comments=None):
+ async def control_pass(state, *, telegram_dispatch=None, telegram_inflight=()):
+     """Only the caller mutates lifecycle state. No global recovery prerequisite."""
+     global WORK_CONTEXT
++    from external_effects import blocked
++    if blocked():
++        await observe_latched_poll(state)
++        return
+     fresh = set()
+     with measure(state, 'control_total'):
+         for number, item in list(state['issues'].items()):
+             WORK_CONTEXT = None
+             if not str(number).isdigit() or not isinstance(item, dict):
+                 continue
++            if bridge_effects.observation_held(state, number):
++                continue
+             restore_merged_state(item, state)
+             if merge_complete(item):
+                 project_merge({'number': int(number)}, item, state)
+diff --git a/telegram_setup.py b/telegram_setup.py
+index dbe1094..c0023be 100755
+--- a/telegram_setup.py
++++ b/telegram_setup.py
+@@ -13,6 +13,8 @@ ENV_FILE = CONFIG_DIR / "telegram.env"
+ 
+ 
+ def api(token, method, data=None):
++    from external_effects import refuse
++    refuse('telegram')
+     url = f"https://api.telegram.org/bot{token}/{method}"
+ 
+     payload = None
+@@ -31,6 +33,8 @@ def api(token, method, data=None):
+ 
+ 
+ def main():
++    from external_effects import refuse
++    refuse('telegram')
+     print("Telegram DevOrchestrator setup")
+     print("Сначала отправь /start своему боту в Telegram.")
+     print()
+diff --git a/transition_executor.py b/transition_executor.py
+index 1c54090..be9d8db 100644
+--- a/transition_executor.py
++++ b/transition_executor.py
+@@ -21,12 +21,20 @@ def synchronous(name, args):
+         adapter = bridge.github_task_transport()
+         return adapter.fetch_labels(adapter.issue_ref(args['number']))
+     if name == 'post_comment':
++        from external_effects import refuse
++        refuse('github')
+         return bridge.raw_add_comment(args['number'], args['body'])
+     if name == 'transition':
++        from external_effects import refuse
++        refuse('github')
+         return bridge.raw_transition_issue(args['issue'], args['target'])
+     if name == 'telegram':
++        from external_effects import refuse
++        refuse('telegram')
+         return bridge.send_telegram(args['text'])
+     if name == 'github':
++        from external_effects import guard_github
++        guard_github(args['args'])
+         return bridge.gh(*args['args'])
+     if name == 'issues':
+         return bridge.open_issues()
+@@ -40,6 +48,8 @@ def synchronous(name, args):
+     if name == 'repository':
+         if args['method'] not in ('snapshot', 'review_evidence', 'git', 'run'):
+             raise ValueError('Unknown repository operation')
++        from external_effects import refuse
++        refuse('publication')
+         repo = bridge.Repository(args['project'], args.get('report'))
+         if 'configuration' in args and repo.cfg != args['configuration']:
+             from publication import PublicationError
+@@ -70,7 +80,12 @@ async def execute(command):
+     args = command.arguments()
+     if command.name == 'discovery':
+         from control_loop import discover
+-        return await discover()
++        from external_effects import blocked
++        latched = blocked()
++        result = await discover()
++        if latched or blocked():
++            result['observation_confidence'] = 'READ_ONLY'
++        return result
+     if command.name == 'legacy_review_inspect':
+         from transition_io import Command
+         capability = await execute(Command.create('rpc', dict(name='get_transition_capabilities', arguments={})))
+@@ -83,6 +98,14 @@ async def execute(command):
+         return await (prepare(command) if command.name == 'prepare_review' else verify(command))
+     if command.name == 'rpc':
+         import task_bridge as bridge
+-        return await bridge.transport_call(args['name'], args['arguments'])
++        from external_effects import guard_worker_rpc, blocked
++        guard_worker_rpc(args['name'], args['arguments'])
++        latched = blocked()
++        result = await bridge.transport_call(args['name'], args['arguments'])
++        if args['name'] in ('get_task_report', 'list_tasks') and (latched or blocked()):
++            if isinstance(result, list):
++                return [dict(row, observation_confidence='READ_ONLY') for row in result]
++            return dict(result, observation_confidence='READ_ONLY')
++        return result
+     loop = asyncio.get_running_loop()
+     return await loop.run_in_executor(POOLS[command.lane], synchronous, command.name, args)
+diff --git a/worker_runtime.py b/worker_runtime.py
+index 17394c5..a0807d5 100644
+--- a/worker_runtime.py
++++ b/worker_runtime.py
+@@ -143,8 +143,26 @@ def group_ownership(receipt, group=None):
+     return 'AMBIGUOUS'
+ 
+ 
++def recorded_cleanup(meta):
++    """Return cleanup proof that is already durable. Never signal or invent one."""
++    if meta.get('remote_key'):
++        if (meta.get('remote_cleanup_generation') == meta.get('runtime_generation') and
++                meta.get('remote_cleanup_state') in ('ABSENT', 'CLEANED')):
++            return meta['remote_cleanup_state']
++        return 'ACTIVE'
++    if (meta.get('machine') == 'work' and meta.get('runtime_generation') and
++            meta.get('cleanup_generation') == meta['runtime_generation'] and
++            meta.get('cleanup_state') in ('ABSENT', 'CLEANED')):
++        return meta['cleanup_state']
++    return 'ACTIVE'
++
++
+ def cleanup_group(directory, meta, state, *, grace_seconds=1):
+     """Terminal generation-bound proof fences cleanup and every signal."""
++    # Same variable as external_effects.ENV. This module is copied to SSH workers,
++    # which do not have that import available.
++    if os.environ.get('DEVORCHESTRATOR_BLOCK_EXTERNAL_EFFECTS') == '1':
++        return recorded_cleanup(meta)
+     if state not in ('DONE', 'FAILED') or meta.get('launch_prepared') or meta.get('resume_prepared'):
+         return 'ACTIVE'
+     if meta.get('remote_key'):
+@@ -290,6 +308,8 @@ def publication_safe(directory, meta):
+ 
+ def reconcile_task(directory, meta, state, code):
+     """Called under worker.lock; preserve original receipts and audit history."""
++    if os.environ.get('DEVORCHESTRATOR_BLOCK_EXTERNAL_EFFECTS') == '1':
++        return None
+     if state not in ('DONE', 'FAILED'):
+         return None
+     import copy
+@@ -320,6 +340,8 @@ def reconcile_leases(data_dir, terminal):
+     Only a bound terminal receipt with absent/cleaned runtime frees a lease.
+     Missing evidence is not a missing task: callers must classify that explicitly.
+     """
++    if os.environ.get('DEVORCHESTRATOR_BLOCK_EXTERNAL_EFFECTS') == '1':
++        return
+     path = data_dir.parent / 'worker_leases.json'
+     leases = read_json(path, {})
+     diagnostic_path = data_dir.parent / 'worker_consistency.json'
+@@ -404,6 +426,9 @@ def inspect_start_request(data_dir, request_id, *, fence=False):
+     valid_request(request_id)
+     if not request_id or type(fence) is not bool:
+         raise ValueError('A start request ID and boolean fence flag are required')
++    if fence:
++        from external_effects import refuse
++        refuse('worker')
+     task_id = request_id[:24]
+     result = dict(schema_version=1, request_id=request_id, task_id=task_id, state='UNKNOWN')
+     path = data_dir.parent / 'requests' / (request_id + '.json')
+@@ -451,6 +476,8 @@ def inspect_start_request(data_dir, request_id, *, fence=False):
+ 
+ def launch(data_dir, request_id, task_id, callback, prepare=None, signature=None, signature_version=None):
+     """Receipt is durable before launching. A crash can leave UNKNOWN, never a duplicate."""
++    from external_effects import refuse
++    refuse('worker')
+     valid_request(request_id)
+     if not request_id:
+         if prepare:

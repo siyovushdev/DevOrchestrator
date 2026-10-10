@@ -143,8 +143,26 @@ def group_ownership(receipt, group=None):
     return 'AMBIGUOUS'
 
 
+def recorded_cleanup(meta):
+    """Return cleanup proof that is already durable. Never signal or invent one."""
+    if meta.get('remote_key'):
+        if (meta.get('remote_cleanup_generation') == meta.get('runtime_generation') and
+                meta.get('remote_cleanup_state') in ('ABSENT', 'CLEANED')):
+            return meta['remote_cleanup_state']
+        return 'ACTIVE'
+    if (meta.get('machine') == 'work' and meta.get('runtime_generation') and
+            meta.get('cleanup_generation') == meta['runtime_generation'] and
+            meta.get('cleanup_state') in ('ABSENT', 'CLEANED')):
+        return meta['cleanup_state']
+    return 'ACTIVE'
+
+
 def cleanup_group(directory, meta, state, *, grace_seconds=1):
     """Terminal generation-bound proof fences cleanup and every signal."""
+    # Same variable as external_effects.ENV. This module is copied to SSH workers,
+    # which do not have that import available.
+    if os.environ.get('DEVORCHESTRATOR_BLOCK_EXTERNAL_EFFECTS') == '1':
+        return recorded_cleanup(meta)
     if state not in ('DONE', 'FAILED') or meta.get('launch_prepared') or meta.get('resume_prepared'):
         return 'ACTIVE'
     if meta.get('remote_key'):
@@ -290,6 +308,8 @@ def publication_safe(directory, meta):
 
 def reconcile_task(directory, meta, state, code):
     """Called under worker.lock; preserve original receipts and audit history."""
+    if os.environ.get('DEVORCHESTRATOR_BLOCK_EXTERNAL_EFFECTS') == '1':
+        return None
     if state not in ('DONE', 'FAILED'):
         return None
     import copy
@@ -320,6 +340,8 @@ def reconcile_leases(data_dir, terminal):
     Only a bound terminal receipt with absent/cleaned runtime frees a lease.
     Missing evidence is not a missing task: callers must classify that explicitly.
     """
+    if os.environ.get('DEVORCHESTRATOR_BLOCK_EXTERNAL_EFFECTS') == '1':
+        return
     path = data_dir.parent / 'worker_leases.json'
     leases = read_json(path, {})
     diagnostic_path = data_dir.parent / 'worker_consistency.json'
@@ -404,6 +426,9 @@ def inspect_start_request(data_dir, request_id, *, fence=False):
     valid_request(request_id)
     if not request_id or type(fence) is not bool:
         raise ValueError('A start request ID and boolean fence flag are required')
+    if fence:
+        from external_effects import refuse
+        refuse('worker')
     task_id = request_id[:24]
     result = dict(schema_version=1, request_id=request_id, task_id=task_id, state='UNKNOWN')
     path = data_dir.parent / 'requests' / (request_id + '.json')
@@ -451,6 +476,8 @@ def inspect_start_request(data_dir, request_id, *, fence=False):
 
 def launch(data_dir, request_id, task_id, callback, prepare=None, signature=None, signature_version=None):
     """Receipt is durable before launching. A crash can leave UNKNOWN, never a duplicate."""
+    from external_effects import refuse
+    refuse('worker')
     valid_request(request_id)
     if not request_id:
         if prepare:

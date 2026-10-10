@@ -66,6 +66,8 @@ def reap_processes():
 
 
 def spawn_detached(wrapper, log_file):
+    from external_effects import refuse
+    refuse('worker')
     try:
         process = subprocess.Popen(["bash", "-lc", wrapper], stdin=subprocess.DEVNULL,
                                    stdout=log_file, stderr=subprocess.STDOUT, start_new_session=True)
@@ -103,6 +105,8 @@ def machine_command(machine, command, *, connect_timeout=10, ssh_options=()):
 
 
 def capture(machine, command, separate_stderr=False):
+    from external_effects import refuse
+    refuse('worker')
     return subprocess.run(
         machine_command(machine, command),
         text=True,
@@ -114,6 +118,8 @@ def capture(machine, command, separate_stderr=False):
 
 
 def capture_execution(machine, command, *, timeout=PROBE_TIMEOUT):
+    from external_effects import refuse
+    refuse('worker')
     env = dict(MACHINES[machine].get('agent_env', {}))
     if machine == 'firefly' and command.startswith('agent '):
         env['NODE_USE_ENV_PROXY'] = '1'
@@ -312,6 +318,8 @@ def capture_git_baseline(machine, workspace):
 
 
 def doctor_probe(machine, command, timeout):
+    from external_effects import refuse
+    refuse('worker')
     # A timed-out local version command may have children holding stdout open.
     # Kill the entire probe group so cleanup cannot wait on those children.
     process = subprocess.Popen(
@@ -377,6 +385,8 @@ agent --version 2>/dev/null || true
 
 
 def doctor(as_json=False):
+    from external_effects import refuse
+    refuse('worker')
     report = doctor_health()
     if as_json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
@@ -406,6 +416,9 @@ def load_projects():
 
 
 def execution_catalog(project=None, discover=False, agent=None):
+    from external_effects import blocked, refuse
+    if discover and blocked():
+        refuse('worker')
     cfg = load_projects()[project] if project else {}
     catalog, identity = execution_profiles.load_catalog(cfg)
     result = dict(catalog=catalog, identity=identity)
@@ -473,7 +486,54 @@ def run_project(
 
 
 
+def stored_task_status(meta, directory):
+    """Read-only completion diagnosis, using the authoritative result parser.
+
+    Cached metadata alone cannot establish terminal completion. A generation
+    mismatch invalidates even an apparently successful exit marker.
+    """
+    if meta.get('resume_prepared') or meta.get('launch_prepared') or meta.get('remote_logs_pending'):
+        return 'UNKNOWN', None
+    record = None
+    try:
+        record = runtime_liveness.read_record(directory)
+        if record is not None or meta.get('runtime_generation'):
+            runtime_liveness.validate(record, meta)
+    except (OSError, ValueError, TypeError, KeyError):
+        return 'UNKNOWN', None
+    exit_path = directory / 'exit_code'
+    if exit_path.exists():
+        try:
+            code = int(exit_path.read_text().strip())
+        except (OSError, ValueError):
+            return 'UNKNOWN', None
+        if meta.get('machine') == 'firefly' and code == 255:
+            return 'UNKNOWN', None
+        if record and (record.get('phase') != 'EXITED' or record.get('exit_code') != code):
+            return 'UNKNOWN', None
+    elif record and record.get('phase') == 'EXITED':
+        code = record['exit_code']
+        if meta.get('remote_key'):
+            return 'UNKNOWN', None  # No confirmed final remote log drain.
+    else:
+        return 'UNKNOWN', None
+    if code != 0 or (record and record.get('terminal_reason') != 'process_exited'):
+        return 'FAILED', code
+    return ('DONE' if task_output(meta, directory)['result'] else 'FAILED'), code
+
+
+def stored_runtime_health(directory, state):
+    """Cached health is not current ownership or failure evidence."""
+    return {'state': 'UNKNOWN', 'reason': 'reconciliation_blocked',
+            'observation_confidence': 'READ_ONLY', 'lease_state': 'UNKNOWN',
+            'heartbeat_age_seconds': None}
+
+
 def task_state(meta, directory, refresh_remote=True):
+    from external_effects import blocked
+    if blocked():
+        reap_processes()
+        return stored_task_status(meta, directory)
     reap_processes()
     if not refresh_remote:
         meta.pop('_runtime_health', None)
@@ -550,6 +610,9 @@ def project_for_task(meta):
 
 
 def runtime_status(meta, directory, state=None):
+    from external_effects import blocked
+    if blocked():
+        return stored_runtime_health(directory, state)
     if meta.get('remote_key') and meta.get('_runtime_health'):
         return meta['_runtime_health']
     return runtime_liveness.watchdog(directory, meta, probe=not meta.get('remote_key'),
@@ -557,6 +620,8 @@ def runtime_status(meta, directory, state=None):
 
 
 def spawn_runtime(directory, meta, command, log_file):
+    from external_effects import refuse
+    refuse('worker')
     meta['project'] = project_for_task(meta)
     meta.pop('runtime_generation', None)
     record = runtime_liveness.initialize(directory, meta)
@@ -568,14 +633,16 @@ def spawn_runtime(directory, meta, command, log_file):
 
 
 def list_tasks(as_json=False, show_all=False, cached=False, control=False, control_project=None):
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    if not control:
+    from external_effects import blocked
+    if not blocked():
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if not control and not blocked():
         reconcile_workers()
 
     rows = []
     scope = load_projects()[control_project] if control_project else None
 
-    directories = [p for p in DATA_DIR.iterdir() if p.name != "archives"]
+    directories = [p for p in DATA_DIR.iterdir() if p.name != "archives"] if DATA_DIR.exists() else []
     if (DATA_DIR / "archives").exists():
         directories.extend((DATA_DIR / "archives").iterdir())
     for directory in directories:
@@ -610,7 +677,7 @@ def list_tasks(as_json=False, show_all=False, cached=False, control=False, contr
                 # supplies cleanup proof, including terminal wrapper children.
                 if not worker_runtime.publication_safe(directory, meta):
                     state, exit_code = 'UNKNOWN', None
-            if meta.get('remote_key') and not cached:
+            if meta.get('remote_key') and not cached and not blocked():
                 reconcile_remote_observation(directory, meta, state, exit_code)
         except Exception:
             state, exit_code = 'UNKNOWN', None
@@ -619,6 +686,7 @@ def list_tasks(as_json=False, show_all=False, cached=False, control=False, contr
 
         rows.append({
             "id": meta.get("id", directory.name),
+            "observation_confidence": 'READ_ONLY' if blocked() else 'RUNTIME',
             "project": project_for_task(meta),
             "machine": meta.get("machine", "-"),
             "agent": meta.get("agent", "-"),
@@ -702,6 +770,9 @@ def worker_lease_evidence(directory, meta, state, code, refresh_remote=False):
 
 def reconcile_remote_observation(directory, meta, state, code):
     """Use an existing fresh report probe, without repeating SSH or a stale write."""
+    from external_effects import blocked
+    if blocked():
+        return
     try:
         with exclusive(DATA_DIR.parent / 'worker.lock'):
             snapshot = {k: v for k, v in meta.items() if k != '_runtime_health'}
@@ -716,6 +787,9 @@ def reconcile_remote_observation(directory, meta, state, code):
 
 def reconcile_workers(refresh_remote=False):
     """Bounded self-healing; skipped remote probes leave leases unclassified."""
+    from external_effects import blocked
+    if blocked():
+        return
     try:
         with exclusive(DATA_DIR.parent / 'worker.lock'):
             started = time.monotonic()
@@ -759,6 +833,8 @@ def certify_local_absent(task_id, generation, *, control_group_reset_verified=Fa
     The reset is external evidence asserted by the caller, not inferred from PIDs.
     No startup or reconciliation path calls this helper.
     """
+    from external_effects import refuse
+    refuse('worker')
     if control_group_reset_verified is not True:
         raise ValueError('A verified complete MCP control-group reset is required')
     with exclusive(DATA_DIR.parent / 'worker.lock', blocking=True):
@@ -788,6 +864,8 @@ def adopt_task(
     model=None,
     effort=None,
 ):
+    from external_effects import refuse
+    refuse('worker')
     projects = load_projects()
 
     if project not in projects:
@@ -1144,6 +1222,9 @@ def preflight_task(operation, arguments):
         if receipt.get('status') == 'FENCED':
             return {'status': 'FENCED', 'launch_started': False}
         return {'status': 'REPLAY'}
+    from external_effects import blocked, refuse
+    if blocked():
+        refuse('worker')
     if request_id and (task_dir(request_id[:24]) / 'meta.json').exists() and operation == 'start_task':
         raise RuntimeError('Existing task metadata without request receipt; inspect worker ownership before retrying')
     # Bound read-only discovery independently from the full issue transition.
@@ -1183,6 +1264,8 @@ def preflight_task(operation, arguments):
 def run_agent(machine, agent, workspace, prompt, model=None, effort=None,
               request_id=None, role="coding", execution_profile=None, execution_options=None,
               review_binding=None, repository_binding=None):
+    from external_effects import refuse
+    refuse('worker')
     worker_runtime.valid_request(request_id)
     task_id = request_id[:24] if request_id else uuid.uuid4().hex[:12]
     with exclusive(DATA_DIR.parent / "worker.lock", blocking=True):
@@ -1508,6 +1591,8 @@ def find_cursor_session_id(task_id):
 
 
 def continue_task(task_id, prompt, request_id=None):
+    from external_effects import refuse
+    refuse('worker')
     with exclusive(DATA_DIR.parent / "worker.lock", blocking=True):
         meta = load_meta(task_id)
         project = project_for_task(meta)
@@ -1800,12 +1885,15 @@ def task_output(meta, directory):
 
 
 def task_report(task_id, as_json=False):
-    reconcile_workers()
+    from external_effects import blocked
+    quiet = blocked()
+    if not quiet:
+        reconcile_workers()
     directory = task_dir(task_id)
     meta = load_meta(task_id)
 
     state, exit_code = task_state(meta, directory)
-    if meta.get('remote_key'):
+    if meta.get('remote_key') and not quiet:
         reconcile_remote_observation(directory, meta, state, exit_code)
 
     output = task_output(meta, directory)
@@ -1819,7 +1907,7 @@ def task_report(task_id, as_json=False):
     if state == "FAILED" and not last_error:
         last_error = last_non_json
 
-    if session_id and meta.get('runtime_generation'):
+    if session_id and meta.get('runtime_generation') and not quiet:
         try:
             runtime_liveness.annotate_session(directory, meta, session_id)
         except (OSError, ValueError, TypeError):
@@ -1832,6 +1920,7 @@ def task_report(task_id, as_json=False):
 
     report = {
         "id": task_id,
+        "observation_confidence": 'READ_ONLY' if quiet else 'RUNTIME',
         "role": meta.get('role', 'coding'),
         "runtime_generation": meta.get('runtime_generation'),
         "launch_request_id": meta.get('launch_request_id'),
@@ -1902,6 +1991,8 @@ def task_report(task_id, as_json=False):
 
 
 def exec_command(machine, command):
+    from external_effects import refuse
+    refuse('worker')
     return subprocess.run(
         machine_command(machine, command),
         stdin=subprocess.DEVNULL,

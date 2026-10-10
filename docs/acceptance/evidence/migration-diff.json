@@ -1,0 +1,17 @@
+{
+  "added": 0,
+  "removed": 58,
+  "changed": 0,
+  "unexpected": [],
+  "removed_fields": {
+    "heartbeat_age_seconds": 10,
+    "lease_state": 10,
+    "observed_at": 10,
+    "heartbeat_sequence": 9,
+    "last_heartbeat_at": 9,
+    "lease_expires_at": 9,
+    "timings": 1
+  },
+  "source_bytes": 2738791,
+  "saved_bytes": 2730869
+}

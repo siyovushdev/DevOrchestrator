@@ -1,0 +1,220 @@
+test_discovery_cache_race_does_not_revoke_sticky_closure_or_latch_hold (test_safety_latch_final.DurableQuarantineTests.test_discovery_cache_race_does_not_revoke_sticky_closure_or_latch_hold) ... ok
+test_enqueue_tombstones_survive_recreation_and_status_reset (test_safety_latch_final.DurableQuarantineTests.test_enqueue_tombstones_survive_recreation_and_status_reset) ... ok
+test_generic_flush_quarantines_legacy_pending_without_deleting_unrelated (test_safety_latch_final.DurableQuarantineTests.test_generic_flush_quarantines_legacy_pending_without_deleting_unrelated) ... ok
+test_inflight_report_keeps_read_only_provenance_after_removal (test_safety_latch_final.DurableQuarantineTests.test_inflight_report_keeps_read_only_provenance_after_removal) ... ok
+test_inline_launch_cannot_adopt_a_read_only_final_report (test_safety_latch_final.DurableQuarantineTests.test_inline_launch_cannot_adopt_a_read_only_final_report) ... ok
+test_late_nested_result_cannot_adopt_after_latch_removal (test_safety_latch_final.DurableQuarantineTests.test_late_nested_result_cannot_adopt_after_latch_removal) ... ok
+test_missing_health_does_not_probe_or_classify_healthy (test_safety_latch_final.DurableQuarantineTests.test_missing_health_does_not_probe_or_classify_healthy) ... ok
+test_network_report_requests_propagate_read_only_without_changing_arguments (test_safety_latch_final.DurableQuarantineTests.test_network_report_requests_propagate_read_only_without_changing_arguments) ... ok
+test_old_server_without_observation_tool_fails_before_mutating_report (test_safety_latch_final.DurableQuarantineTests.test_old_server_without_observation_tool_fails_before_mutating_report) ... ok
+test_operational_smoke_client_cannot_reach_an_unlatched_server (test_safety_latch_final.DurableQuarantineTests.test_operational_smoke_client_cannot_reach_an_unlatched_server) ... ok
+test_registered_dispatch_retains_provenance_if_latch_changes_inflight (test_safety_latch_final.DurableQuarantineTests.test_registered_dispatch_retains_provenance_if_latch_changes_inflight) ... ok
+test_rpc_guard_allows_only_observational_tools (test_safety_latch_final.DurableQuarantineTests.test_rpc_guard_allows_only_observational_tools) ... ok
+test_telegram_setup_stops_before_input_files_or_transport (test_safety_latch_final.DurableQuarantineTests.test_telegram_setup_stops_before_input_files_or_transport) ... ok
+test_cli_exec_and_direct_runtime_launch_are_blocked (test_safety_latch_final.FinalReportTests.test_cli_exec_and_direct_runtime_launch_are_blocked) ... ok
+test_completion_semantics_through_registered_dispatch (test_safety_latch_final.FinalReportTests.test_completion_semantics_through_registered_dispatch) ... ok
+test_direct_remote_script_is_read_only_and_start_is_blocked (test_safety_latch_final.FinalReportTests.test_direct_remote_script_is_read_only_and_start_is_blocked) ... ok
+test_explicit_read_only_request_latches_child_of_unlatched_server (test_safety_latch_final.FinalReportTests.test_explicit_read_only_request_latches_child_of_unlatched_server) ... ok
+test_missing_health_receipt_through_registered_running_report (test_safety_latch_final.FinalReportTests.test_missing_health_receipt_through_registered_running_report) ... ok
+test_poll_removal_restart_flush_and_reconciliation_do_not_replay (test_safety_latch_final.FinalReportTests.test_poll_removal_restart_flush_and_reconciliation_do_not_replay) ... Executing <Task pending name='Task-88' coro=<FinalReportTests.test_poll_removal_restart_flush_and_reconciliation_do_not_replay() running at /source/tests/test_safety_latch_final.py:176> wait_for=<Future pending cb=[_chain_future.<locals>._call_check_cancel() at /usr/lib/python3.12/asyncio/futures.py:387, Task.task_wakeup()] created at /usr/lib/python3.12/asyncio/base_events.py:449> cb=[_run_until_complete_cb() at /usr/lib/python3.12/asyncio/base_events.py:182] created at /usr/lib/python3.12/asyncio/runners.py:100> took 0.129 seconds
+ok
+test_stale_terminal_and_remote_cached_metadata_are_unverified (test_safety_latch_final.FinalReportTests.test_stale_terminal_and_remote_cached_metadata_are_unverified) ... ok
+test_bridge_keeps_ownership_without_retry_approval_or_failed (test_acceptance_report_latch.ReportLatchTests.test_bridge_keeps_ownership_without_retry_approval_or_failed) ... ok
+test_other_read_tools_do_not_probe (test_acceptance_report_latch.ReportLatchTests.test_other_read_tools_do_not_probe) ... ok
+test_real_mcp_subprocess_inherits_latch_and_does_not_signal (test_acceptance_report_latch.ReportLatchTests.test_real_mcp_subprocess_inherits_latch_and_does_not_signal) ... ok
+test_registered_report_with_mocked_killpg_does_not_signal_or_write (test_acceptance_report_latch.ReportLatchTests.test_registered_report_with_mocked_killpg_does_not_signal_or_write) ... ok
+test_remote_report_does_not_ssh_or_signal (test_acceptance_report_latch.ReportLatchTests.test_remote_report_does_not_ssh_or_signal) ... ok
+test_remote_script_killpg_is_mocked_and_skipped_when_latched (test_acceptance_report_latch.ReportLatchTests.test_remote_script_killpg_is_mocked_and_skipped_when_latched) ... ok
+test_unlatched_same_receipt_still_reaches_killpg (test_acceptance_report_latch.ReportLatchTests.test_unlatched_same_receipt_still_reaches_killpg) ... Executing <Task finished name='Task-127' coro=<ReportLatchTests.test_unlatched_same_receipt_still_reaches_killpg() done, defined at /source/tests/test_acceptance_report_latch.py:200> result=None created at /usr/lib/python3.12/asyncio/runners.py:100> took 2.080 seconds
+ok
+test_clearing_the_latch_sends_the_withheld_chief_comment (test_acceptance_effect_latch.ControlLoopLatchTests.test_clearing_the_latch_sends_the_withheld_chief_comment) ... [bridge] issue #1 -> task 1416553e435df02be9e79746
+Executing <Task pending name='Task-132' coro=<ControlLoopLatchTests.test_clearing_the_latch_sends_the_withheld_chief_comment() running at /source/tests/test_acceptance_effect_latch.py:330> wait_for=<Future pending cb=[_chain_future.<locals>._call_check_cancel() at /usr/lib/python3.12/asyncio/futures.py:387, Task.task_wakeup()] created at /usr/lib/python3.12/asyncio/base_events.py:449> cb=[_run_until_complete_cb() at /usr/lib/python3.12/asyncio/base_events.py:182] created at /usr/lib/python3.12/asyncio/runners.py:100> took 0.139 seconds
+[bridge] review started 8e49712fc4611a51100911e2 for 1416553e435df02be9e79746 with cursor
+Executing <Task pending name='Task-132' coro=<ControlLoopLatchTests.test_clearing_the_latch_sends_the_withheld_chief_comment() running at /source/tests/test_acceptance_effect_latch.py:330> wait_for=<Future pending cb=[_chain_future.<locals>._call_check_cancel() at /usr/lib/python3.12/asyncio/futures.py:387, Task.task_wakeup()] created at /usr/lib/python3.12/asyncio/base_events.py:449> cb=[_run_until_complete_cb() at /usr/lib/python3.12/asyncio/base_events.py:182] created at /usr/lib/python3.12/asyncio/runners.py:100> took 0.174 seconds
+[bridge] independent review PASS for 1416553e435df02be9e79746
+Executing <Task finished name='Task-132' coro=<ControlLoopLatchTests.test_clearing_the_latch_sends_the_withheld_chief_comment() done, defined at /source/tests/test_acceptance_effect_latch.py:329> result=None created at /usr/lib/python3.12/asyncio/runners.py:100> took 0.461 seconds
+ok
+test_latched_control_loop_does_not_dispatch_or_damage_receipts (test_acceptance_effect_latch.ControlLoopLatchTests.test_latched_control_loop_does_not_dispatch_or_damage_receipts) ... [bridge] issue #1 -> task 1416553e435df02be9e79746
+Executing <Task pending name='Task-137' coro=<ControlLoopLatchTests.test_latched_control_loop_does_not_dispatch_or_damage_receipts() running at /source/tests/test_acceptance_effect_latch.py:225> wait_for=<Future pending cb=[_chain_future.<locals>._call_check_cancel() at /usr/lib/python3.12/asyncio/futures.py:387, Task.task_wakeup()] created at /usr/lib/python3.12/asyncio/base_events.py:449> cb=[_run_until_complete_cb() at /usr/lib/python3.12/asyncio/base_events.py:182] created at /usr/lib/python3.12/asyncio/runners.py:100> took 0.181 seconds
+[bridge] review started 8e49712fc4611a51100911e2 for 1416553e435df02be9e79746 with cursor
+Executing <Task pending name='Task-137' coro=<ControlLoopLatchTests.test_latched_control_loop_does_not_dispatch_or_damage_receipts() running at /source/tests/test_acceptance_effect_latch.py:225> wait_for=<Future pending cb=[_chain_future.<locals>._call_check_cancel() at /usr/lib/python3.12/asyncio/futures.py:387, Task.task_wakeup()] created at /usr/lib/python3.12/asyncio/base_events.py:449> cb=[_run_until_complete_cb() at /usr/lib/python3.12/asyncio/base_events.py:182] created at /usr/lib/python3.12/asyncio/runners.py:100> took 0.198 seconds
+[bridge] independent review PASS for 1416553e435df02be9e79746
+ok
+test_latched_start_and_continue_do_not_record_launch_authority (test_acceptance_effect_latch.LaunchAuthorityTests.test_latched_start_and_continue_do_not_record_launch_authority) ... ok
+test_ambiguous_post_is_still_uncertain_when_the_latch_is_off (test_acceptance_effect_latch.OutboxLatchTests.test_ambiguous_post_is_still_uncertain_when_the_latch_is_off) ... ok
+test_blocked_exception_after_sending_returns_to_pending (test_acceptance_effect_latch.OutboxLatchTests.test_blocked_exception_after_sending_returns_to_pending) ... ok
+test_comment_not_dispatched_still_retries (test_acceptance_effect_latch.OutboxLatchTests.test_comment_not_dispatched_still_retries) ... ok
+test_completion_crash_receipt_is_reconciled_and_a_new_one_is_not_sent (test_acceptance_effect_latch.OutboxLatchTests.test_completion_crash_receipt_is_reconciled_and_a_new_one_is_not_sent) ... ok
+test_crash_sending_comment_reconciles_without_a_new_post (test_acceptance_effect_latch.OutboxLatchTests.test_crash_sending_comment_reconciles_without_a_new_post) ... ok
+test_crash_sending_telegram_stays_uncertain_without_transport (test_acceptance_effect_latch.OutboxLatchTests.test_crash_sending_telegram_stays_uncertain_without_transport) ... ok
+test_duplicate_receipt_stays_uncertain_and_is_not_resent (test_acceptance_effect_latch.OutboxLatchTests.test_duplicate_receipt_stays_uncertain_and_is_not_resent) ... ok
+test_exact_comment_receipt_still_reconciles_while_latched (test_acceptance_effect_latch.OutboxLatchTests.test_exact_comment_receipt_still_reconciles_while_latched) ... ok
+test_preexisting_runtime_effects_stay_pending_without_attempts_or_sending (test_acceptance_effect_latch.OutboxLatchTests.test_preexisting_runtime_effects_stay_pending_without_attempts_or_sending) ... ok
+test_manifest_includes_the_guard_module_and_rejects_a_foreign_root (test_acceptance_effect_latch.SourceManifestTests.test_manifest_includes_the_guard_module_and_rejects_a_foreign_root) ... ok
+test_capability_probe_cannot_select_another_tool (test_acceptance_effect_gate.EffectGateTests.test_capability_probe_cannot_select_another_tool) ... ok
+test_dispatcher_refuses_fence_before_the_client (test_acceptance_effect_gate.EffectGateTests.test_dispatcher_refuses_fence_before_the_client) ... ok
+test_github_reads_remain_available (test_acceptance_effect_gate.EffectGateTests.test_github_reads_remain_available) ... ok
+test_latch_off_does_not_block_classification (test_acceptance_effect_gate.EffectGateTests.test_latch_off_does_not_block_classification) ... ok
+test_latched_publication_does_not_open_a_journal (test_acceptance_effect_gate.EffectGateTests.test_latched_publication_does_not_open_a_journal) ... ok
+test_launch_adopt_and_continue_stop_before_receipts (test_acceptance_effect_gate.EffectGateTests.test_launch_adopt_and_continue_stop_before_receipts) ... ok
+test_publication_subprocess_is_refused_before_capture (test_acceptance_effect_gate.EffectGateTests.test_publication_subprocess_is_refused_before_capture) ... ok
+test_telegram_refuses_before_subprocess_and_network (test_acceptance_effect_gate.EffectGateTests.test_telegram_refuses_before_subprocess_and_network) ... ok
+test_unknown_and_mutating_github_commands_never_start (test_acceptance_effect_gate.EffectGateTests.test_unknown_and_mutating_github_commands_never_start) ... ok
+test_worker_rpc_is_refused_before_the_client (test_acceptance_effect_gate.EffectGateTests.test_worker_rpc_is_refused_before_the_client) ... ok
+test_worker_spawn_and_fence_stop_before_write (test_acceptance_effect_gate.EffectGateTests.test_worker_spawn_and_fence_stop_before_write) ... ok
+test_foreign_repository_lock_skips_archived_merge_without_mutation (test_acceptance_archived_merge.ArchivedMergeTests.test_foreign_repository_lock_skips_archived_merge_without_mutation) ... ok
+test_latched_pending_merge_is_kept_without_another_put (test_acceptance_archived_merge.ArchivedMergeTests.test_latched_pending_merge_is_kept_without_another_put) ... ok
+test_observed_merged_pr_is_latched_without_put (test_acceptance_archived_merge.ArchivedMergeTests.test_observed_merged_pr_is_latched_without_put) ... ok
+test_unsent_archived_merge_does_not_invent_pending_or_put (test_acceptance_archived_merge.ArchivedMergeTests.test_unsent_archived_merge_does_not_invent_pending_or_put) ... ok
+test_accepted_blocking_io_error_reconciles_on_restart_without_duplicate (test_chief_delivery_retry.ChiefDeliveryRetryTests.test_accepted_blocking_io_error_reconciles_on_restart_without_duplicate) ... [bridge] issue #1 -> task 1416553e435df02be9e79746
+Executing <Task pending name='Task-213' coro=<ChiefDeliveryRetryTests.test_accepted_blocking_io_error_reconciles_on_restart_without_duplicate() running at /source/tests/test_chief_delivery_retry.py:226> wait_for=<Future pending cb=[_chain_future.<locals>._call_check_cancel() at /usr/lib/python3.12/asyncio/futures.py:387, Task.task_wakeup()] created at /usr/lib/python3.12/asyncio/base_events.py:449> cb=[_run_until_complete_cb() at /usr/lib/python3.12/asyncio/base_events.py:182] created at /usr/lib/python3.12/asyncio/runners.py:100> took 0.155 seconds
+[bridge] review started 8e49712fc4611a51100911e2 for 1416553e435df02be9e79746 with cursor
+Executing <Task pending name='Task-213' coro=<ChiefDeliveryRetryTests.test_accepted_blocking_io_error_reconciles_on_restart_without_duplicate() running at /source/tests/test_chief_delivery_retry.py:226> wait_for=<Future pending cb=[_chain_future.<locals>._call_check_cancel() at /usr/lib/python3.12/asyncio/futures.py:387, Task.task_wakeup()] created at /usr/lib/python3.12/asyncio/base_events.py:449> cb=[_run_until_complete_cb() at /usr/lib/python3.12/asyncio/base_events.py:182] created at /usr/lib/python3.12/asyncio/runners.py:100> took 0.246 seconds
+[bridge] independent review PASS for 1416553e435df02be9e79746
+Executing <Task finished name='Task-213' coro=<ChiefDeliveryRetryTests.test_accepted_blocking_io_error_reconciles_on_restart_without_duplicate() done, defined at /source/tests/test_chief_delivery_retry.py:225> result=None created at /usr/lib/python3.12/asyncio/runners.py:100> took 0.487 seconds
+ok
+test_blocking_io_error_inside_post_is_uncertain_and_never_retried (test_chief_delivery_retry.ChiefDeliveryRetryTests.test_blocking_io_error_inside_post_is_uncertain_and_never_retried) ... [bridge] issue #1 -> task 1416553e435df02be9e79746
+Executing <Task pending name='Task-218' coro=<ChiefDeliveryRetryTests.test_blocking_io_error_inside_post_is_uncertain_and_never_retried() running at /source/tests/test_chief_delivery_retry.py:223> wait_for=<Future pending cb=[_chain_future.<locals>._call_check_cancel() at /usr/lib/python3.12/asyncio/futures.py:387, Task.task_wakeup()] created at /usr/lib/python3.12/asyncio/base_events.py:449> cb=[_run_until_complete_cb() at /usr/lib/python3.12/asyncio/base_events.py:182] created at /usr/lib/python3.12/asyncio/runners.py:100> took 0.165 seconds
+[bridge] review started 8e49712fc4611a51100911e2 for 1416553e435df02be9e79746 with cursor
+Executing <Task pending name='Task-218' coro=<ChiefDeliveryRetryTests.test_blocking_io_error_inside_post_is_uncertain_and_never_retried() running at /source/tests/test_chief_delivery_retry.py:223> wait_for=<Future pending cb=[_chain_future.<locals>._call_check_cancel() at /usr/lib/python3.12/asyncio/futures.py:387, Task.task_wakeup()] created at /usr/lib/python3.12/asyncio/base_events.py:449> cb=[_run_until_complete_cb() at /usr/lib/python3.12/asyncio/base_events.py:182] created at /usr/lib/python3.12/asyncio/runners.py:100> took 0.201 seconds
+[bridge] independent review PASS for 1416553e435df02be9e79746
+Executing <Task finished name='Task-218' coro=<ChiefDeliveryRetryTests.test_blocking_io_error_inside_post_is_uncertain_and_never_retried() done, defined at /source/tests/test_chief_delivery_retry.py:222> result=None created at /usr/lib/python3.12/asyncio/runners.py:100> took 0.916 seconds
+ok
+test_control_loop_keeps_polling_while_real_worker_lock_is_busy (test_chief_delivery_retry.ChiefDeliveryRetryTests.test_control_loop_keeps_polling_while_real_worker_lock_is_busy) ... [bridge] issue #1 -> task 1416553e435df02be9e79746
+Executing <Task pending name='Task-223' coro=<ChiefDeliveryRetryTests.test_control_loop_keeps_polling_while_real_worker_lock_is_busy() running at /source/tests/test_chief_delivery_retry.py:229> wait_for=<Future pending cb=[_chain_future.<locals>._call_check_cancel() at /usr/lib/python3.12/asyncio/futures.py:387, Task.task_wakeup()] created at /usr/lib/python3.12/asyncio/base_events.py:449> cb=[_run_until_complete_cb() at /usr/lib/python3.12/asyncio/base_events.py:182] created at /usr/lib/python3.12/asyncio/runners.py:100> took 0.148 seconds
+[bridge] review started 8e49712fc4611a51100911e2 for 1416553e435df02be9e79746 with cursor
+Executing <Task pending name='Task-223' coro=<ChiefDeliveryRetryTests.test_control_loop_keeps_polling_while_real_worker_lock_is_busy() running at /source/tests/test_chief_delivery_retry.py:229> wait_for=<Future pending cb=[_chain_future.<locals>._call_check_cancel() at /usr/lib/python3.12/asyncio/futures.py:387, Task.task_wakeup()] created at /usr/lib/python3.12/asyncio/base_events.py:449> cb=[_run_until_complete_cb() at /usr/lib/python3.12/asyncio/base_events.py:182] created at /usr/lib/python3.12/asyncio/runners.py:100> took 0.180 seconds
+[bridge] independent review PASS for 1416553e435df02be9e79746
+ok
+test_real_flock_retry_restart_recovery_once_and_no_heartbeat_writes (test_chief_delivery_retry.ChiefDeliveryRetryTests.test_real_flock_retry_restart_recovery_once_and_no_heartbeat_writes) ... [bridge] issue #1 -> task 1416553e435df02be9e79746
+Executing <Task pending name='Task-243' coro=<ChiefDeliveryRetryTests.test_real_flock_retry_restart_recovery_once_and_no_heartbeat_writes() running at /source/tests/test_chief_delivery_retry.py:152> wait_for=<Future pending cb=[_chain_future.<locals>._call_check_cancel() at /usr/lib/python3.12/asyncio/futures.py:387, Task.task_wakeup()] created at /usr/lib/python3.12/asyncio/base_events.py:449> cb=[_run_until_complete_cb() at /usr/lib/python3.12/asyncio/base_events.py:182] created at /usr/lib/python3.12/asyncio/runners.py:100> took 0.187 seconds
+[bridge] review started 8e49712fc4611a51100911e2 for 1416553e435df02be9e79746 with cursor
+Executing <Task pending name='Task-243' coro=<ChiefDeliveryRetryTests.test_real_flock_retry_restart_recovery_once_and_no_heartbeat_writes() running at /source/tests/test_chief_delivery_retry.py:152> wait_for=<Future pending cb=[_chain_future.<locals>._call_check_cancel() at /usr/lib/python3.12/asyncio/futures.py:387, Task.task_wakeup()] created at /usr/lib/python3.12/asyncio/base_events.py:449> cb=[_run_until_complete_cb() at /usr/lib/python3.12/asyncio/base_events.py:182] created at /usr/lib/python3.12/asyncio/runners.py:100> took 0.180 seconds
+[bridge] independent review PASS for 1416553e435df02be9e79746
+Executing <Task pending name='Task-243' coro=<ChiefDeliveryRetryTests.test_real_flock_retry_restart_recovery_once_and_no_heartbeat_writes() running at /source/tests/test_chief_delivery_retry.py:194> wait_for=<Future pending cb=[_chain_future.<locals>._call_check_cancel() at /usr/lib/python3.12/asyncio/futures.py:387, Task.task_wakeup()] created at /usr/lib/python3.12/asyncio/base_events.py:449> cb=[_run_until_complete_cb() at /usr/lib/python3.12/asyncio/base_events.py:182] created at /usr/lib/python3.12/asyncio/runners.py:100> took 1.692 seconds
+ok
+test_crash_after_post_reconciles_exact_receipt_without_duplicate (test_chief_delivery_retry.NoSendCheckpointTests.test_crash_after_post_reconciles_exact_receipt_without_duplicate) ... ok
+test_crash_before_no_send_checkpoint_keeps_sending_and_never_blind_retries (test_chief_delivery_retry.NoSendCheckpointTests.test_crash_before_no_send_checkpoint_keeps_sending_and_never_blind_retries) ... ok
+test_explicit_no_send_has_bounded_backoff_and_survives_restart (test_chief_delivery_retry.NoSendCheckpointTests.test_explicit_no_send_has_bounded_backoff_and_survives_restart) ... ok
+test_failed_no_send_checkpoint_is_fatal_and_retains_sending_receipt_boundary (test_chief_delivery_retry.NoSendCheckpointTests.test_failed_no_send_checkpoint_is_fatal_and_retains_sending_receipt_boundary) ... ok
+test_alive_lease_cannot_be_stolen_failure_can_release (test_recovery.RecoveryTests.test_alive_lease_cannot_be_stolen_failure_can_release) ... ok
+test_child_scan_only_when_leader_pid_is_gone (test_recovery.RecoveryTests.test_child_scan_only_when_leader_pid_is_gone) ... ok
+test_coding_and_review_restart_keep_capacity_and_locks (test_recovery.RecoveryTests.test_coding_and_review_restart_keep_capacity_and_locks) ... ok
+test_corrupt_state_fails_closed_and_atomic_save (test_recovery.RecoveryTests.test_corrupt_state_fails_closed_and_atomic_save) ... ok
+test_dead_local_and_unknown_remote (test_recovery.RecoveryTests.test_dead_local_and_unknown_remote) ... ok
+test_delayed_comment_post_never_resends_on_absence_after_restart (test_recovery.RecoveryTests.test_delayed_comment_post_never_resends_on_absence_after_restart) ... ok
+test_done_before_review_and_pass_before_owner_and_commit_before_push (test_recovery.RecoveryTests.test_done_before_review_and_pass_before_owner_and_commit_before_push) ... ok
+test_github_comment_accepted_before_crash_is_not_repeated (test_recovery.RecoveryTests.test_github_comment_accepted_before_crash_is_not_repeated) ... ok
+test_github_label_failure_recovers_without_duplicate_comment (test_recovery.RecoveryTests.test_github_label_failure_recovers_without_duplicate_comment) ... ok
+test_legacy_pending_comment_is_queried_but_not_reposted_without_receipt (test_recovery.RecoveryTests.test_legacy_pending_comment_is_queried_but_not_reposted_without_receipt) ... ok
+test_outbox_batch_cannot_starve_reconciliation (test_recovery.RecoveryTests.test_outbox_batch_cannot_starve_reconciliation) ... ok
+test_receipt_replays_never_launch_twice_even_after_error (test_recovery.RecoveryTests.test_receipt_replays_never_launch_twice_even_after_error) ... ok
+test_reused_session_leader_start_mismatch_retains_ambiguous_lease (test_recovery.RecoveryTests.test_reused_session_leader_start_mismatch_retains_ambiguous_lease) ... ok
+test_telegram_crash_after_acceptance_restart_does_not_resend (test_recovery.RecoveryTests.test_telegram_crash_after_acceptance_restart_does_not_resend) ... ok
+test_telegram_exception_and_unknown_outcome_cannot_crash_or_repeat (test_recovery.RecoveryTests.test_telegram_exception_and_unknown_outcome_cannot_crash_or_repeat) ... ok
+test_telegram_known_failure_has_bounded_outbox_attempts (test_recovery.RecoveryTests.test_telegram_known_failure_has_bounded_outbox_attempts) ... ok
+test_transient_github_telegram_and_backoff (test_recovery.RecoveryTests.test_transient_github_telegram_and_backoff) ... ok
+test_unclassified_lease_evidence_preserves_diagnostic_and_requires_machine_binding (test_recovery.RecoveryTests.test_unclassified_lease_evidence_preserves_diagnostic_and_requires_machine_binding) ... ok
+test_worker_identity_pid_zero_reuse_and_reboot (test_recovery.RecoveryTests.test_worker_identity_pid_zero_reuse_and_reboot) ... ok
+test_absence_does_not_claim_no_launch_or_create_receipt (test_request_protocol.RequestProtocolTests.test_absence_does_not_claim_no_launch_or_create_receipt) ... ok
+test_accepted_and_prepared_receipts_are_never_fenced_or_relaunched (test_request_protocol.RequestProtocolTests.test_accepted_and_prepared_receipts_are_never_fenced_or_relaunched) ... ok
+test_busy_lock_never_waits_or_fences (test_request_protocol.RequestProtocolTests.test_busy_lock_never_waits_or_fences) ... ok
+test_corrupt_receipt_returns_payload_free_uncertainty (test_request_protocol.RequestProtocolTests.test_corrupt_receipt_returns_payload_free_uncertainty) ... ok
+test_crash_after_pending_receipt_cannot_trigger_second_callback (test_request_protocol.RequestProtocolTests.test_crash_after_pending_receipt_cannot_trigger_second_callback) ... ok
+test_fence_blocks_delayed_launch_and_repeated_fence_does_not_rewrite (test_request_protocol.RequestProtocolTests.test_fence_blocks_delayed_launch_and_repeated_fence_does_not_rewrite) ... ok
+test_orphan_metadata_directory_or_lease_cannot_be_fenced (test_request_protocol.RequestProtocolTests.test_orphan_metadata_directory_or_lease_cannot_be_fenced) ... ok
+test_close_observed_during_preflight_prevents_new_launch (test_resumable_control.ResumableControlTests.test_close_observed_during_preflight_prevents_new_launch) ... ok
+test_control_reducer_save_failure_stops_before_further_dispatch (test_resumable_control.ResumableControlTests.test_control_reducer_save_failure_stops_before_further_dispatch) ... ok
+test_full_review_chief_owner_commit_uses_one_writer (test_resumable_control.ResumableControlTests.test_full_review_chief_owner_commit_uses_one_writer) ... [bridge] issue #1 -> task 1416553e435df02be9e79746
+[bridge] independent review PASS for 1416553e435df02be9e79746
+ok
+test_only_actionable_followup_invalidates_pending_review (test_resumable_control.ResumableControlTests.test_only_actionable_followup_invalidates_pending_review) ... [bridge] issue #1 -> task 1416553e435df02be9e79746
+ok
+test_slow_publication_keeps_polling_and_restart_reconciles_existing_commit (test_resumable_control.ResumableControlTests.test_slow_publication_keeps_polling_and_restart_reconciles_existing_commit) ... [bridge] issue #1 -> task 1416553e435df02be9e79746
+[bridge] independent review PASS for 1416553e435df02be9e79746
+ok
+test_slow_reviewer_rpc_does_not_block_owner_polling_or_duplicate_launch (test_resumable_control.ResumableControlTests.test_slow_reviewer_rpc_does_not_block_owner_polling_or_duplicate_launch) ... [bridge] issue #1 -> task 1416553e435df02be9e79746
+ok
+test_unchanged_running_polls_and_timings_never_rewrite_authority (test_resumable_control.ResumableControlTests.test_unchanged_running_polls_and_timings_never_rewrite_authority) ... [bridge] issue #1 -> task 1416553e435df02be9e79746
+ok
+test_all_f3_phases_roundtrip_and_heartbeat_never_changes_authority (test_resumable_semantic_durability.CheckpointDurabilityTests.test_all_f3_phases_roundtrip_and_heartbeat_never_changes_authority) ... ok
+test_failed_authoritative_save_stops_writer_before_telemetry_or_command (test_resumable_semantic_durability.CheckpointDurabilityTests.test_failed_authoritative_save_stops_writer_before_telemetry_or_command) ... ok
+test_legacy_review_migrates_once_keeps_envelope_and_never_launches (test_resumable_semantic_durability.CheckpointDurabilityTests.test_legacy_review_migrates_once_keeps_envelope_and_never_launches) ... ok
+test_optional_telemetry_failure_does_not_replay_authorization_or_adoption (test_resumable_semantic_durability.CheckpointDurabilityTests.test_optional_telemetry_failure_does_not_replay_authorization_or_adoption) ... ok
+test_accepted_review_response_lost_heartbeat_polling_and_restart_no_relaunch (test_resumable_semantic_durability.ResumableHeartbeatTests.test_accepted_review_response_lost_heartbeat_polling_and_restart_no_relaunch) ... [bridge] issue #1 -> task 1416553e435df02be9e79746
+ok
+test_accepted_merge_is_reconciled_after_closed_restart (test_publication_closure.PublicationClosureTests.test_accepted_merge_is_reconciled_after_closed_restart) ... [bridge] issue #1 -> task 1416553e435df02be9e79746
+[bridge] independent review PASS for 1416553e435df02be9e79746
+ok
+test_accepted_pr_creation_is_reconciled_after_closed_restart (test_publication_closure.PublicationClosureTests.test_accepted_pr_creation_is_reconciled_after_closed_restart) ... [bridge] issue #1 -> task 1416553e435df02be9e79746
+[bridge] independent review PASS for 1416553e435df02be9e79746
+ok
+test_accepted_push_is_reconciled_after_closed_restart (test_publication_closure.PublicationClosureTests.test_accepted_push_is_reconciled_after_closed_restart) ... [bridge] issue #1 -> task 1416553e435df02be9e79746
+[bridge] independent review PASS for 1416553e435df02be9e79746
+ok
+test_accepted_unacknowledged_commit_survives_closure_and_two_restarts (test_publication_closure.PublicationClosureTests.test_accepted_unacknowledged_commit_survives_closure_and_two_restarts) ... [bridge] issue #1 -> task 1416553e435df02be9e79746
+[bridge] independent review PASS for 1416553e435df02be9e79746
+ok
+test_close_after_commit_object_read_blocks_ref_mutation (test_publication_closure.PublicationClosureTests.test_close_after_commit_object_read_blocks_ref_mutation) ... [bridge] issue #1 -> task 1416553e435df02be9e79746
+[bridge] independent review PASS for 1416553e435df02be9e79746
+[bridge] task 1416553e435df02be9e79746 -> READY_FOR_REVIEW
+ok
+test_close_during_delayed_owner_preflight_blocks_commit (test_publication_closure.PublicationClosureTests.test_close_during_delayed_owner_preflight_blocks_commit) ... [bridge] issue #1 -> task 1416553e435df02be9e79746
+[bridge] independent review PASS for 1416553e435df02be9e79746
+[bridge] task 1416553e435df02be9e79746 -> READY_FOR_REVIEW
+ok
+test_close_during_delayed_repository_snapshot_blocks_commit (test_publication_closure.PublicationClosureTests.test_close_during_delayed_repository_snapshot_blocks_commit) ... [bridge] issue #1 -> task 1416553e435df02be9e79746
+[bridge] independent review PASS for 1416553e435df02be9e79746
+[bridge] task 1416553e435df02be9e79746 -> READY_FOR_REVIEW
+ok
+test_close_while_mutation_waits_for_capacity_blocks_dispatch (test_publication_closure.PublicationClosureTests.test_close_while_mutation_waits_for_capacity_blocks_dispatch) ... [bridge] issue #1 -> task 1416553e435df02be9e79746
+[bridge] independent review PASS for 1416553e435df02be9e79746
+[bridge] task 1416553e435df02be9e79746 -> READY_FOR_REVIEW
+ok
+test_closed_accepted_coding_launch_is_adopted_after_restart_without_replay (test_publication_closure.PublicationClosureTests.test_closed_accepted_coding_launch_is_adopted_after_restart_without_replay) ... ok
+test_closed_after_pr_read_cannot_create_pr (test_publication_closure.PublicationClosureTests.test_closed_after_pr_read_cannot_create_pr) ... [bridge] issue #1 -> task 1416553e435df02be9e79746
+[bridge] independent review PASS for 1416553e435df02be9e79746
+[bridge] task 1416553e435df02be9e79746 -> READY_FOR_REVIEW
+ok
+test_closed_after_pr_read_cannot_merge (test_publication_closure.PublicationClosureTests.test_closed_after_pr_read_cannot_merge) ... [bridge] issue #1 -> task 1416553e435df02be9e79746
+[bridge] independent review PASS for 1416553e435df02be9e79746
+[bridge] task 1416553e435df02be9e79746 -> READY_FOR_REVIEW
+ok
+test_closed_after_remote_read_cannot_push (test_publication_closure.PublicationClosureTests.test_closed_after_remote_read_cannot_push) ... [bridge] issue #1 -> task 1416553e435df02be9e79746
+[bridge] independent review PASS for 1416553e435df02be9e79746
+[bridge] task 1416553e435df02be9e79746 -> READY_FOR_REVIEW
+ok
+test_closed_coding_launch_waiting_for_capacity_is_fenced_without_send (test_publication_closure.PublicationClosureTests.test_closed_coding_launch_waiting_for_capacity_is_fenced_without_send) ... ok
+test_closed_reviewer_preparation_cannot_authorize_launch (test_publication_closure.PublicationClosureTests.test_closed_reviewer_preparation_cannot_authorize_launch) ... [bridge] issue #1 -> task 1416553e435df02be9e79746
+ok
+test_fresh_issue_read_blocks_mutation_before_next_control_poll (test_publication_closure.PublicationClosureTests.test_fresh_issue_read_blocks_mutation_before_next_control_poll) ... [bridge] issue #1 -> task 1416553e435df02be9e79746
+[bridge] independent review PASS for 1416553e435df02be9e79746
+[bridge] task 1416553e435df02be9e79746 -> READY_FOR_REVIEW
+ok
+test_later_publication_hold_blocks_reserved_unrelated_launch_without_state_churn (test_publication_closure.PublicationClosureTests.test_later_publication_hold_blocks_reserved_unrelated_launch_without_state_churn) ... ok
+test_revoked_chief_gate_during_read_cannot_update_ref (test_publication_closure.PublicationClosureTests.test_revoked_chief_gate_during_read_cannot_update_ref) ... [bridge] issue #1 -> task 1416553e435df02be9e79746
+[bridge] independent review PASS for 1416553e435df02be9e79746
+ok
+test_active_and_identity_or_turn_mismatch_are_never_signalled (test_operational_stability.OwnedCleanupTests.test_active_and_identity_or_turn_mismatch_are_never_signalled) ... ok
+test_escalation_rechecks_ownership_and_is_bounded (test_operational_stability.OwnedCleanupTests.test_escalation_rechecks_ownership_and_is_bounded) ... ok
+test_external_terminal_ambiguous_group_is_imported_as_occupied (test_operational_stability.OwnedCleanupTests.test_external_terminal_ambiguous_group_is_imported_as_occupied) ... ok
+test_operator_status_with_runtime_is_strictly_read_only (test_operational_stability.OwnedCleanupTests.test_operator_status_with_runtime_is_strictly_read_only) ... ok
+test_scheduler_releases_only_proven_terminal_locks (test_operational_stability.OwnedCleanupTests.test_scheduler_releases_only_proven_terminal_locks) ... ok
+test_terminal_ambiguous_group_retains_scheduler_capacity (test_operational_stability.OwnedCleanupTests.test_terminal_ambiguous_group_retains_scheduler_capacity) ... ok
+test_terminal_failure_metadata_and_ambiguous_orphan_lease (test_operational_stability.OwnedCleanupTests.test_terminal_failure_metadata_and_ambiguous_orphan_lease) ... ok
+test_terminal_owned_child_in_separate_group_is_cleaned (test_operational_stability.OwnedCleanupTests.test_terminal_owned_child_in_separate_group_is_cleaned) ... ok
+test_terminal_owned_children_metadata_and_lease_converge_idempotently (test_operational_stability.OwnedCleanupTests.test_terminal_owned_children_metadata_and_lease_converge_idempotently) ... ok
+test_unrecorded_survivors_fail_closed (test_operational_stability.OwnedCleanupTests.test_unrecorded_survivors_fail_closed) ... ok
+test_cached_listing_avoids_ssh_and_keeps_uncertain_capacity (test_worker_integration.WorkerIntegrationTests.test_cached_listing_avoids_ssh_and_keeps_uncertain_capacity) ... ok
+test_cli_routes_cached_listing (test_worker_integration.WorkerIntegrationTests.test_cli_routes_cached_listing) ... ok
+test_cli_routes_request_and_role (test_worker_integration.WorkerIntegrationTests.test_cli_routes_request_and_role) ... ok
+test_corrupt_task_metadata_is_unknown_and_other_tasks_are_listed (test_worker_integration.WorkerIntegrationTests.test_corrupt_task_metadata_is_unknown_and_other_tasks_are_listed) ... ok
+test_git_baseline_fingerprint_detects_dirty_content_change (test_worker_integration.WorkerIntegrationTests.test_git_baseline_fingerprint_detects_dirty_content_change) ... ok
+test_lease_capacity_and_traversal (test_worker_integration.WorkerIntegrationTests.test_lease_capacity_and_traversal) ... ok
+test_new_turn_cannot_reuse_previous_terminal_result_or_error (test_worker_integration.WorkerIntegrationTests.test_new_turn_cannot_reuse_previous_terminal_result_or_error) ... ok
+test_real_local_dummy_launch_and_rpc_replay_and_resume (test_worker_integration.WorkerIntegrationTests.test_real_local_dummy_launch_and_rpc_replay_and_resume) ... ok
+
+----------------------------------------------------------------------
+Ran 136 tests in 53.459s
+
+OK

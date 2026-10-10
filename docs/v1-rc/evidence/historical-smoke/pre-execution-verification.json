@@ -1,0 +1,10 @@
+{
+  "status": "PASS",
+  "source_files": 124,
+  "untracked_files": 21,
+  "guarded_source_files": 17,
+  "tree_manifest_sha256": "31834a44973af92ad721b3cf6bc8ce45fe63802ca1dbad28c1a0708964175495",
+  "preparation_manifest_sha256": "a4db4f76cdabe8750f51d5fd229e9e97cb7519c9d221db6e2dff7865d790c255",
+  "production_access": false,
+  "smoke_executed": false
+}

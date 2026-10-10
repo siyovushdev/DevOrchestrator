@@ -1,0 +1,18 @@
+{
+  "root": "/home/siovush/DevOrchestrator-integration",
+  "command": [
+    "/home/siovush/DevOrchestrator-integration/.venv/bin/python",
+    "-m",
+    "unittest",
+    "discover",
+    "-s",
+    "tests",
+    "-p",
+    "test_chief*.py",
+    "-v"
+  ],
+  "exit_code": 0,
+  "elapsed_seconds": 50.24,
+  "log": "/tmp/devorchestrator-independent-chief-a1q0hwc2/integration-chief.log",
+  "log_sha256": "741339f916a293e3d628884bbd1b2e77faa6826a9a63b17fc4a8134862badc4e"
+}

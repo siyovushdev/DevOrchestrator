@@ -1,0 +1,18 @@
+{
+  "status": "FAIL",
+  "group": "full",
+  "tests": 737,
+  "discovered": 737,
+  "unique_ids": 737,
+  "seconds": 225.7639357749722,
+  "failures": 2,
+  "errors": 0,
+  "skips": 0,
+  "python": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]",
+  "mcp": "2.3.0",
+  "failed_ids": [
+    "test_operational_stability.OwnedCleanupTests.test_unrecorded_survivors_fail_closed",
+    "test_worker_integration.WorkerIntegrationTests.test_git_baseline_fingerprint_detects_dirty_content_change"
+  ],
+  "skipped_ids": []
+}

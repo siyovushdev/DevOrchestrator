@@ -5,6 +5,10 @@ from health import validate_health
 
 
 async def main():
+    from external_effects import refuse
+    # This legacy client requests doctor/recovery on a separately running MCP.
+    # Its local environment cannot latch that server over the wire.
+    refuse('worker')
     async with Client(MCP_URL) as client:
         tools = await client.list_tools()
 

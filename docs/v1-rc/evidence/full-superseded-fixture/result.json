@@ -1,0 +1,17 @@
+{
+  "status": "FAIL",
+  "group": "full",
+  "tests": 737,
+  "discovered": 737,
+  "unique_ids": 737,
+  "seconds": 305.10512602701783,
+  "failures": 1,
+  "errors": 0,
+  "skips": 0,
+  "python": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]",
+  "mcp": "2.3.0",
+  "failed_ids": [
+    "test_operational_stability.OwnedCleanupTests.test_active_and_identity_or_turn_mismatch_are_never_signalled"
+  ],
+  "skipped_ids": []
+}

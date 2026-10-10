@@ -43,6 +43,19 @@ def identity(pid):
         return fields[19]
     except OSError: return None
 boot = pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+if os.environ.get('DEVORCHESTRATOR_BLOCK_EXTERNAL_EFFECTS') == '1':
+    if mode != 'report':
+        raise RuntimeError('External worker effect blocked')
+    # Direct script invocation must be observational too: no mkdir, lock,
+    # watchdog write, cleanup or successful completion from cached status.
+    path = root / 'events.jsonl'
+    chunk = b''; more = False
+    if path.exists():
+        with path.open('rb') as log:
+            log.seek(int(sys.argv[3])); chunk = log.read(524288); more = bool(log.read(1))
+    print(json.dumps(dict(status='UNKNOWN', exit_code=None, cleanup_state='ACTIVE',
+        observation_confidence='READ_ONLY', chunk=base64.b64encode(chunk).decode(), more=more)))
+    raise SystemExit(0)
 root.mkdir(parents=True, exist_ok=True, mode=0o700)
 # Concurrent/replayed SSH invocations must share a single launch receipt.
 import fcntl
@@ -96,7 +109,10 @@ with (root / 'lock').open('a') as lock:
                 health = runtime_liveness.watchdog(root, context)
                 status, code = runtime_liveness.task_status(health)
                 import worker_runtime
-                cleanup = worker_runtime.cleanup_group(root, context, status)
+                if os.environ.get('DEVORCHESTRATOR_BLOCK_EXTERNAL_EFFECTS') == '1':
+                    cleanup = 'ACTIVE'
+                else:
+                    cleanup = worker_runtime.cleanup_group(root, context, status)
                 extra = dict(liveness=record, runtime_health=health, cleanup_state=cleanup)
             # Observe exit before reading logs. A process that exits while this
             # chunk is being read must not make an incomplete chunk final.
@@ -115,6 +131,8 @@ SCRIPT = SCRIPT.replace('runner = BUNDLE +', 'runner = ' + repr(BUNDLE) + ' +')
 
 
 def rpc(machine, mode, key, value, context=None):
+    from external_effects import refuse
+    refuse('worker')
     import devctl
     args = ['python3', '-c', SCRIPT, mode, key, str(value)]
     if context is not None:
@@ -131,7 +149,16 @@ def start(machine, key, command, context=None):
     return rpc(machine, 'start', key, command, context)
 
 
+def cached_refresh(meta, directory):
+    """Share local read-only diagnosis; cached status is never authority."""
+    from devctl import stored_task_status
+    return stored_task_status(meta, directory)
+
+
 def refresh(meta, directory):
+    from external_effects import blocked
+    if blocked():
+        return cached_refresh(meta, directory)
     from durable import exclusive, read_json
     with exclusive(directory / 'remote-refresh.lock', blocking=True):
         meta.update(read_json(directory / 'meta.json'))
@@ -140,6 +167,9 @@ def refresh(meta, directory):
 
 
 def _refresh(meta, directory):
+    from external_effects import blocked
+    if blocked():
+        return cached_refresh(meta, directory)
     from durable import exclusive, read_json
     key = meta['remote_key']
     log = directory / 'events.jsonl'

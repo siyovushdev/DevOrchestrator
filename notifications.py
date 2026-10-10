@@ -62,6 +62,8 @@ def send(text, opener=None, sleep=time.sleep):
     The normal transport runs in a killable subprocess with a wall-clock bound;
     even a server trickling response bytes cannot keep the bridge blocked.
     """
+    from external_effects import refuse
+    refuse('telegram')
     token, chat = os.environ.get('TELEGRAM_BOT_TOKEN'), os.environ.get('TELEGRAM_CHAT_ID')
     if not token or not chat:
         return False

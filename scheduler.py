@@ -162,6 +162,8 @@ class Scheduler:
     def release(self, owner):
         from operational_state import chief_repository_hold, post_merge_repository_hold, publication_repository_hold
         item = self.state.get('issues', {}).get(str(owner))
+        if isinstance(item, dict) and item.get('safety_latch_hold'):
+            return False
         from review_transitions import holds_repository
         if item is not None and holds_repository(item):
             return False
@@ -179,6 +181,13 @@ class Scheduler:
 
     def recover(self, tasks, identity_resolver=None):
         """Import active legacy/direct tasks; never steal an uncertain lock."""
+        from external_effects import blocked
+        if blocked():
+            return  # Observations cannot settle or manufacture queue ownership.
+        held_tasks = {task_id for item in self.state.get('issues', {}).values()
+                      if isinstance(item, dict) and item.get('safety_latch_hold')
+                      for task_id in (item.get('task_id'), item.get('review_task_id')) if task_id}
+        tasks = [t for t in tasks if t.get('observation_confidence') != 'READ_ONLY' and t.get('id') not in held_tasks]
         identity_resolver = identity_resolver or project_identity
         for task in tasks:
             project = task.get('project')
@@ -220,7 +229,8 @@ class Scheduler:
         # admission predicate also honors this hold before recovery can run.
         for key, job in self.jobs.items():
             item = self.state.get('issues', {}).get(str(job['owner']), {})
-            if job.get('repo') and (post_merge_repository_hold(item) or holds_repository(item) or publication_repository_hold(item)):
+            if job.get('repo') and (item.get('safety_latch_hold') or post_merge_repository_hold(item) or
+                                    holds_repository(item) or publication_repository_hold(item)):
                 self.locks.setdefault(job['repo'], {'owner': job['owner'], 'key': key})
         for repo, lock in list(self.locks.items()):
             jobs = [j for j in self.jobs.values() if j.get('repo') == repo and j.get('owner') == lock.get('owner')]
@@ -230,6 +240,8 @@ class Scheduler:
             if diagnostics.get(repo) == 'Lock retained: missing queue ownership proof':
                 diagnostics.pop(repo)
             item = self.state.get('issues', {}).get(str(lock.get('owner')))
+            if isinstance(item, dict) and item.get('safety_latch_hold'):
+                continue
             from review_transitions import holds_repository
             if item is not None and holds_repository(item):
                 continue

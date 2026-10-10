@@ -69,6 +69,8 @@ class Repository:
             raise PublicationError('Task no longer matches registered workspace')
 
     def run(self, *args):
+        from external_effects import refuse
+        refuse('publication')
         merge_api = (args[:6] == ('gh', 'api', '--hostname', 'github.com', '--method', 'PUT') and
                      len(args) > 6 and re.fullmatch(
                          r'repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pulls/[1-9][0-9]*/merge', args[6]))
@@ -104,6 +106,8 @@ class Repository:
         return self.run('git', *args)
 
     def snapshot(self):
+        from external_effects import refuse
+        refuse('publication')
         result = devctl.capture(self.machine, shlex.join([
             'python3', '-c', SNAPSHOT_SCRIPT, self.workspace]), separate_stderr=True)
         if result.returncode:
@@ -112,6 +116,8 @@ class Repository:
 
     def review_evidence(self, snapshot):
         """Local registered workspace and freshly verified object IDs only."""
+        from external_effects import refuse
+        refuse('publication')
         from chief_evidence import EVIDENCE_SCRIPT
         result = devctl.capture(self.machine, shlex.join([
             'python3', '-c', EVIDENCE_SCRIPT, self.workspace,
@@ -285,16 +291,37 @@ def _prove_non_merge_steps(repo, item, persist, *, allow_open=False):
     return True
 
 
+def _merge_send_latched(item, entry):
+    """True only after a merge send was authorized or its result is already durable.
+
+    A journal command, base and repo are the pre-send record. They are not
+    authorization to invent a PENDING attempt.
+    """
+    convergence = item.get('post_merge_convergence') or {}
+    if item.get('merged') or item.get('owner_state') == 'MERGED':
+        return True
+    if entry.get('outcome') in ('PENDING', 'MERGED', 'NOT_MERGED'):
+        return True
+    if entry.get('dispatch_state') in ('SENDING', 'RETURNED'):
+        return True
+    if convergence.get('status') in ('PENDING', 'BLOCKED', 'DONE', 'NOT_REQUIRED', 'NOT_MERGED'):
+        return True
+    return convergence.get('refusal_http_status') is not None
+
+
 def _execute_steps(repo, item, report, command, persist, *, reconcile_only=False):
     """Failed preconditions cannot erase an uncertain earlier external effect."""
     try:
         return (yield from __execute_steps(repo, item, report, command, persist, reconcile_only=reconcile_only))
     except PublicationError:
-        if command.get('action') == 'MERGE' and (
-                item.get('post_merge_convergence') or {}).get('status') != 'NOT_MERGED':
+        entry = ((item.get('publication_journal') or {}).get('MERGE') or {})
+        if (command.get('action') == 'MERGE' and
+                (item.get('post_merge_convergence') or {}).get('status') != 'NOT_MERGED' and
+                not (reconcile_only and not _merge_send_latched(item, entry))):
             # Also inspect after early permanent errors (dirty tree, stale Chief,
             # moved refs). A CLOSED observation can settle a previous uncertainty
             # without authorizing a publication or changing any Git history.
+            # Archived recovery with no latched send must not invent that record.
             (yield from _prove_non_merge_steps(repo, item, persist))
         raise
 
@@ -437,6 +464,12 @@ def __execute_steps(repo, item, report, command, persist, *, reconcile_only=Fals
                             (('branch', branch), ('base', base), ('method', method)))):
                     raise PublicationError('Post-merge convergence assessment changed')
                 if pr['state'] != 'MERGED':
+                    if reconcile_only:
+                        # A bound MERGED observation above is reconciliation.
+                        # Anything else needs a send that already happened.
+                        if not _merge_send_latched(item, entry):
+                            raise PublicationError('Archived recovery cannot authorize a new merge')
+                        raise PublicationError('Archived recovery cannot repeat a merge send')
                     uncertain_retry = convergence is not None and convergence.get('status') == 'PENDING'
                     # Assess only a new publication, before the external mutation.
                     # A merged historical PR with no record must remain archival.

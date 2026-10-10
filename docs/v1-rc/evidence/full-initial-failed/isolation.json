@@ -1,0 +1,11 @@
+{
+  "status": "PASS",
+  "source_read_only": true,
+  "production_visible": false,
+  "host_mcp_reachable": false,
+  "home_and_tmp_initially_empty": true,
+  "private_pid_and_network_namespaces": true,
+  "verified_python_sources": 83,
+  "pid_namespace": "pid:[4026541024]",
+  "network_namespace": "net:[4026541026]"
+}

@@ -1,202 +1,157 @@
-# Integration progress
+# V1 RC progress — 2026-10-10
 
-## Initial inspection
+## Inventory and candidate construction
 
-- Current worktree is clean; all three trees share base commit
-  `6de216192084b9902c73f5a81e1965d1d9b5c7a1`.
-- No applicable AGENTS.md found in the workspace or parent directory.
-- Review source: 19 tracked files plus 21 untracked files (including historical
-  PLAN/PROGRESS); #47 source: five tracked and four untracked files.
-- Intersections: bridge_effects.py, devctl.py, operational_state.py, task_bridge.py.
-  F3 introduces one shared resumable outbox core and a fatal writer persistence
-  boundary. #47 supplies bounded optional telemetry, legacy filtering and
-  transient Telegram rendering. These must be combined, preserving both.
-- Source PLAN/PROGRESS are historical evidence and will be retained under docs;
-  integration PLAN/PROGRESS track this task only.
+- Production HEAD `6de216192084b9902c73f5a81e1965d1d9b5c7a1`, clean;
+  integration HEAD `d447ebc6e88531dc003665874ad9cfd498d5d0b4`, clean;
+  acceptance HEAD `adab54726e7427d83cf42d9241c570ec619dceec`, 16 tracked edits
+  and 21 individual untracked files. Seven existing worktrees recorded in
+  `docs/v1-rc/evidence/baseline.json`. No applicable AGENTS.md found.
+- Acceptance contains every integration file. Exactly 16 tracked paths differ;
+  Chief tests and other integration files are identical. Chief implementation
+  remains in both changed runtime paths; independent reviewer invoked.
+- Acceptance and frozen copy match all 124 hashes/file set and 17 guarded hashes.
+  Preparation artifacts and historical logs verified. Historical full: 737 PASS /
+  320.331s; targeted: 55 PASS / 9.773s; smoke: 9 PASS / 1.559s. Independent
+  173 PASS and final SMOKE_ACCEPTED are owner-attested; separate reviewer record
+  is not present. Historical results are not new candidate verification.
+- Created independent Git clone/object store, no remotes, detached at acceptance
+  HEAD. Copied exact frozen files including untracked modules/tests/docs.
+  No source worktree/index/branch changes. Prior integration PLAN/PROGRESS archived.
+- Baseline includes production files/Git metadata, live state and local config.
+  Saved only hashes/path metadata, never secret/state content. Tests use synthetic
+  fixtures. Copied acceptance-only venv into candidate.
 
-## Integration checkpoint
+Next: isolated targeted/full tests, independent review, architectural review,
+final preservation and release handoff. These engineering actions are authorized.
 
-- Read both implementation diffs, new modules, tests and docs. Applied the full
-  F3 diff, copied new modules/tests/docs, then applied nonconflicting #47 hunks.
-- Manually combined save/load and asynchronous outbox rendering. Preserved
-  DurabilityFailure before dispatch; telemetry saves follow workflow checkpoints.
-  Both outbox adapters now use the same immutable Telegram payload/send buffer.
-- Retained historical review PLAN/PROGRESS in docs/integration-sources.
-- Initial compilation and diff check pass. Transferred #47 loop fixtures need
-  adaptation to F3's cooperative dispatcher (no loop.discover method and no
-  immediate state application in one step); first exploratory run is incomplete.
-- Created an integration-local .venv and copied existing installed dependencies
-  read-only from the review .venv; verified mcp 2.3.0. No downloads or source writes.
+## Targeted verification and independent review
 
-Next: repair transferred fixtures, run focused suites, add combined regressions.
-All tests/measurements use isolated temporary fixtures.
+- Fresh RC targeted run: **118 PASS / 48.058s**, exit 0, no skips/errors/failures;
+  118 discovered and unique executed IDs. Read-only source, private PID/network
+  namespaces, empty synthetic HOME/TMPDIR, production invisible, host MCP
+  unreachable. Python 3.12.3, MCP 2.3.0. Complete logs/inventory/isolation evidence
+  captured in `.rc-lab/targeted-9a58100c/evidence` and will be archived for handoff.
+- Independent read-only reviewer **ACCEPTED** Chief fix and combined Safety Latch:
+  **106 PASS / 58.012s**, exit 0, zero skips/errors/failures. 82 independently
+  compared runtime/test/Chief-doc files match acceptance and remain unchanged.
+  Additional adversarial checks cover lock release after POST, tree-check refusal
+  and tampered quarantined Chief status after latch removal. Review was performed by
+  the separate reviewer agent `/root/independent_chief_review`; no claim of owner
+  release acceptance. Reviewer-owned artifacts copied under
+  `docs/v1-rc/evidence/independent-chief/`.
+- No confirmed runtime integration defect. Exact source composition requires no
+  code rewrite. All frozen Python file hashes still match; compilation of 85
+  source/test/verification files passed before importing reviewer artifacts.
+- `.gitignore` now excludes candidate-only `.rc-lab/`; only engineering docs and
+  reproducible verification tooling differ from the frozen input.
+- Full 737-test run is in progress. Two isolated final-candidate 60-second idle
+  and deferred-notification measurements started; authoritative zero-write
+  assertions retained from the source measurement tool.
 
-## Recovery and focused verification (2026-10-10)
+## Full-run findings and minimal correction
 
-- Server interruption preserved the worktree. Rechecked status, PLAN/PROGRESS,
-  logs and source hashes before resuming. Source statuses/hashes are unchanged.
-- Adapted four #47 idle-loop tests to F3's explicit I/O boundary progression.
-  Preserved mtime/inode/content, actual replacement, restart and no-send checks.
-- Added five combined regressions in tests/test_resumable_semantic_durability.py:
-  all checkpoint phases through the semantic writer; optional telemetry failure;
-  fatal authoritative failure; legacy envelope migration; accepted/lost reviewer
-  response with heartbeat polling and restart deduplication.
-- Sandbox runs stalled during thread-to-asyncio wakeups, reproduced on a copied,
-  unchanged F3 reference in /tmp. Outside sandbox, closure restart and all adapted
-  #47 tests complete normally. Temporary shutdown-code experiment was reverted;
-  control_loop.py remains identical to the source. The 20-test outside-sandbox
-  run passed 19; fixed the new test's measurement boundary to settle scheduler's
-  legitimate accepted-worker receipt before asserting no observation writes.
-- First final-loop 60-second measurements completed: baseline 4 authoritative
-  replacements / 9,128,698 serialized bytes; fixed 0, stable inode/mtime/content;
-  fixed telemetry 4 replacements / 2,354 bytes. Both read fresh reports twice.
-  Reproduce again after final verification and include deferred notifications.
+- First complete RC run: 737 executed / 225.764s; 735 PASS, two failures, zero
+  errors/skips. Preserved the whole run under `evidence/full-initial-failed/`.
+- Git baseline failure root cause: sandbox exposes `/usr/bin/awk` symlink but
+  not its `/etc/alternatives/awk` target. Captured real snapshot index pipeline
+  returning 127 with `awk: command not found` in `environment-root-cause.json`.
+  Runner now binds the resolved awk binary read-only at that one target; no host
+  configuration directory or production path is exposed. Runtime code unchanged.
+- Cleanup failure root cause: orphan fixture waited for durable exit_code, which
+  precedes actual supervisor termination. A still-live generation-bound wrapper
+  is a valid ownership anchor even after fixture clears receipt members, so a
+  legitimate SIGTERM contradicts the test's orphan premise. Fixture now waits/reaps
+  only its exact disposable wrapper and asserts absence before testing unrecorded
+  survivors. All no-signal assertions and cleanup runtime logic remain intact.
+- Only accepted Python diff is the eight-line synchronization correction in
+  `tests/test_operational_stability.py`; new candidate-python-manifest records
+  both acceptance and candidate hashes. Runtime and all 17 guards are unchanged.
+  Independent reviewer requested to verify root cause and changed fixture.
+- Targeted rerun expanded from 118 to 120 cases, including both failed cases;
+  complete rerun will follow final correction. No failure is excluded or skipped.
+- Preservation audit: production's 3,290 files (including Git metadata), two
+  config files and every original worktree HEAD/status/source hash are unchanged.
+  1,306/1,307 live-state files are unchanged; task_bridge_state.json drifted while
+  the preexisting production bridge continues running. Read-only systemctl, exact
+  script cmdline and bridge.lock ownership identify PID 1541746, started Oct 9.
+  No source/state/service mutation by this task; test namespaces have no host-state
+  mount. Literal whole-interval byte immutability of active live state is not
+  asserted. Evidence: preservation.json, background-writer-observation.json.
 
-Next: focused rerun, full regression (real MCP SDK, no skips), final measurement,
-diff self-review and persistent evidence/report.
+### Independent fixture review correction
 
-## Combined checks and final-loop measurement
+The independent reviewer found that applying wrapper reaping to every orphan
+fixture changes another test's live-leader identity-mismatch premise. A recorded
+surviving child remains a valid ownership anchor after leader exit; this is the
+accepted runtime contract, not a new cleanup bug. Moved exact wrapper wait/reap
+into only `test_unrecorded_survivors_fail_closed`, which specifically needs no
+live leader anchor. Other fixtures remain as accepted. The no-signal assertion
+is intact. Intermediate verification against the broader helper correction is
+historical; final focused/full runs must validate this narrower test-only diff.
 
-- Focused outside-sandbox rerun: **20 PASS in 16.644s**, no skips, after settling
-  the accepted-worker scheduler receipt before observation-only measurement.
-  Log: /tmp/integration-combined-unsandboxed.log.
-- Full regression started with `.venv/bin/python -m unittest discover -s tests -v`
-  outside sandbox; real MCP 2.3.0 is installed. Completion was pending at this checkpoint.
-- Four final-loop 60-second measurements completed outside sandbox, each with
-  17 writer steps, one discovery and five fresh reports. Original whole-state
-  save: 10 replacements / 22,822,915 authoritative bytes; integrated save: zero.
-  Deferred regeneration baseline: 4 replacements / 9,134,368 authoritative bytes;
-  integrated deferred case: zero. Both fixed files retain inode/mtime/content.
-  Fixed telemetry: 7,049 / 14,739 serialized bytes; process write_bytes:
-  40,960 / 61,440. Raw results are in docs/integration-evidence/measurement-*.json.
-- Documented the new loop's measurement protocol; retained older source figures
-  under an explicit historical heading. Baselines patch behavior in memory only.
-- Rechecked shared-save/outbox diffs against each source: fatal saves, exact
-  phases/envelopes, send receipts, narrow filtering and status-only sidecar reads
-  are preserved. Unchanged F3 modules retain source bytes.
+The identity-mismatch case also relied on the wrapper still being observable.
+Made only its wrapper_identity subcase deterministic with a matching current
+leader observation for the exact fixture PID, delegating all other PID reads to
+the real implementation. A mismatching receipt must still return AMBIGUOUS and
+never signal; real orphan/no-anchor and subgroup cleanup tests remain unchanged.
+This expresses the accepted documented live-anchor contract, rather than treating
+a valid surviving child anchor as unknown. Reviewer independently identified this
+fixture precondition. No worker/lifecycle runtime change was made.
 
-Next: finish full regression, fix any findings, rerun required checks, finalize
-self-review and report. No production-ready claim.
+## Final fixture and targeted verification
 
-## First complete regression and compatibility correction
+- Final expanded targeted suite: **136 PASS / 53.459s**,
+  exit 0, no skips/errors/failures. Includes all 10 OwnedCleanupTests, all eight
+  WorkerIntegrationTests and the prior latch/Chief/recovery/request/publication
+  suites. Exact inventory and complete log archived in evidence/targeted-final.
+- Fixture changes are limited to the unrecorded-survivor wrapper termination
+  precondition and deterministic live-leader observation for wrapper-identity
+  mismatch. Runtime and guarded hashes remain identical to accepted Safety Latch.
+- Third full candidate run started on these final test bytes. The second run
+  began on the broader, superseded fixture and is retained as intermediate
+  diagnostic evidence, not candidate validation. No failure/skip is omitted.
+- Installed dependency inventory: 29 distributions saved in dependency-lock.txt.
 
-- Complete run: 669 tests in 297.650s, 668 PASS and one failed assertion; no skips.
-  Real MCP HTTP concurrency test executed. The failure was the transferred
-  F3 test `test_unchanged_running_polls_and_timings_never_rewrite_authority`:
-  its global `write.assert_not_called()` also rejected permitted sidecar writes.
-  The failure's call list contained telemetry replacements, not state writes.
-- Adapted that assertion to count authoritative writes by destination, added
-  unchanged authoritative content and positive sidecar-update assertions.
-  This retains the original safety claim and checks retained observability.
-- Final complete regression started on this correction. Implementation code and
-  measurement implementation are unchanged from the four saved measurements.
-- Compilation, tracked/untracked whitespace checks and conflict-marker search
-  pass. Source HEAD/status and all 40 review / 9 semantic source hashes match
-  the initial manifest. Test inventory: 669, Python 3.12.3, MCP 2.3.0.
+## Revised independent approval
 
-## Final completion and independent-review handoff (2026-10-10)
+- Independent reviewer accepted final cleanup fixture corrections and awk mount:
+  **14 PASS / 2.418s**, exit 0, zero errors/failures/skips. Includes all ten real
+  OwnedCleanupTests, baseline fingerprint and three reviewer-owned anchor probes.
+  Earlier 106-case Chief/Safety Latch approval remains valid: all runtime bytes
+  unchanged. 81/82 original compared files remain identical; the sole altered
+  test file hash is a58f2e7221a4260e4a674a74dc278271c487d55882ec76fcc99156a1dfe4bf1b.
+- Updated independent evidence copied under independent-chief/followup. Earlier
+  rejected broad fixture experiment is preserved in that evidence with its
+  root cause and correction; final approval is explicit, not agent self-review.
 
-- Final full regression: `.venv/bin/python -m unittest discover -s tests -v`:
-  **669 PASS in 308.263s**, exit 0, no skips. This includes the actual MCP HTTP
-  concurrency test, all legacy migration/restart suites and five joint F3/#47
-  regressions. The full suite was not rerun after completion; final edits only
-  finalize documentation and evidence.
-- Focused results: 20 PASS in 16.644s; adapted F3 control suite 7 PASS in 6.937s.
-  Earlier exploratory failures and measurements above are historical; the four
-  persisted final-loop measurements supersede the preliminary sandbox figures.
-- Final measurements, ~60s each, 2.28 MB fixture: ordinary baseline 10 / 22,822,915
-  authoritative replacements/bytes -> fixed 0 / 0; deferred baseline
-  4 / 9,134,368 -> fixed 0 / 0. Fixed telemetry 7,049 / 14,739 serialized bytes;
-  process write_bytes 40,960 / 61,440. Authoritative content/inode/mtime stable.
-- Final self-review covers manually merged save/outbox/status paths, all new
-  modules/tests/docs, fatal checkpoints, immutable requests, receipts, locks,
-  sandbox, Chief/owner gates and publication closure. No unresolved architectural
-  conflict was found. Legacy state is normalized once; ambiguous legacy ownership
-  remains held, and accepted receipts recover without duplicate launches.
-- Git status and tracked/untracked whitespace/conflict checks are recorded in
-  docs/integration-evidence/verification.json, together with implementation/test
-  hashes and source verification. Compilation passed for all 71 Python files.
-  The streamed full-run output was truncated by the tool; no complete raw log is
-  claimed. The terminal result was 669/308.263s/OK, confirmed before finalization.
-- Both source worktrees retain their original HEAD/status and all 40 / 9 file
-  hashes. PLAN.md is complete. docs/integration-report.md contains the full change
-  inventory, resolved intersections, reproduction commands and remaining risks.
-- Ready for independent review, not production acceptance. Remaining work is real
-  provider/SSH failure soak, compatible worker/MCP rollout validation and operator
-  acceptance of ambiguous holds. Production/live state/config/services were not
-  touched; no commit, push, PR, merge, deployment or service restart was performed.
+## Final complete regression and engineering delivery
 
-Task complete. Stop after the final report; no additional operations scheduled.
+- Final full suite: **737 PASS / 277.412s**, exit 0, 0 failures/errors/skips.
+  All 737 unique executed IDs match discovery; full captured log, result, exact
+  bwrap command and isolation proof are in evidence/full-final. Python 3.12.3,
+  MCP 2.3.0; real private-loopback MCP concurrency and disposable dummy-worker
+  execution/recovery tests ran. Runtime/test hashes unchanged throughout final run.
+- Final targeted: 136 PASS / 53.459s, 0 failures/errors/skips. Independent
+  Chief/latch 106 PASS / 58.012s and final fixture/runner 14 PASS / 2.418s, ACCEPTED.
+- Both final-candidate measurements: 60.016s idle and 60.019s deferred, 17 writer
+  steps, 1 discovery/5 reports each, authoritative writes/bytes 0/0; content, inode,
+  mtime unchanged. Deferred effect stayed PENDING with identical payload. Telemetry
+  10/7,055 bytes and 16/16,435 bytes; process writes 40,960 and 65,536 bytes.
+- Compilation: 90 Python files PASS; whitespace/conflict/git diff checks PASS.
+  All 17 guard hashes retained. 120/124 frozen input files preserve exact bytes;
+  only .gitignore, current PLAN/PROGRESS and reviewed cleanup test changed. All
+  21 required untracked acceptance inputs present. Historical plans archived.
+- Original seven worktrees' HEAD/status/file sets/hashes, original branch/worktree
+  inventories, production 3,290 files including Git metadata and two config files
+  unchanged. Known external drift is only live task_bridge_state.json from the
+  preexisting active bridge; remaining 1,306 state files unchanged. No live state
+  writer, transport, service or worker operation was invoked by this task.
+- Source change manifest, independent evidence, failed/intermediate/final logs,
+  focused architectural review, release/rollback instructions and final report
+  prepared. Candidate identity is the frozen file manifest, not baseline HEAD.
+- No confirmed release-blocking integration defect remains. Full independent
+  release acceptance and owner commit/push/PR/merge/production activation gates
+  remain. No source commit, publication, restart or deployment performed.
 
-## Independent review follow-up: Chief delivery lock contention
-
-- Review reproduced worker.lock contention before POST becoming UNCERTAIN and
-  permanently preventing Chief evidence send. The prior integration handoff is
-  superseded by this authorized correction in the integration worktree only.
-- Added writer-local CommentNotDispatched proof, raised only by the narrow lock
-  acquisition handler before yielding POST. All other exceptions retain uncertain
-  acceptance/receipt reconciliation; generic BlockingIOError is not no-send proof.
-- Chief delivery always acquires worker.lock nonblocking. A confirmed no-send
-  result restores durable PENDING with existing bounded backoff; the checkpoint
-  remains fatal on persistence failure. A crash before that checkpoint retains
-  SENDING and the existing conservative receipt behavior.
-- Next: real flock contention/recovery, ambiguous POST/restart, no duplicates,
-  backoff/heartbeat no-write tests, focused and full regression, final self-review.
-
-### Follow-up focused verification
-
-- Eight new regressions in tests/test_chief_delivery_retry.py cover real flock,
-  pending backoff/restart/recovery, transport BlockingIOError, exact/duplicate
-  receipts, crash/checkpoint failure, retained Chief/owner gates and ControlLoop
-  polling. 40 deferred heartbeat/flush passes over 2.28 MB state cause zero
-  authoritative replacements; telemetry remains observable.
-- Focused: Chief family 63 PASS / 47.595s; semantic/resumable 19 PASS / 17.247s;
-  recovery 19 PASS / 0.097s; resumable control 7 PASS / 6.362s. Total 108 PASS.
-- Direct commands complete normally. A shell-wrapper sandbox invocation stalled
-  at the previously documented threaded asyncio wakeup boundary and was aborted;
-  no shutdown-code workaround or production action was added.
-- Compilation passes for 72 Python files. Discovery inventory contains 677 IDs.
-  Narrow follow-up runtime diff reconstructs the initial integration snapshot
-  and matches its saved SHA-256: only bridge_effects.py and task_bridge.py changed.
-- Full regression is running. Two final-tree 60s fixed durability measurements
-  are running in independent temporary fixtures. Final report:
-  docs/chief-delivery-fix-report.md. Current status is pending those results.
-
-### Follow-up durability measurements
-
-- Current fixed idle, 60.029s: 17 writer steps, one discovery, five fresh reports;
-  authoritative 0 replacements / 0 bytes; telemetry 10 / 7,037 bytes;
-  process write_bytes 40,960, syscw 10.
-- Current fixed deferred notification, 60.026s: same steps/reads;
-  authoritative 0 / 0; telemetry 16 / 16,438 bytes; process write_bytes 65,536,
-  syscw 16. PENDING event and payload unchanged.
-- Both state files retain content/inode/mtime. Raw results are
-  docs/integration-evidence/measurement-*-after-chief.json. Full regression
-  completion remains pending; no implementation changes since it started.
-
-### Follow-up final completion and self-review
-
-- Full regression: **677 PASS in 263.395s**, exit 0, no skips. Real MCP HTTP
-  concurrency, publication closure, Chief/owner gating, legacy migration and
-  restart suites all executed. Eight new tests account for 669 -> 677 discovery.
-- The code/test snapshot is unchanged since full regression started; subsequent
-  edits only finalize docs/evidence. Complete streamed output was captured in
-  /tmp/integration-chief-full.log; all 677 unique executed IDs match discovery.
-  Summary, log hash, implementation/test hashes and measurements are persisted
-  in docs/integration-evidence/chief-delivery-verification.json.
-- Final self-review confirms acquisition-only no-send proof, nonblocking lock,
-  bounded durable retry, fatal checkpoint failure and unchanged uncertain receipt
-  semantics. Generic BlockingIOError in POST is never safe retry; crash before
-  PENDING checkpoint remains conservative. No schema upgrade or forced reset of
-  old SENDING/UNCERTAIN is introduced. Chief/owner/publication gates remain intact.
-- Compilation, tracked/untracked whitespace and conflict checks pass. Source
-  HEAD/status and all 40 / 9 source hashes match the original manifest. Runtime
-  changes relative to the prior integration are exactly bridge_effects.py and
-  task_bridge.py; other runtime and existing test files retain their prior hashes.
-- PLAN.md follow-up is complete. docs/chief-delivery-fix-report.md and evidence
-  provide the changes, commands, results, measurements and compatibility limits.
-  Ready for independent verification, without a production-ready claim.
-- Production, live state, source worktrees, configs and services were not changed.
-  No commit, push, PR, merge, deployment or service restart was performed.
-
-Follow-up complete. Stop for independent verification; no additional operations.
+Engineering task complete; stop after delivering candidate and evidence.
