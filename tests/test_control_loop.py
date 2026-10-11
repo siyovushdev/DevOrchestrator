@@ -96,7 +96,10 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
             await loop.close()
 
     async def pump_control(self, loop, predicate):
-        for _ in range(700):
+        # Detached Git and durable fsync run in a real isolated filesystem.
+        # A tick-count is not a completion deadline; keep a finite wall bound.
+        until = time.monotonic() + 10
+        while time.monotonic() < until:
             loop.next_heavy = 0
             loop.next_control.clear()
             await loop.step()

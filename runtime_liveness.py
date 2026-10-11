@@ -110,9 +110,9 @@ def initialize(directory, meta, *, clock=None):
     return record
 
 
-def heartbeat(directory, generation, *, worker_pid, agent_pid, phase, exit_code=None):
+def heartbeat(directory, generation, *, worker_pid, agent_pid, phase, exit_code=None, lock=exclusive, record_process_group=True):
     """A generation fence prevents an old runner from touching a subsequent turn."""
-    with exclusive(directory / 'liveness.lock', blocking=True):
+    with lock(directory / 'liveness.lock', blocking=True):
         record = validate(read_record(directory))
         if record['generation'] != generation:
             raise RuntimeError('Runtime generation changed')
@@ -126,7 +126,7 @@ def heartbeat(directory, generation, *, worker_pid, agent_pid, phase, exit_code=
         # Record live group anchors before the supervisor exits, including
         # descendants surviving a successfully exited direct agent child.
         from worker_runtime import record_group
-        if worker_pid == os.getpid():
+        if record_process_group and worker_pid == os.getpid():
             record_group(directory, record, worker_pid)
         write_json(directory / 'liveness.json', record)
         return record

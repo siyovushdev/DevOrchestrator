@@ -1495,7 +1495,7 @@ def publication_authority(item):
         'task_id', 'coding_turn', 'coding_status', 'review_task_id', 'review_status',
         'review_coding_turn', 'reviewed_tree', 'review_hold', 'owner_approved_at',
         'owner_state', 'chief_required', 'chief_status', 'chief_review',
-        'worker_uncertain', 'review_uncertain')})
+        'worker_uncertain', 'review_uncertain', 'owner_decision')})
 
 
 def authorize_dispatch(number, command, state, issue):
@@ -1512,7 +1512,7 @@ def authorize_dispatch(number, command, state, issue):
                 guard.get('issue') != str(number) or guard.get('kind') != 'publication' or
                 exclusion_reason(item, issue) or guard.get('reconcile_only') or
                 publication_authority(item) != guard.get('quality') or
-                not chief_review.approval_complete(item) or item.get('review_hold') or
+                not chief_review.approval_complete(item) or not __import__('owner_decision').publication_allowed(item) or item.get('review_hold') or
                 owner_action_plan(item.get('owner_state'), guard.get('action'))['status'] != 'ALLOWED' or
                 (item.get('review_status') == 'PASS' and not notifications.review_approval_complete(item))):
             raise PublicationError('Current issue and quality approval are required before a new publication mutation')
@@ -2449,12 +2449,26 @@ async def process_owner_actions(issue, item, state, report):
         if comment_already_processed(comment, processed) or not authorized_comment(comment):
             continue
         try:
+            import owner_decision
+            decision = owner_decision.parse(comment.get('body'))
+            if decision is not None:
+                approved = item.get('owner_approved_at')
+                created = comment.get('createdAt')
+                if not approved or not created or datetime.fromisoformat(created.replace('Z', '+00:00')) <= datetime.fromisoformat(approved):
+                    raise PublicationError('Owner decision must follow current Chief PASS')
+                owner_decision.apply(item, comment['body'], cid)
+                processed.add(cid)
+                item['processed_owner_actions'] = sorted(processed)
+                save_state(state)
+                continue  # Quality decision alone performs no publication/notification.
             command = parse_owner_command(comment.get("body"))
             if not command:
                 continue
             if command["action"] == "ANSWER":
                 # Defer the answer to process_followup so it follows the coding resume path.
                 continue
+            if not owner_decision.publication_allowed(item):
+                raise PublicationError('Owner rejected or decision binding changed; publication remains blocked')
             plan = owner_action_plan(item.get("owner_state"), command["action"])
             if command['action'] == 'MERGE' and item.get('merged') and not merge_complete(item):
                 plan = {'status': 'ALLOWED', 'next_state': 'MERGED'}
@@ -2538,7 +2552,7 @@ async def process_followup(issue, item, state, report):
     for comment in (await io_call('comments', dict(number=issue["number"]))):
         body = comment.get("body") or ""
 
-        if chief_review.is_evidence_comment(body) or not authorized_comment(comment):
+        if 'DEVORCHESTRATOR_OWNER_DECISION_V1' in body or chief_review.is_evidence_comment(body) or not authorized_comment(comment):
             continue
         cid = comment_id(comment)
         if comment_already_processed(comment, processed):

@@ -539,6 +539,17 @@ def task_state(meta, directory, refresh_remote=True):
         meta.pop('_runtime_health', None)
     if meta.get("resume_prepared") or meta.get("launch_prepared"):
         return "UNKNOWN", None
+    if meta.get('native_codex'):
+        from native_supervisor import terminal_cleanup
+        result = read_json(directory / 'native-watchdog/bounded-result.json', {})
+        if result.get('state') == 'UNKNOWN': return 'UNKNOWN', None
+        if (directory / 'exit_code').exists():
+            state, code = stored_task_status(meta, directory)
+            proof = terminal_cleanup(directory, meta, state)
+            return (state, code) if proof == 'ABSENT' else ('UNKNOWN', None)
+        health = runtime_liveness.watchdog(directory, meta)
+        if health['state'] != 'RUNNING_HEALTHY': return 'UNKNOWN', None
+        return 'RUNNING', None
     if meta.get('runtime_generation') or (directory / 'liveness.json').exists():
         if meta.get('remote_key') and refresh_remote:
             state, code = remote_worker.refresh(meta, directory)
@@ -623,6 +634,11 @@ def spawn_runtime(directory, meta, command, log_file):
     from external_effects import refuse
     refuse('worker')
     meta['project'] = project_for_task(meta)
+    if meta.get('native_codex'):
+        from native_codex import spawn
+        process = spawn(directory, meta, log_file)
+        _CHILDREN.append(process)
+        return process
     meta.pop('runtime_generation', None)
     record = runtime_liveness.initialize(directory, meta)
     meta['runtime_generation'] = record['generation']
@@ -1261,6 +1277,10 @@ def preflight_task(operation, arguments):
         return execution_profiles.rejection(exc)
 
 
+def self_module():
+    return sys.modules[__name__]
+
+
 def run_agent(machine, agent, workspace, prompt, model=None, effort=None,
               request_id=None, role="coding", execution_profile=None, execution_options=None,
               review_binding=None, repository_binding=None):
@@ -1287,6 +1307,13 @@ def run_agent(machine, agent, workspace, prompt, model=None, effort=None,
             expected = dict(machine=machine, repository=canonical, registry_digest=digest(projects[project]))
             if repository_binding != expected:
                 raise execution_profiles.StaleReviewInput('Registered repository changed before launch')
+        import native_codex
+        native_config = native_codex.config(DATA_DIR)
+        if native_config:
+            previous = read_json(task_dir(task_id) / 'meta.json', {})
+            if previous and (not previous.get('native_codex') or previous.get('launch_prepared') or previous.get('resume_prepared') or
+                             previous.get('cleanup_state') == 'AMBIGUOUS' or previous.get('runtime_cleanup_pending')):
+                raise RuntimeError('UNKNOWN native request; no admission or resume; owner forward repair required')
         def prepare():
             if repository_binding is not None:
                 validate_repository()
@@ -1301,6 +1328,10 @@ def run_agent(machine, agent, workspace, prompt, model=None, effort=None,
                     # prepare has not admitted capacity, created metadata, or
                     # crossed the worker receipt boundary at this point.
                     raise execution_profiles.StaleReviewInput('Review source changed before launch') from exc
+            prepared_native = None
+            if native_config:
+                prepared_native = native_codex.prepare(self_module(), native_config, project, machine, agent,
+                    workspace, prompt, execution, role, request_id, review_binding)
             worker_runtime.check_capacity(DATA_DIR, task_id, machine, role, task_state)
             worker_runtime.admit(DATA_DIR, machine, canonical, task_id, task_state)
             directory = task_dir(task_id)
@@ -1309,6 +1340,7 @@ def run_agent(machine, agent, workspace, prompt, model=None, effort=None,
                       "execution": execution, "model": execution["model"], "reasoning_effort": execution["options"].get("effort"),
                       "workspace": workspace, "pid": 0, "status": "STARTING", "role": role,
                       "created_at": now(), "git_baseline": None, "launch_prepared": True, "prepared_request": request_id,
+                      **({'native_codex': prepared_native} if prepared_native else {}),
                       **({'review_binding': review_binding, 'launch_request_id': request_id}
                          if review_binding is not None else {}),
                       **({'repository_binding': repository_binding, 'launch_request_id': request_id}
@@ -1372,18 +1404,21 @@ def _run_agent(
         workspace,
     )
 
-    agent_command = build_agent_command(
-        machine,
-        agent,
-        workspace,
-        prompt,
-        model=model,
-        effort=effort,
-        role=role,
-        execution=execution,
-    )
-    actual_command = machine_command(machine, agent_command)
-
+    if prepared.get('native_codex'):
+        agent_command = ''
+        actual_command = []  # Native supervisor consumes the hash-bound structured spec.
+    else:
+        agent_command = build_agent_command(
+            machine,
+            agent,
+            workspace,
+            prompt,
+            model=model,
+            effort=effort,
+            role=role,
+            execution=execution,
+        )
+        actual_command = machine_command(machine, agent_command)
     meta = {
         "id": task_id,
         "machine": machine,
@@ -1394,6 +1429,7 @@ def _run_agent(
         "pid": 0,
         "role": role,
         "git_baseline": git_baseline,
+        **({'native_codex': prepared['native_codex']} if prepared.get('native_codex') else {}),
         **({key: prepared[key] for key in ('review_binding', 'launch_request_id')}
            if prepared.get('review_binding') is not None else {}),
         **({key: prepared[key] for key in ('repository_binding', 'launch_request_id')}
@@ -1595,6 +1631,8 @@ def continue_task(task_id, prompt, request_id=None):
     refuse('worker')
     with exclusive(DATA_DIR.parent / "worker.lock", blocking=True):
         meta = load_meta(task_id)
+        if meta.get('native_codex'):
+            raise execution_profiles.PreflightRejected('Native Codex continuation requires a fresh authorized request; automatic session resume disabled')
         project = project_for_task(meta)
         if project == "-":
             raise ValueError("Task workspace is no longer registered")

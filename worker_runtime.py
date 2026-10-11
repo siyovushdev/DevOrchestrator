@@ -163,6 +163,9 @@ def cleanup_group(directory, meta, state, *, grace_seconds=1):
     # which do not have that import available.
     if os.environ.get('DEVORCHESTRATOR_BLOCK_EXTERNAL_EFFECTS') == '1':
         return recorded_cleanup(meta)
+    if meta.get('native_codex'):
+        from native_supervisor import terminal_cleanup
+        return terminal_cleanup(directory, meta, state)
     if state not in ('DONE', 'FAILED') or meta.get('launch_prepared') or meta.get('resume_prepared'):
         return 'ACTIVE'
     if meta.get('remote_key'):
@@ -270,6 +273,9 @@ def cleanup_group(directory, meta, state, *, grace_seconds=1):
 
 def publication_safe(directory, meta):
     """Read-only ownership proof for terminal tasks; never signal or reconcile."""
+    if meta.get('native_codex'):
+        from native_supervisor import terminal_cleanup
+        return terminal_cleanup(directory, meta, 'DONE') == 'ABSENT'
     try:
         if meta.get('launch_prepared') or meta.get('resume_prepared'):
             return False

@@ -329,6 +329,9 @@ def _execute_steps(repo, item, report, command, persist, *, reconcile_only=False
 def __execute_steps(repo, item, report, command, persist, *, reconcile_only=False):
     """Journal before mutations. Recover uncertain results by inspecting Git/GitHub."""
     from chief_review import approval_complete
+    from owner_decision import publication_allowed
+    if not reconcile_only and not publication_allowed(item):
+        raise PublicationError('Current owner disposition forbids publication')
     if not reconcile_only and not approval_complete(item):
         raise PublicationError('Current Chief PASS is required for publication')
     action = command['action']

@@ -1,6 +1,7 @@
 """Production driver with isolated providers and deterministic suspended RPCs."""
 import asyncio
 import copy
+import time
 import unittest
 from unittest.mock import patch
 
@@ -17,7 +18,10 @@ class ResumableControlTests(unittest.IsolatedAsyncioTestCase):
     setUp = integration.BridgeIntegrationTests.setUp
 
     async def pump(self, loop, predicate, limit=600):
-        for _ in range(limit):
+        # Preserve every state/effect assertion; wait for actual I/O completion
+        # under a finite wall-clock bound rather than ~1.2s of synthetic ticks.
+        until = time.monotonic() + max(10, limit * .002)
+        while time.monotonic() < until:
             loop.next_heavy = 0
             loop.next_control.clear()
             await loop.step()
