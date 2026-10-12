@@ -1462,6 +1462,8 @@ def task_execution_request(issue):
 async def transport_call(name, arguments):
     from external_effects import guard_worker_rpc
     guard_worker_rpc(name, arguments)
+    if name in ('start_task','continue_task','adopt_task'):
+        __import__('admission_policy').validate_rpc(name,arguments)
     return await asyncio.wait_for(_transport_call(name, arguments), timeout=120)
 
 
@@ -1783,6 +1785,8 @@ async def mcp_call(name, arguments):
         raise RuntimeError('Pending launch intent differs from this RPC; existing ownership must be reconciled')
     observe_reconciliation_stage('project_identity')
     project = arguments.get('project') or item['project']
+    key = hashlib.sha256(f"{REPO}:{number}:{name}:{operation}".encode()).hexdigest()
+    __import__('admission_policy').validate_scope(name, dict(arguments, project=project, request_id=key))
     if DRIVING.get() and name == 'start_task' and kind == 'coding' and not pending:
         binding = await io_call('project_identity', dict(project=project, binding=True))
         machine, repo = binding['machine'], binding['repository']
@@ -1793,6 +1797,8 @@ async def mcp_call(name, arguments):
     else:
         machine, repo = await io_call('project_identity', dict(project=project))
     key = hashlib.sha256(f"{REPO}:{number}:{name}:{operation}".encode()).hexdigest()
+    from admission_policy import validate_rpc
+    validate_rpc(name,dict(arguments, project=project, request_id=key))
     if pending and pending.get('arguments', {}).get('request_id', key) != key:
         raise RuntimeError('Pending launch request ID changed; existing ownership must be reconciled')
     scheduler = Scheduler(state)

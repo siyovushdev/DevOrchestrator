@@ -409,8 +409,12 @@ class NonzeroMergeRefusalTests(unittest.TestCase):
     def capture(self, machine, command, separate_stderr=False):
         self.assertEqual(machine, 'work'); self.assertTrue(separate_stderr)
         args = shlex.split(command)
-        if args[:2] == ['python3', '-c']:
-            self.assertEqual(args[2], p.SNAPSHOT_SCRIPT)
+        if args[:4] == ['/usr/bin/python3', '-I', '-B', '-c']:
+            self.assertEqual(len(args),6);self.assertEqual(args[5],'/registered/test')
+            actual=args[4].splitlines();expected=p.SNAPSHOT_SCRIPT.splitlines()
+            self.assertRegex(actual[2],r'^_git_end=min\(time.clock_gettime\(time.CLOCK_BOOTTIME\)\+30,[0-9.]+\)$')
+            actual[2]=expected[2]
+            self.assertEqual(actual,expected)
             return subprocess.CompletedProcess(args, 0, json.dumps(self.fake.snapshot()), '')
         self.assertEqual(args[:3], ['cd', '/registered/test', '&&'])
         args = tuple(args[3:])

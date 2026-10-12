@@ -18,6 +18,9 @@ sys.path.insert(0,str(Path(__file__).resolve().parent))
 from durable import read_json, write_json
 from native_deadlines import boot, clock, LIMITS
 
+class DeadlineReached(ValueError):
+    """A trusted callback exhausted the same monotonic execution deadline."""
+
 def identity(pid):
     try:
         p=Path('/proc')/str(pid)
@@ -194,7 +197,7 @@ class Cohort:
         for fd in self.fds.values():os.close(fd)
 
 def run(argv,folder,*,deadline,env=None,stdout=None,stderr=None,cwd=None,
-        term_grace=None,kill_grace=None,tick=None):
+        term_grace=None,kill_grace=None,tick=None,before_exec=None):
     require_support();folder=Path(folder);folder.mkdir(parents=True,exist_ok=True)
     journal=folder/'processes.json';result_path=folder/'bounded-result.json'
     if journal.exists() or result_path.exists():raise ValueError('Durable process fence exists; no automatic retry')
@@ -224,6 +227,7 @@ def run(argv,folder,*,deadline,env=None,stdout=None,stderr=None,cwd=None,
     try:
         cohort=Cohort(child.pid,journal)
         if child.pid not in cohort.members:raise ValueError('UNKNOWN: launch identity unavailable')
+        if before_exec:before_exec()
         write_json(gate,{'identity':cohort.members[child.pid]})
         if tick:tick(child.pid)
         while True:
@@ -244,8 +248,9 @@ def run(argv,folder,*,deadline,env=None,stdout=None,stderr=None,cwd=None,
                         try:os.waitpid(pid,os.WNOHANG)
                         except ChildProcessError:pass
     except (OSError,ValueError,subprocess.TimeoutExpired) as exc:
-        reason='UNKNOWN: '+str(exc)
-        ambiguous=True;known=False
+        timed_out=isinstance(exc,DeadlineReached)
+        reason='DEADLINE' if timed_out else 'UNKNOWN: '+str(exc)
+        ambiguous=not timed_out;known=False
         # A failed heartbeat/receipt callback must not escape the time bound.
         # Cleanup revalidates ownership independently. Identity/access errors
         # make it return False without guessed numeric-PID/group signals.

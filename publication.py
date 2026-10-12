@@ -6,15 +6,15 @@ import shlex
 import devctl
 
 # Runs on the registered machine. A temporary index leaves the user's index intact.
-SNAPSHOT_SCRIPT = r'''
+from repository_safety import GIT_PREAMBLE, bounded_script
+
+SNAPSHOT_SCRIPT = GIT_PREAMBLE + r'''
 import hashlib, json, os, subprocess, sys, tempfile
 workspace = sys.argv[1]
+assert_git_config(workspace)
+bounded_tree(workspace)
 def git(*args, env=None, optional=False):
-    p = subprocess.run(['git', '-C', workspace, *args], env=env,
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if p.returncode and not optional:
-        raise RuntimeError('Git snapshot failed')
-    return p.stdout if not p.returncode else b''
+    return safe_git(workspace,args,env=env,optional=optional)
 head = git('rev-parse', '--verify', 'HEAD', optional=True).decode().strip()
 branch = git('symbolic-ref', '--quiet', '--short', 'HEAD', optional=True).decode().strip()
 origin = git('remote', 'get-url', 'origin', optional=True).decode().strip()
@@ -107,9 +107,9 @@ class Repository:
 
     def snapshot(self):
         from external_effects import refuse
-        refuse('publication')
+        refuse('repository_read')
         result = devctl.capture(self.machine, shlex.join([
-            'python3', '-c', SNAPSHOT_SCRIPT, self.workspace]), separate_stderr=True)
+            '/usr/bin/python3', '-I', '-B', '-c', bounded_script(SNAPSHOT_SCRIPT), self.workspace]), separate_stderr=True)
         if result.returncode:
             raise PublicationError('Cannot fingerprint registered repository')
         return json.loads(result.stdout)
@@ -117,10 +117,10 @@ class Repository:
     def review_evidence(self, snapshot):
         """Local registered workspace and freshly verified object IDs only."""
         from external_effects import refuse
-        refuse('publication')
+        refuse('repository_read')
         from chief_evidence import EVIDENCE_SCRIPT
         result = devctl.capture(self.machine, shlex.join([
-            'python3', '-c', EVIDENCE_SCRIPT, self.workspace,
+            '/usr/bin/python3', '-I', '-B', '-c', bounded_script(EVIDENCE_SCRIPT), self.workspace,
             snapshot['tree'], snapshot.get('head') or '']), separate_stderr=True)
         if result.returncode:
             raise PublicationError('Cannot safely extract bounded Chief evidence')

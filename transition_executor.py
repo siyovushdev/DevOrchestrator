@@ -49,7 +49,7 @@ def synchronous(name, args):
         if args['method'] not in ('snapshot', 'review_evidence', 'git', 'run'):
             raise ValueError('Unknown repository operation')
         from external_effects import refuse
-        refuse('publication')
+        refuse('repository_read' if args['method'] in ('snapshot', 'review_evidence') else 'publication')
         repo = bridge.Repository(args['project'], args.get('report'))
         if 'configuration' in args and repo.cfg != args['configuration']:
             from publication import PublicationError

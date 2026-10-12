@@ -60,6 +60,9 @@ class ControlLoop:
 
     def _observe_control(self, number, observation):
         import task_bridge as bridge
+        from admission_policy import issue_allowed
+        if not issue_allowed(bridge.REPO, number, self.state['issues'].get(number)):
+            return
         if bridge.observation_barrier(self.state, number):
             return
         issue = observation['issue']
@@ -117,6 +120,9 @@ class ControlLoop:
         bridge.Scheduler(self.state).recover(tasks, identity_resolver=resolved)
         for issue in issues:
             number = str(issue['number'])
+            from admission_policy import issue_allowed
+            if not issue_allowed(bridge.REPO, number, self.state['issues'].get(number)):
+                continue
             if bridge.QUEUE_LABEL in bridge.label_names(issue) and number not in self.state['issues']:
                 self.state['issues'][number] = {'queue_status': 'QUEUED'}
             if number in self.state['issues']:
@@ -140,6 +146,9 @@ class ControlLoop:
             number = key.split(':', 1)[1]
         else:
             number = None
+        from admission_policy import issue_allowed
+        if number is not None and not issue_allowed(bridge.REPO, number, self.state['issues'].get(number)):
+            return
         if read_only_observation(value):
             targets = [number] if number is not None else [
                 n for n, item in self.state['issues'].items() if isinstance(item, dict) and item.get('task_id')]
@@ -212,7 +221,8 @@ class ControlLoop:
         if self.closing:
             return
         from external_effects import blocked
-        if blocked():
+        from admission_policy import available, issue_allowed
+        if blocked() or not available():
             await bridge.observe_latched_poll(self.state)
             return
         # Control/discovery reducers are lifecycle writers too. A failed save
@@ -254,6 +264,8 @@ class ControlLoop:
                             Command.create('control_read', dict(number=number), lane='control'))
                 self.poll_cursor += 1
             for number, item in list(self.state['issues'].items()):
+                if not issue_allowed(bridge.REPO, number, self.state['issues'].get(number)):
+                    continue
                 if not isinstance(item, dict) or not number.isdigit():
                     continue
                 if bridge.bridge_effects.observation_held(self.state, number):
@@ -305,6 +317,8 @@ class ControlLoop:
                 ready_numbers = ready_numbers[offset:] + ready_numbers[:offset]
                 self.writer_cursor += 1
             for number in ready_numbers:
+                if not issue_allowed(bridge.REPO, number, self.state['issues'].get(number)):
+                    continue
                 if bridge.bridge_effects.observation_held(self.state, number):
                     continue
                 if number not in self.waiting or number in self.ready:
@@ -358,5 +372,7 @@ async def discover():
     """Copied discovery observations; never receives a ControlLoop reference."""
     issues = await execute(Command.create('issues', {}))
     tasks = await execute(Command.create('rpc', dict(name='list_tasks', arguments={})))
+    from admission_policy import task_allowed
+    tasks = [task for task in tasks if task_allowed(task['id'])]
     identities = await execute(Command.create('discovery_identities', dict(tasks=tasks)))
     return dict(issues=issues, tasks=tasks, identities=identities)

@@ -89,21 +89,38 @@ def supervise(directory,generation,spec_path):
     record=native.validate(native.read_record(directory),meta)
     if record['generation']!=generation or record['role']!=spec['role'] or (run/'STOP_ADMISSION').exists():
         raise ValueError('Generation/role/admission mismatch')
+    from admission_policy import supervisor
+    admission_deadline=supervisor(spec['admission'],generation)
     owner=identity(os.getpid())
     if owner['pgid']!=os.getpid() or owner['sid']!=os.getpid():raise ValueError('Fresh supervisor session required')
     write_json(directory/'process_group.json',dict(task_id=record['task_id'],generation=generation,
         turn=record.get('turn',1),role=record['role'],agent=record['agent'],machine=record['machine'],
         wrapper_pid=os.getpid(),wrapper_identity={'boot':owner['boot'],'start':owner['start']},
         pgid=os.getpid(),sid=os.getpid(),members=[],groups=[]))
-    role_deadline=min(spec['deadline'],deadline(run,record['role']));last=[0.]
+    role_deadline=min(spec['deadline'],deadline(run,record['role']),admission_deadline);last=[0.]
+    def authorize_exec():
+        from admission_policy import require_running, emergency, validation_budget
+        try:
+            emergency()
+            with validation_budget(role_deadline):require_running(spec['admission'],generation,admission_deadline)
+        except __import__('native_process').DeadlineReached:
+            raise
+        except Exception as exc:
+            raise ValueError('Admission/emergency boundary revoked: '+type(exc).__name__) from exc
     def tick(pid):
+        authorize_exec()
         if time.monotonic()-last[0]>=min(native.HEARTBEAT_SECONDS,1):
             native.heartbeat(directory,generation,worker_pid=os.getpid(),agent_pid=pid,
                 phase='REVIEW' if record['role']=='review' else 'CODING',
                 lock=lambda path,blocking=True:bounded_lock(path,blocking,until=role_deadline),
                 record_process_group=False)
             last[0]=time.monotonic()
-    result=bounded(spec['argv'],directory/'native-watchdog',deadline=role_deadline,env=spec['env'],tick=tick)
+    result=bounded(spec['argv'],directory/'native-watchdog',deadline=role_deadline,env=spec['env'],tick=tick,before_exec=authorize_exec)
+    from admission_policy import terminal
+    try:terminal(spec['admission'],generation,result['cleanup_proven'] and result['state']!='UNKNOWN')
+    except (OSError,ValueError,KeyError,TimeoutError) as exc:
+        result={**result,'state':'UNKNOWN','returncode':None,'reason':'Admission terminal identity changed: '+type(exc).__name__}
+        write_json(directory/'native-watchdog/bounded-result.json',result)
     if result['state']=='UNKNOWN':
         stop(run,'UNKNOWN worker ownership/cleanup; owner forward repair required')
         write_json(directory/'native-timeout.json',{**result,'generation':generation,'state':'UNKNOWN'})

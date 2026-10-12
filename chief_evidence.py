@@ -3,16 +3,16 @@
 The worker receives only a locally registered workspace and verified object IDs.
 Paths come from that Git tree and are literal pathspecs, never issue commands.
 """
-EVIDENCE_SCRIPT = r'''
+from repository_safety import GIT_PREAMBLE
+
+EVIDENCE_SCRIPT = GIT_PREAMBLE + r'''
 import hashlib, json, os, re, subprocess, sys
 workspace, tree, head = sys.argv[1:]
 if not re.fullmatch(r'[0-9a-f]{40,64}', tree) or (head and not re.fullmatch(r'[0-9a-f]{40,64}', head)):
     raise ValueError('Invalid local tree identity')
+assert_git_config(workspace)
 def git(*args, input=None):
-    p = subprocess.run(['git', '-C', workspace, '--literal-pathspecs', *args], input=input,
-                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    if p.returncode: raise RuntimeError('Evidence extraction failed')
-    return p.stdout
+    return safe_git(workspace,args,input=input)
 base = head or git('mktree', input=b'').decode().strip()
 raw = git('diff-tree', '--no-commit-id', '--raw', '-z', '-r', '--no-renames', base, tree).split(b'\0')
 files, patches, total = [], [], 0
