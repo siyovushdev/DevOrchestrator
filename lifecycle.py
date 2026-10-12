@@ -82,6 +82,7 @@ def plan(state, data_dir, registry, retention_days=30, issue_days=7, now=None):
 
 
 def apply(state, data_dir, actions, persist, close_issue):
+    __import__('admission_policy').require_operation('maintenance')
     for action in actions:
         if action['action'] == 'close_issue':
             number = action['number']
@@ -121,6 +122,7 @@ def main():
     parser.add_argument('--issue-days', type=int, default=int(os.environ.get('DEVORCHESTRATOR_ISSUE_RETENTION_DAYS', '7')))
     parser.add_argument('--state-dir', type=Path, default=devctl.DATA_DIR.parent)
     args = parser.parse_args()
+    __import__('admission_policy').require_operation('maintenance')
     state_file = args.state_dir / 'task_bridge_state.json'
     with exclusive(args.state_dir / 'bridge.lock'), exclusive(args.state_dir / 'worker.lock'):
         state = read_json(state_file, {'issues': {}})

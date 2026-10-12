@@ -55,6 +55,9 @@ class LegacyReviewRecovery:
         import task_bridge as bridge
         changed = False
         for number, item in self.state['issues'].items():
+            from admission_policy import issue_allowed
+            if not issue_allowed(self.namespace,number,item):
+                continue
             if not isinstance(item, dict) or item.get('review_transition') is not None or item.get('review_migration') is not None:
                 continue
             pending = item.get('pending_rpc')

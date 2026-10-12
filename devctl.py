@@ -66,6 +66,7 @@ def reap_processes():
 
 
 def spawn_detached(wrapper, log_file):
+    __import__('admission_policy').require_operation('legacy_launch')
     from external_effects import refuse
     refuse('worker')
     try:
@@ -106,7 +107,7 @@ def machine_command(machine, command, *, connect_timeout=10, ssh_options=()):
 
 def capture(machine, command, separate_stderr=False):
     from external_effects import refuse
-    refuse('worker')
+    refuse('process_read')
     return subprocess.run(
         machine_command(machine, command),
         text=True,
@@ -119,7 +120,7 @@ def capture(machine, command, separate_stderr=False):
 
 def capture_execution(machine, command, *, timeout=PROBE_TIMEOUT):
     from external_effects import refuse
-    refuse('worker')
+    refuse('process_read')
     env = dict(MACHINES[machine].get('agent_env', {}))
     if machine == 'firefly' and command.startswith('agent '):
         env['NODE_USE_ENV_PROXY'] = '1'
@@ -132,14 +133,9 @@ def capture_execution(machine, command, *, timeout=PROBE_TIMEOUT):
 
 
 def capture_git(machine, workspace, *args):
-    command = (
-        "git -C "
-        + shlex.quote(workspace)
-        + " "
-        + shlex.join(list(args))
-    )
-
-    return capture(machine, command)
+    from repository_safety import GIT_PREAMBLE, bounded_script
+    script=GIT_PREAMBLE + '\nimport sys; p=sys.argv[1]; assert_git_config(p); sys.stdout.buffer.write(safe_git(p,sys.argv[2:]))'
+    return capture(machine, shlex.join(['/usr/bin/python3','-I','-B','-c',bounded_script(script),workspace,*args]))
 
 
 def capture_git_baseline(machine, workspace):
@@ -150,171 +146,17 @@ def capture_git_baseline(machine, workspace):
     A dirty baseline is allowed for coding/review, but later
     owner COMMIT must reject automatic publication.
     """
-    captured_at = now()
-
-    repo = capture_git(
-        machine,
-        workspace,
-        "rev-parse",
-        "--is-inside-work-tree",
-    )
-
-    if (
-        repo.returncode != 0
-        or repo.stdout.strip() != "true"
-    ):
-        return {
-            "captured_at": captured_at,
-            "is_repo": False,
-            "head": None,
-            "branch": None,
-            "detached": None,
-            "status_porcelain": None,
-            "clean": False,
-            "error": (
-                repo.stdout.strip()[-2000:]
-                or "not a Git work tree"
-            ),
-        }
-
-    # HEAD can legitimately be absent in a newly initialized
-    # repository with no commits yet.
-    head_result = capture_git(
-        machine,
-        workspace,
-        "rev-parse",
-        "--verify",
-        "HEAD",
-    )
-
-    head = (
-        head_result.stdout.strip()
-        if head_result.returncode == 0
-        else None
-    )
-
-    branch_result = capture_git(
-        machine,
-        workspace,
-        "symbolic-ref",
-        "--quiet",
-        "--short",
-        "HEAD",
-    )
-
-    branch = (
-        branch_result.stdout.strip()
-        if branch_result.returncode == 0
-        else None
-    )
-
-    status_result = capture_git(
-        machine,
-        workspace,
-        "status",
-        "--porcelain=v1",
-        "--untracked-files=all",
-    )
-
-    status_porcelain = (
-        status_result.stdout.rstrip("\n")
-        if status_result.returncode == 0
-        else None
-    )
-
-    origin_result = capture_git(
-        machine,
-        workspace,
-        "remote",
-        "get-url",
-        "origin",
-    )
-
-    origin = (
-        origin_result.stdout.strip()
-        if origin_result.returncode == 0
-        else None
-    )
-
-    root_result = capture_git(machine, workspace, "rev-parse", "--show-toplevel")
-    push_result = capture_git(machine, workspace, "remote", "get-url", "--push", "--all", "origin")
-
-    # Capture the exact publishable worktree state without touching the user's
-    # real index. This lets notification code prove that a reviewed task was
-    # truly read-only/no-op even when the repository was already dirty.
-    quoted_workspace = shlex.quote(workspace)
-
-    tree_result = capture(
-        machine,
-        (
-            "set -e; "
-            'tmp=$(mktemp); rm -f "$tmp"; '
-            """trap 'rm -f "$tmp"' EXIT; """
-            f"if git -C {quoted_workspace} rev-parse --verify HEAD >/dev/null 2>&1; then "
-            f'GIT_INDEX_FILE="$tmp" git -C {quoted_workspace} read-tree HEAD; '
-            "fi; "
-            f'GIT_INDEX_FILE="$tmp" git -C {quoted_workspace} add -A; '
-            f'GIT_INDEX_FILE="$tmp" git -C {quoted_workspace} write-tree'
-        ),
-        separate_stderr=True,
-    )
-
-    index_result = capture(
-        machine,
-        (
-            "set -o pipefail; "
-            f"git -C {quoted_workspace} ls-files --stage -z "
-            "| sha256sum | awk '{print $1}'"
-        ),
-        separate_stderr=True,
-    )
-
-    root = root_result.stdout.strip() if root_result.returncode == 0 else None
-    push_urls = push_result.stdout.splitlines() if push_result.returncode == 0 else []
-    worktree_tree = tree_result.stdout.strip() if tree_result.returncode == 0 else None
-    index_fingerprint = index_result.stdout.strip() if index_result.returncode == 0 else None
-
-    snapshot_fingerprint = None
-    if (
-        status_result.returncode == 0
-        and root
-        and worktree_tree
-        and index_fingerprint
-    ):
-        snapshot = {
-            "head": head,
-            "branch": branch,
-            "origin": origin,
-            "root": root,
-            "push_urls": push_urls,
-            "tree": worktree_tree,
-            "status": status_result.stdout,
-            "index": index_fingerprint,
-        }
-        snapshot_fingerprint = hashlib.sha256(
-            json.dumps(snapshot, sort_keys=True).encode()
-        ).hexdigest()
-
-    return {
-        "captured_at": captured_at,
-        "is_repo": True,
-        "head": head,
-        "branch": branch,
-        "detached": branch is None,
-        "status_porcelain": status_porcelain,
-        "clean": status_porcelain == "",
-        "origin": origin,
-        "root": root,
-        "push_urls": push_urls,
-        "worktree_tree": worktree_tree,
-        "index_fingerprint": index_fingerprint,
-        "snapshot_fingerprint": snapshot_fingerprint,
-        "error": (
-            None
-            if status_result.returncode == 0
-            else status_result.stdout.strip()[-2000:]
-        ),
-    }
+    from publication import SNAPSHOT_SCRIPT
+    from repository_safety import bounded_script
+    result=capture(machine,shlex.join(['/usr/bin/python3','-I','-B','-c',bounded_script(SNAPSHOT_SCRIPT),workspace]),separate_stderr=True)
+    if result.returncode:
+        raise RuntimeError('Cannot safely capture bounded repository baseline')
+    value=json.loads(result.stdout)
+    return dict(captured_at=now(),is_repo=True,head=value['head'],branch=value['branch'],
+        detached=value['branch'] is None,status_porcelain=value['status'].rstrip('\n'),
+        clean=value['status'].rstrip('\n')=='',origin=value['origin'],root=value['root'],
+        push_urls=value['push_urls'],worktree_tree=value['tree'],index_fingerprint=value['index'],
+        snapshot_fingerprint=value['fingerprint'],error=None)
 
 
 def doctor_probe(machine, command, timeout):
@@ -403,6 +245,9 @@ def doctor(as_json=False):
 
 
 def load_projects():
+    if os.environ.get('DEVORCHESTRATOR_ADMISSION_POLICY'):
+        from admission_policy import policy, strict
+        return strict(policy()[1]['registry_file'])
     if not PROJECTS_FILE.exists():
         raise SystemExit(f"Projects registry not found: {PROJECTS_FILE}")
 
@@ -417,8 +262,8 @@ def load_projects():
 
 def execution_catalog(project=None, discover=False, agent=None):
     from external_effects import blocked, refuse
-    if discover and blocked():
-        refuse('worker')
+    if discover:
+        __import__('admission_policy').require_operation('discovery')
     cfg = load_projects()[project] if project else {}
     catalog, identity = execution_profiles.load_catalog(cfg)
     result = dict(catalog=catalog, identity=identity)
@@ -531,7 +376,7 @@ def stored_runtime_health(directory, state):
 
 def task_state(meta, directory, refresh_remote=True):
     from external_effects import blocked
-    if blocked():
+    if blocked() or not __import__('admission_policy').task_allowed(meta.get('id',directory.name)):
         reap_processes()
         return stored_task_status(meta, directory)
     reap_processes()
@@ -622,7 +467,7 @@ def project_for_task(meta):
 
 def runtime_status(meta, directory, state=None):
     from external_effects import blocked
-    if blocked():
+    if blocked() or not __import__('admission_policy').task_allowed(meta.get('id',directory.name)):
         return stored_runtime_health(directory, state)
     if meta.get('remote_key') and meta.get('_runtime_health'):
         return meta['_runtime_health']
@@ -652,7 +497,8 @@ def list_tasks(as_json=False, show_all=False, cached=False, control=False, contr
     from external_effects import blocked
     if not blocked():
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-    if not control and not blocked():
+    # Bulk legacy reconciliation is never triggered by observational list APIs.
+    if not control and not blocked() and __import__('admission_policy').operation_allowed('reconcile'):
         reconcile_workers()
 
     rows = []
@@ -693,7 +539,7 @@ def list_tasks(as_json=False, show_all=False, cached=False, control=False, contr
                 # supplies cleanup proof, including terminal wrapper children.
                 if not worker_runtime.publication_safe(directory, meta):
                     state, exit_code = 'UNKNOWN', None
-            if meta.get('remote_key') and not cached and not blocked():
+            if meta.get('remote_key') and not cached and not blocked() and __import__('admission_policy').task_allowed(meta.get('id',directory.name)):
                 reconcile_remote_observation(directory, meta, state, exit_code)
         except Exception:
             state, exit_code = 'UNKNOWN', None
@@ -802,6 +648,7 @@ def reconcile_remote_observation(directory, meta, state, code):
 
 
 def reconcile_workers(refresh_remote=False):
+    __import__('admission_policy').require_operation('reconcile')
     """Bounded self-healing; skipped remote probes leave leases unclassified."""
     from external_effects import blocked
     if blocked():
@@ -1031,6 +878,7 @@ REMOTE_PY
 
 
 def set_task_archived(task_id, archived=True):
+    __import__('admission_policy').require_operation('maintenance')
     directory = task_dir(task_id)
     meta_path = directory / "meta.json"
 
@@ -1226,6 +1074,19 @@ def validate_review_source(project, machine, workspace, binding):
 
 
 def preflight_task(operation, arguments):
+    """Receipt-only replay is observational; fresh runtime probes require admission."""
+    request_id = arguments.get('request_id')
+    worker_runtime.valid_request(request_id)
+    receipt = read_json(DATA_DIR.parent / 'requests' / (request_id + '.json')) if request_id else None
+    if receipt:
+        return _authorized_preflight_task(operation, arguments)
+    from admission_policy import execution, validate_rpc
+    validate_rpc(operation, arguments)
+    with execution(arguments, DATA_DIR):
+        return _authorized_preflight_task(operation, arguments)
+
+
+def _authorized_preflight_task(operation, arguments):
     """Read-only validation, including runtime, on the same host as launches.
 
     Existing durable requests are replayed without applying changed catalog
@@ -1284,11 +1145,27 @@ def self_module():
 def run_agent(machine, agent, workspace, prompt, model=None, effort=None,
               request_id=None, role="coding", execution_profile=None, execution_options=None,
               review_binding=None, repository_binding=None):
+    from admission_policy import execution, emergency
+    emergency()
+    project = next((name for name, cfg in load_projects().items()
+                    if cfg.get('machine') == machine and cfg.get('workspace') == workspace), None)
+    arguments = dict(project=project, agent=agent, prompt=prompt, model=model, effort=effort,
+                     request_id=request_id, role=role, execution_profile=execution_profile,
+                     execution_options=execution_options, review_binding=review_binding,
+                     repository_binding=repository_binding)
+    with execution(arguments, DATA_DIR):
+        return _admitted_run_agent(machine, agent, workspace, prompt, model, effort, request_id,
+                                   role, execution_profile, execution_options, review_binding, repository_binding)
+
+
+def _admitted_run_agent(machine, agent, workspace, prompt, model=None, effort=None,
+              request_id=None, role="coding", execution_profile=None, execution_options=None,
+              review_binding=None, repository_binding=None):
     from external_effects import refuse
     refuse('worker')
     worker_runtime.valid_request(request_id)
     task_id = request_id[:24] if request_id else uuid.uuid4().hex[:12]
-    with exclusive(DATA_DIR.parent / "worker.lock", blocking=True):
+    with __import__("admission_policy").finite_lock(DATA_DIR.parent / "worker.lock"):
         import scheduler
         projects = load_projects()
         project = next((name for name, cfg in projects.items()
@@ -1309,6 +1186,7 @@ def run_agent(machine, agent, workspace, prompt, model=None, effort=None,
                 raise execution_profiles.StaleReviewInput('Registered repository changed before launch')
         import native_codex
         native_config = native_codex.config(DATA_DIR)
+        __import__('admission_policy').native_required(native_config)
         if native_config:
             previous = read_json(task_dir(task_id) / 'meta.json', {})
             if previous and (not previous.get('native_codex') or previous.get('launch_prepared') or previous.get('resume_prepared') or
@@ -1328,6 +1206,8 @@ def run_agent(machine, agent, workspace, prompt, model=None, effort=None,
                     # prepare has not admitted capacity, created metadata, or
                     # crossed the worker receipt boundary at this point.
                     raise execution_profiles.StaleReviewInput('Review source changed before launch') from exc
+            from admission_policy import reserve
+            reserve(DATA_DIR)
             prepared_native = None
             if native_config:
                 prepared_native = native_codex.prepare(self_module(), native_config, project, machine, agent,
@@ -1341,6 +1221,7 @@ def run_agent(machine, agent, workspace, prompt, model=None, effort=None,
                       "workspace": workspace, "pid": 0, "status": "STARTING", "role": role,
                       "created_at": now(), "git_baseline": None, "launch_prepared": True, "prepared_request": request_id,
                       **({'native_codex': prepared_native} if prepared_native else {}),
+                      'admission': __import__('admission_policy').require_worker(),
                       **({'review_binding': review_binding, 'launch_request_id': request_id}
                          if review_binding is not None else {}),
                       **({'repository_binding': repository_binding, 'launch_request_id': request_id}
@@ -1430,6 +1311,7 @@ def _run_agent(
         "role": role,
         "git_baseline": git_baseline,
         **({'native_codex': prepared['native_codex']} if prepared.get('native_codex') else {}),
+        **({'admission': prepared['admission']} if prepared.get('admission') else {}),
         **({key: prepared[key] for key in ('review_binding', 'launch_request_id')}
            if prepared.get('review_binding') is not None else {}),
         **({key: prepared[key] for key in ('repository_binding', 'launch_request_id')}
@@ -1924,13 +1806,30 @@ def task_output(meta, directory):
 
 def task_report(task_id, as_json=False):
     from external_effects import blocked
-    quiet = blocked()
-    if not quiet:
+    quiet = blocked() or not __import__('admission_policy').task_allowed(task_id)
+    if not quiet and __import__('admission_policy').operation_allowed('reconcile'):
         reconcile_workers()
     directory = task_dir(task_id)
     meta = load_meta(task_id)
 
-    state, exit_code = task_state(meta, directory)
+    state, exit_code = stored_task_status(meta, directory) if quiet else task_state(meta, directory)
+    if quiet and meta.get('native_codex') and read_json(directory/'native-watchdog/bounded-result.json',{}).get('state')=='UNKNOWN':
+        state,exit_code='UNKNOWN',None
+    if not quiet and meta.get('native_codex') and state in ('DONE','FAILED'):
+        # Finalize only this admitted generation. No bulk scan, signals, remote
+        # operations, or legacy metadata/lease changes are allowed here.
+        from native_supervisor import terminal_cleanup
+        try:
+            with __import__('admission_policy').finite_lock(DATA_DIR.parent/'worker.lock',blocking=False):
+                current=load_meta(task_id)
+                if (current.get('runtime_generation')==meta.get('runtime_generation') and
+                        __import__('admission_policy').task_allowed(task_id) and
+                        terminal_cleanup(directory,current,state)=='ABSENT'):
+                    worker_runtime.reconcile_task(directory,current,state,exit_code)
+                    worker_runtime.reconcile_leases(DATA_DIR,{task_id:dict(machine=current['machine'],cleanup='ABSENT')})
+                    meta=current
+        except __import__('admission_policy').AdmissionDenied:
+            pass  # A reader nested inside a writer lock never waits or grants authority.
     if meta.get('remote_key') and not quiet:
         reconcile_remote_observation(directory, meta, state, exit_code)
 
@@ -2029,6 +1928,7 @@ def task_report(task_id, as_json=False):
 
 
 def exec_command(machine, command):
+    __import__('admission_policy').require_operation('shell')
     from external_effects import refuse
     refuse('worker')
     return subprocess.run(

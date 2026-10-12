@@ -163,6 +163,8 @@ def cleanup_group(directory, meta, state, *, grace_seconds=1):
     # which do not have that import available.
     if os.environ.get('DEVORCHESTRATOR_BLOCK_EXTERNAL_EFFECTS') == '1':
         return recorded_cleanup(meta)
+    if not __import__('admission_policy').reconciliation_allowed(directory,meta):
+        return recorded_cleanup(meta)
     if meta.get('native_codex'):
         from native_supervisor import terminal_cleanup
         return terminal_cleanup(directory, meta, state)
@@ -316,6 +318,8 @@ def reconcile_task(directory, meta, state, code):
     """Called under worker.lock; preserve original receipts and audit history."""
     if os.environ.get('DEVORCHESTRATOR_BLOCK_EXTERNAL_EFFECTS') == '1':
         return None
+    if not __import__('admission_policy').reconciliation_allowed(directory,meta):
+        return recorded_cleanup(meta)
     if state not in ('DONE', 'FAILED'):
         return None
     import copy
@@ -348,6 +352,13 @@ def reconcile_leases(data_dir, terminal):
     """
     if os.environ.get('DEVORCHESTRATOR_BLOCK_EXTERNAL_EFFECTS') == '1':
         return
+    import admission_policy
+    admitted=set()
+    for key in terminal:
+        try:meta=read_json(data_dir/key/'meta.json',{})
+        except (OSError,ValueError,TypeError):continue
+        if admission_policy.reconciliation_allowed(data_dir/key,meta):admitted.add(key)
+    if not admitted:return
     path = data_dir.parent / 'worker_leases.json'
     leases = read_json(path, {})
     diagnostic_path = data_dir.parent / 'worker_consistency.json'
@@ -358,6 +369,7 @@ def reconcile_leases(data_dir, terminal):
     changed = False
     for key, lease in list(leases.items()):
         task_id = lease.get('task_id') if isinstance(lease, dict) else None
+        if task_id not in admitted:continue
         proof = terminal.get(task_id)
         if not isinstance(proof, dict) or proof.get('cleanup') not in ('ABSENT', 'CLEANED', 'ACTIVE', 'AMBIGUOUS', 'MISSING'):
             continue  # Skipped probes, sweep limits, and incomplete classifications.
@@ -391,9 +403,13 @@ def check_capacity(data_dir, task_id, machine, role, task_state):
                 continue
             meta = read_json(directory / 'meta.json')
             if meta:
-                state, code = task_state(meta, directory)
-                cleanup = reconcile_task(directory, meta, state, code)
-                if state in ('RUNNING', 'UNKNOWN', 'STARTING') or cleanup == 'AMBIGUOUS':
+                if __import__('admission_policy').reconciliation_allowed(directory,meta):
+                    state, code = task_state(meta, directory)
+                    cleanup = reconcile_task(directory, meta, state, code)
+                else:
+                    state,code=__import__('devctl').stored_task_status(meta,directory)
+                    cleanup=recorded_cleanup(meta)
+                if state in ('RUNNING', 'UNKNOWN', 'STARTING') or cleanup not in ('ABSENT','CLEANED'):
                     active.append(meta)
     role_limit = limits.coding if role == 'coding' else limits.review
     if (len(active) >= limits.total or
@@ -413,8 +429,8 @@ def admit(data_dir, machine, canonical, task_id, task_state):
         if not directory.exists():
             directory = data_dir / 'archives' / lease['task_id']
         meta = read_json(directory / 'meta.json')
-        if not meta:
-            raise RuntimeError('Registered workspace has an active or uncertain worker lease')
+        if not meta or not __import__('admission_policy').reconciliation_allowed(directory,meta):
+            raise RuntimeError('Registered workspace has an unadmitted active or uncertain worker lease')
         state, code = task_state(meta, directory)
         if state not in ('DONE', 'FAILED') or reconcile_task(directory, meta, state, code) == 'AMBIGUOUS':
             raise RuntimeError('Registered workspace has an active or uncertain worker lease')
@@ -485,12 +501,14 @@ def launch(data_dir, request_id, task_id, callback, prepare=None, signature=None
     from external_effects import refuse
     refuse('worker')
     valid_request(request_id)
+    from admission_policy import require_request
+    require_request(data_dir,request_id,task_id)
     if not request_id:
         if prepare:
             prepare()
         return callback()
     path = data_dir.parent / 'requests' / (request_id + '.json')
-    with exclusive(path.with_suffix('.lock'), blocking=True):
+    with __import__('admission_policy').finite_lock(path.with_suffix('.lock')):
         receipt = read_json(path)
         if receipt:
             if receipt.get('status') == 'FENCED':
@@ -506,6 +524,7 @@ def launch(data_dir, request_id, task_id, callback, prepare=None, signature=None
             raise RuntimeError('Bound task metadata exists without a request receipt')
         if prepare:
             prepare()
+        require_request(data_dir,request_id,task_id,prepared=True)
         record = {'task_id': task_id, 'status': 'PENDING', 'signature': signature}
         if signature_version is not None:
             record['signature_version'] = signature_version

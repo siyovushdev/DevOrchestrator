@@ -56,6 +56,9 @@ if os.environ.get('DEVORCHESTRATOR_BLOCK_EXTERNAL_EFFECTS') == '1':
     print(json.dumps(dict(status='UNKNOWN', exit_code=None, cleanup_state='ACTIVE',
         observation_confidence='READ_ONLY', chunk=base64.b64encode(chunk).decode(), more=more)))
     raise SystemExit(0)
+# Direct/delayed script invocation is not inherited launch authority.
+import admission_policy
+admission_policy.require_operation('remote')
 root.mkdir(parents=True, exist_ok=True, mode=0o700)
 # Concurrent/replayed SSH invocations must share a single launch receipt.
 import fcntl
@@ -131,6 +134,7 @@ SCRIPT = SCRIPT.replace('runner = BUNDLE +', 'runner = ' + repr(BUNDLE) + ' +')
 
 
 def rpc(machine, mode, key, value, context=None):
+    __import__('admission_policy').require_operation('remote')
     from external_effects import refuse
     refuse('worker')
     import devctl
@@ -144,6 +148,8 @@ def rpc(machine, mode, key, value, context=None):
 
 
 def start(machine, key, command, context=None):
+    from external_effects import refuse
+    refuse('worker')
     if context is not None:
         context = {k: context[k] for k in ('id', 'machine', 'agent', 'project', 'session_id', 'role', 'runtime_generation', 'turns') if k in context}
     return rpc(machine, 'start', key, command, context)

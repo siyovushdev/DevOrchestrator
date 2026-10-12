@@ -48,6 +48,9 @@ def io_tool(function):
 
 
 def load_projects() -> dict:
+    if os.environ.get('DEVORCHESTRATOR_ADMISSION_POLICY'):
+        import devctl as worker
+        return worker.load_projects()
     return json.loads(PROJECTS_FILE.read_text())
 
 
@@ -129,6 +132,7 @@ def inspect_start_request(request_id: str, fence: bool = False) -> dict:
 
 
 @io_tool
+@__import__('admission_policy').endpoint
 def start_task(
     project: str,
     prompt: str,
@@ -205,6 +209,7 @@ def start_task(
 
 @io_tool
 def get_task_report(task_id: str, read_only: bool = False) -> dict:
+    read_only = read_only or not __import__('admission_policy').task_allowed(task_id)
     """Return task status and latest concise result."""
     return json.loads(
         devctl("report", task_id, "--json", **({'read_only': True} if read_only else {}))

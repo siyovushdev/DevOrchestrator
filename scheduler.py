@@ -55,8 +55,10 @@ def project_identity(project):
     workspace = cfg['workspace']
     # Resolve aliases on the actual worker, never a cloud supplied path.
     import shlex
+    from repository_safety import GIT_PREAMBLE, bounded_script
+    script=GIT_PREAMBLE + '\nimport sys; p=os.path.realpath(sys.argv[1]); assert_git_config(p); r=safe_git(p,["rev-parse","--show-toplevel"],optional=True).decode().strip(); print(os.path.realpath(r) if r else p)'
     result = devctl.capture(cfg['machine'], shlex.join([
-        'python3', '-c', 'import os,subprocess,sys; p=os.path.realpath(sys.argv[1]); r=subprocess.run(["git","-C",p,"rev-parse","--show-toplevel"],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True); print(os.path.realpath(r.stdout.strip()) if r.returncode == 0 else p)', workspace]), separate_stderr=True)
+        '/usr/bin/python3', '-I', '-B', '-c', bounded_script(script), workspace]), separate_stderr=True)
     if result.returncode:
         raise RuntimeError('Cannot resolve registered workspace identity')
     canonical = result.stdout.strip()
@@ -190,6 +192,8 @@ class Scheduler:
         tasks = [t for t in tasks if t.get('observation_confidence') != 'READ_ONLY' and t.get('id') not in held_tasks]
         identity_resolver = identity_resolver or project_identity
         for task in tasks:
+            if not __import__('admission_policy').task_allowed(task['id']):
+                continue
             project = task.get('project')
             matching = [j for j in self.jobs.values() if j.get('task_id') == task['id']]
             pending = next((j for j in matching if j.get('identity_pending')), None)
@@ -218,6 +222,9 @@ class Scheduler:
                     self.locks.setdefault(repo, {'owner': key, 'key': key})
         external = {t['id']: t for t in tasks}
         for key, job in self.jobs.items():
+            import task_bridge
+            if not __import__('admission_policy').issue_allowed(task_bridge.REPO,job['owner'],self.state.get('issues',{}).get(str(job['owner']))):
+                continue
             if key.startswith('external:') and job.get('task_id') in external:
                 self.observe(job['task_id'], external[job['task_id']]['status'], external[job['task_id']].get('cleanup_state'))
                 if job['status'] in ('DONE', 'FAILED'):
@@ -228,11 +235,17 @@ class Scheduler:
         # Repair a previously released lock from durable queue ownership. The
         # admission predicate also honors this hold before recovery can run.
         for key, job in self.jobs.items():
+            import task_bridge
+            if not __import__('admission_policy').issue_allowed(task_bridge.REPO,job['owner'],self.state.get('issues',{}).get(str(job['owner']))):
+                continue
             item = self.state.get('issues', {}).get(str(job['owner']), {})
             if job.get('repo') and (item.get('safety_latch_hold') or post_merge_repository_hold(item) or
                                     holds_repository(item) or publication_repository_hold(item)):
                 self.locks.setdefault(job['repo'], {'owner': job['owner'], 'key': key})
         for repo, lock in list(self.locks.items()):
+            import task_bridge
+            if not __import__('admission_policy').issue_allowed(task_bridge.REPO,lock['owner'],self.state.get('issues',{}).get(str(lock['owner']))):
+                continue
             jobs = [j for j in self.jobs.values() if j.get('repo') == repo and j.get('owner') == lock.get('owner')]
             if not jobs:
                 diagnostics[repo] = 'Lock retained: missing queue ownership proof'

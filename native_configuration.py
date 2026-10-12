@@ -33,6 +33,8 @@ def configuration(argv,role,private=None):
 def validate_with_cli(argv,role,folder,*,until,private=None):
     from native_deadlines import clock
     cfg=configuration(argv,role,private)
+    reserve=__import__('native_deadlines').LIMITS['term_grace']+__import__('native_deadlines').LIMITS['kill_grace']
+    if until-clock()<=reserve:raise PreflightRejected('No configuration work/cleanup budget remains')
     binary=argv[0]
     folder=Path(folder);folder.mkdir(mode=0o700,parents=True)
     work=cfg['private']/'tmp/config-preflight';work.mkdir(mode=0o700)
@@ -58,7 +60,7 @@ def validate_with_cli(argv,role,folder,*,until,private=None):
         probe=[binary,'sandbox',*common,'--permission-profile','simple-'+role,'-C',str(cfg['repo']),'--',
                '/usr/bin/python3','-I','-B',str(helper),json.dumps(spec)]
         with (folder/(mode+'.stdout')).open('w') as out,(folder/(mode+'.stderr')).open('w') as err:
-            result=bp.run(probe,folder/(mode+'-watchdog'),deadline=min(until,clock()+10),env=env,stdout=out,stderr=err)
+            result=bp.run(probe,folder/(mode+'-watchdog'),deadline=min(until-reserve,clock()+10),env=env,stdout=out,stderr=err)
         results[mode]=result
         if result['state']!='EXITED' or not result['cleanup_proven']:
             write_json(folder/'result.json',{'status':'UNKNOWN_OR_TIMEOUT','mode':mode,'watchdog':result,'automatic_retry':False})

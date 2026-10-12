@@ -85,7 +85,7 @@ def validate(record, meta=None):
     return record
 
 
-def initialize(directory, meta, *, clock=None):
+def initialize(directory, meta, *, clock=None,lock=None):
     now = time.time() if clock is None else clock
     record = dict(schema_version=1, task_id=meta['id'], project=meta.get('project') or '-',
                   machine=meta['machine'], worker_id=meta['machine'], agent=meta['agent'],
@@ -95,7 +95,9 @@ def initialize(directory, meta, *, clock=None):
                   heartbeat_sequence=0, lease_expires_at=now + LEASE_SECONDS,
                   exit_code=None, terminal_reason=None, role=meta.get('role', 'coding'))
     record['turn'] = meta.get('turns', 1)
-    with exclusive(directory / 'liveness.lock', blocking=True):
+    if lock is None:
+        lock=(lambda path,blocking=True:reader_lock(directory,meta)) if meta.get('native_codex') else exclusive
+    with lock(directory / 'liveness.lock', blocking=True):
         previous = read_record(directory)
         if previous and previous.get('generation') != record['generation']:
             # Preserve each completed turn's original runtime/ownership/exit
@@ -173,6 +175,15 @@ def classify(record, now, worker_alive, process_alive, *, communication=True):
     return 'SUSPECTED_STALL', 'worker_communication_uncertain' if not communication else 'process_ownership_unproven'
 
 
+def reader_lock(directory,meta):
+    if not meta.get('native_codex'):return exclusive(directory/'liveness.lock',blocking=True)
+    from admission_policy import finite_lock,need
+    key=meta.get('launch_request_id');need(isinstance(key,str) and len(key)==64,'Native reader request missing')
+    claim=read_json(Path(directory).parent.parent/'admissions'/key/'claim.json',{})
+    need(claim.get('generation')==meta.get('runtime_generation') and claim.get('work_deadline'), 'Native reader claim mismatch')
+    return finite_lock(directory/'liveness.lock',until=claim['work_deadline'])
+
+
 def watchdog(directory, meta, *, probe=True, terminal=None, clock=None, evidence=None, read_only=False):
     """One normalized, secret-free report, also used by cached MCP/SSH status.
 
@@ -188,8 +199,9 @@ def watchdog(directory, meta, *, probe=True, terminal=None, clock=None, evidence
                     observation_confidence='READ_ONLY', generation=meta.get('runtime_generation'),
                     worker_alive=None, process_alive=None, phase='UNKNOWN', exit_code=None,
                     lease_state='UNKNOWN', heartbeat_age_seconds=None)
+    if not __import__('admission_policy').reconciliation_allowed(directory,meta):read_only=True
     now = time.time() if clock is None else clock
-    with nullcontext() if read_only else exclusive(directory / 'liveness.lock', blocking=True):
+    with nullcontext() if read_only else reader_lock(directory,meta):
         record = None
         worker = process = None
         try:
@@ -263,7 +275,8 @@ def task_status(health):
 def final_report_missing(directory, meta):
     if os.environ.get('DEVORCHESTRATOR_BLOCK_EXTERNAL_EFFECTS') == '1':
         return
-    with exclusive(directory / 'liveness.lock', blocking=True):
+    if not __import__('admission_policy').reconciliation_allowed(directory,meta):return
+    with reader_lock(directory,meta):
         record = validate(read_record(directory), meta)
         if record['exit_code'] == 0 and record.get('terminal_reason') == 'process_exited':
             record['terminal_reason'] = 'process_exited_without_final_report'
@@ -274,7 +287,8 @@ def annotate_session(directory, meta, session_id):
     """Session discovery is activity metadata, never a heartbeat/lease refresh."""
     if os.environ.get('DEVORCHESTRATOR_BLOCK_EXTERNAL_EFFECTS') == '1':
         return
-    with exclusive(directory / 'liveness.lock', blocking=True):
+    if not __import__('admission_policy').reconciliation_allowed(directory,meta):return
+    with reader_lock(directory,meta):
         record = validate(read_record(directory), meta)
         if type(session_id) is str and 0 < len(session_id) <= 512 and record['session_id'] != session_id:
             record['session_id'] = session_id
@@ -282,7 +296,8 @@ def annotate_session(directory, meta, session_id):
 
 
 def run(directory, generation, command):
-    """Supervise independently of stdout; no silence-based kills/retries."""
+    """Retired shell supervisor: no legacy launch authority in this release."""
+    __import__('admission_policy').require_operation('legacy_launch')
     if os.environ.get('DEVORCHESTRATOR_BLOCK_EXTERNAL_EFFECTS') == '1':
         raise RuntimeError('External worker effect blocked')
     directory = Path(directory)

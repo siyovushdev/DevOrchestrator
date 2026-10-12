@@ -111,6 +111,12 @@ def _flush_steps(state, persist, comments, post_comment, transition, telegram, n
     entries.sort(key=lambda pair: 0 if pair[1]['kind'] == 'transition' else
                  1 if pair[1]['kind'] == 'comment' and 'Task started:' in pair[1]['payload'] else 2)
     for key, entry in entries:
+        # Delivery permissions are independent of worker admission.
+        from admission_policy import external_denied, AdmissionDenied
+        try:
+            external_denied()
+        except AdmissionDenied:
+            continue
         if entry.get('status') == 'QUARANTINED' or entry.get('effect_origin') in ('safety_latch', 'legacy_unverified'):
             continue  # No callbacks, retries or receipt-reset paths can authorize this entry.
         if selection is not None and key not in selection:

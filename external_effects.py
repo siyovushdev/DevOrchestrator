@@ -1,6 +1,7 @@
 """Fail-closed latch for a controlled bridge smoke.
 
-Unset, or any value other than ``1``, permits ordinary runtime behavior.
+Clearing this latch permits only separately admitted execution; publication
+remains denied. An unset admission policy grants no new execution.
 Durable observation holds and quarantined effects still require explicit
 authorization recovery: removing this environment flag never clears them.
 When set, worker launches, publication subprocesses, Telegram delivery and
@@ -52,6 +53,12 @@ def read_only_observation(value):
 def refuse(kind):
     if blocked():
         raise ExternalEffectBlocked(kind)
+    if kind == 'worker':
+        from admission_policy import require_worker
+        require_worker()
+    elif kind in ('publication', 'github', 'telegram'):
+        from admission_policy import external_denied
+        external_denied()
 
 
 def github_is_read(args):
@@ -75,6 +82,9 @@ def github_is_read(args):
 def guard_github(args):
     if blocked() and not github_is_read(tuple(args)):
         raise ExternalEffectBlocked('github')
+    if not github_is_read(tuple(args)):
+        from admission_policy import external_denied
+        external_denied()
 
 
 def guard_worker_rpc(name, arguments):
